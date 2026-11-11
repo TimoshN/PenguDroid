@@ -29,7 +29,9 @@ use std::fmt;
 /// unregistration and detached launches (`QueryRun`).
 /// v3 adds a mandatory per-frame source crop to `PresentShm`; v2 peers must
 /// reconnect with matching binaries rather than interpreting allocation padding.
-pub const PROTO_VERSION: u16 = 3;
+/// v4 adds held hardware decoding (`VideoHeld*`): frames the guest's own
+/// pipeline presents by id.
+pub const PROTO_VERSION: u16 = 4;
 
 /// Marker used by the daemon's pid/heartbeat file.
 pub const PROTO_MAGIC: u32 = 0x5044_5247; // "PDRG"
@@ -113,6 +115,10 @@ pub enum MsgKind {
     VideoDecoderFlush = 96,
     VideoDecoderClose = 97,
     VideoDecoderPoll = 98,
+    VideoHeldOpen = 99,
+    VideoHeldDecode = 100,
+    VideoHeldFrame = 101,
+    VideoHeldPresent = 102,
 }
 
 impl MsgKind {
@@ -172,6 +178,10 @@ impl MsgKind {
             96 => VideoDecoderFlush,
             97 => VideoDecoderClose,
             98 => VideoDecoderPoll,
+            99 => VideoHeldOpen,
+            100 => VideoHeldDecode,
+            101 => VideoHeldFrame,
+            102 => VideoHeldPresent,
             other => return Err(ProtoError::BadKind(other)),
         })
     }
@@ -344,6 +354,25 @@ pub enum Message {
     VideoDecoderClose,
     VideoDecoderPoll,
 
+    /// A hardware decoder whose frames are *held* by the daemon instead of
+    /// being shown as they are decoded. The guest's own pipeline (Codec2 →
+    /// BufferQueue) keeps deciding when, and whether, each picture is shown;
+    /// it names the frame with `VideoHeldPresent` when its buffer is queued.
+    /// One per connection, like `VideoDecoderOpen`; `VideoDecoderFlush` and
+    /// `VideoDecoderClose` apply to it too.
+    VideoHeldOpen { codec: String, device: String, extra: Vec<u8> },
+    /// One complete access unit, an empty EOS, or (empty, not EOS) a request
+    /// for the next decoded frame only. Answered by `VideoHeldFrame`.
+    VideoHeldDecode { pts_us: i64, data: Vec<u8>, end_of_stream: bool },
+    /// `frame` is the next decoded frame in output order, announced exactly
+    /// once: `(id, pts_us, width, height)`. `drained` means EOS was sent and
+    /// no frame is left.
+    VideoHeldFrame { accepted: bool, frame: Option<(u64, i64, u32, u32)>, drained: bool },
+    /// Show a held frame on a video surface this process owns. A frame the
+    /// daemon no longer holds is an error the guest may ignore (it was
+    /// evicted because too many newer frames were decoded and never shown).
+    VideoHeldPresent { frame_id: u64, surface_id: u32 },
+
     GetProp { name: String },
     PropValue { name: String, value: Option<String> },
     SetProp { name: String, value: String },
@@ -429,6 +458,10 @@ impl Message {
             VideoDecoderFlush => MsgKind::VideoDecoderFlush,
             VideoDecoderClose => MsgKind::VideoDecoderClose,
             VideoDecoderPoll => MsgKind::VideoDecoderPoll,
+            VideoHeldOpen { .. } => MsgKind::VideoHeldOpen,
+            VideoHeldDecode { .. } => MsgKind::VideoHeldDecode,
+            VideoHeldFrame { .. } => MsgKind::VideoHeldFrame,
+            VideoHeldPresent { .. } => MsgKind::VideoHeldPresent,
             GetProp { .. } => MsgKind::GetProp,
             PropValue { .. } => MsgKind::PropValue,
             SetProp { .. } => MsgKind::SetProp,
@@ -591,6 +624,17 @@ impl Message {
                 if let Some(pts) = last_pts_us { e.u64(*pts as u64); }
             }
             VideoDecoderReady | VideoDecoderFlush | VideoDecoderClose | VideoDecoderPoll => {}
+            VideoHeldOpen { codec, device, extra } => { e.str(codec); e.str(device); e.bytes(extra); }
+            VideoHeldDecode { pts_us, data, end_of_stream } => {
+                e.u64(*pts_us as u64); e.bytes(data); e.u8(u8::from(*end_of_stream));
+            }
+            VideoHeldFrame { accepted, frame, drained } => {
+                e.u8(u8::from(*accepted)); e.u8(u8::from(*drained)); e.u8(u8::from(frame.is_some()));
+                if let Some((id, pts_us, width, height)) = frame {
+                    e.u64(*id); e.u64(*pts_us as u64); e.u32(*width); e.u32(*height);
+                }
+            }
+            VideoHeldPresent { frame_id, surface_id } => { e.u64(*frame_id); e.u32(*surface_id); }
             GetProp { name } => e.str(name),
             SetProp { name, value } => {
                 e.str(name);
@@ -787,6 +831,14 @@ impl Message {
             K::VideoDecoderFlush => VideoDecoderFlush,
             K::VideoDecoderClose => VideoDecoderClose,
             K::VideoDecoderPoll => VideoDecoderPoll,
+            K::VideoHeldOpen => VideoHeldOpen { codec: d.str()?, device: d.str()?, extra: d.bytes()?.to_vec() },
+            K::VideoHeldDecode => VideoHeldDecode { pts_us: d.u64()? as i64, data: d.bytes()?.to_vec(), end_of_stream: d.u8()? != 0 },
+            K::VideoHeldFrame => {
+                let (accepted, drained) = (d.u8()? != 0, d.u8()? != 0);
+                let frame = if d.u8()? != 0 { Some((d.u64()?, d.u64()? as i64, d.u32()?, d.u32()?)) } else { None };
+                VideoHeldFrame { accepted, frame, drained }
+            }
+            K::VideoHeldPresent => VideoHeldPresent { frame_id: d.u64()?, surface_id: d.u32()? },
             K::GetProp => GetProp { name: d.str()? },
             K::SetProp => SetProp { name: d.str()?, value: d.str()? },
             K::PropValue => {
@@ -1154,6 +1206,12 @@ mod tests {
         roundtrip(Message::VideoDecoderFlush);
         roundtrip(Message::VideoDecoderClose);
         roundtrip(Message::VideoDecoderPoll);
+        roundtrip(Message::VideoHeldOpen { codec: "h264".into(), device: "/dev/dri/renderD128".into(), extra: vec![] });
+        roundtrip(Message::VideoHeldDecode { pts_us: -5, data: vec![0, 0, 1, 0x65], end_of_stream: false });
+        roundtrip(Message::VideoHeldDecode { pts_us: 0, data: vec![], end_of_stream: true });
+        roundtrip(Message::VideoHeldFrame { accepted: true, frame: Some((u64::MAX, i64::MIN, 1920, 1080)), drained: false });
+        roundtrip(Message::VideoHeldFrame { accepted: false, frame: None, drained: true });
+        roundtrip(Message::VideoHeldPresent { frame_id: 7, surface_id: 4 });
     }
 
     #[test]

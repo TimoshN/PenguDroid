@@ -437,6 +437,8 @@ unsafe fn build() -> Option<Api> {
             diag(&format!("[codec2] c2-poolmask={mask}\n"));
         }
     }
+    // Before the store exists, so before any component (and decoder thread) can.
+    crate::avc_hw::install();
     let parcel_ctor = sym(b"libhidlbase.so\0", b"_ZN7android8hardware6ParcelC1Ev\0")?;
     let parcel_dtor = sym(b"libhidlbase.so\0", b"_ZN7android8hardware6ParcelD1Ev\0")?;
     // API 37 removed `Parcel::setData`; `Parcel::write` is the exported method

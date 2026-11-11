@@ -883,7 +883,8 @@ fn handle(
             (Some(Message::Goodbye), vec![], true)
         }
         Message::VideoDecoderOpen { .. } | Message::VideoPacket { .. }
-        | Message::VideoDecoderFlush | Message::VideoDecoderClose | Message::VideoDecoderPoll => (
+        | Message::VideoDecoderFlush | Message::VideoDecoderClose | Message::VideoDecoderPoll
+        | Message::VideoHeldOpen { .. } | Message::VideoHeldDecode { .. } | Message::VideoHeldPresent { .. } => (
             Some(Message::Error { code: -22, message: "video decoding requires a connection-local session".into() }), vec![], false,
         ),
         Message::PresentDmabuf { .. } | Message::PresentShm { .. } => (
@@ -911,6 +912,7 @@ fn handle(
         | Message::AudioRing { .. }
         | Message::VideoDecoderReady
         | Message::VideoDecodeStatus { .. }
+        | Message::VideoHeldFrame { .. }
         | Message::Pong
         | Message::Ack => {
             crate::debug!("unexpected inbound message kind {:?}", msg.kind());

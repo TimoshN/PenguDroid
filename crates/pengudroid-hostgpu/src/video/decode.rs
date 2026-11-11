@@ -28,7 +28,9 @@ type Receive = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut RawInfo,
 type Release = unsafe extern "C" fn(*mut c_void);
 type Flush = unsafe extern "C" fn(*mut c_void);
 type Luma = unsafe extern "C" fn(*mut c_void, *mut u32, *mut c_char, u32) -> c_int;
-struct Api { _library: Library, close: Close, send: Send, receive: Receive, release: Release, flush: Flush, luma: Luma }
+type Backend = unsafe extern "C" fn(*const c_void) -> *const c_char;
+type Rgba = unsafe extern "C" fn(*mut c_void, *mut u8, u32, *mut c_char, u32) -> c_int;
+struct Api { _library: Library, close: Close, send: Send, receive: Receive, release: Release, flush: Flush, luma: Luma, backend: Option<Backend>, rgba: Option<Rgba> }
 
 fn error_text(error: &[u8], status: i32) -> String {
     let end = error.iter().position(|b| *b == 0).unwrap_or(error.len());
@@ -36,11 +38,15 @@ fn error_text(error: &[u8], status: i32) -> String {
     else { String::from_utf8_lossy(&error[..end]).into_owned() }
 }
 
-/// A decoder uses VA-API on the chosen DRM render node. Unsupported devices or
-/// codecs return errors; software decoding is never silently substituted.
+/// A decoder runs on the GPU behind the chosen DRM render node: VA-API where
+/// the driver provides it, otherwise Vulkan Video (NVIDIA). Unsupported devices
+/// or codecs return errors; software decoding is never silently substituted.
 pub struct Decoder { api: Rc<Api>, pointer: NonNull<c_void>, _thread: PhantomData<Rc<()>> }
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendStatus { Accepted, DrainFirst }
+/// How many frames a consumer may hold before `receive` reports `FramesHeld`
+/// (`PD_VIDEO_MAX_HELD` in the bridge).
+pub const MAX_HELD_FRAMES: usize = 40;
 pub enum ReceiveStatus { Frame(HardwareFrame), NeedsInput, EndOfStream, FramesHeld }
 
 /// A GPU frame export. Descriptor fds are duplicated, while the original
@@ -99,6 +105,9 @@ impl Decoder {
                 close: library.symbol(c"pd_video_close")?, send: library.symbol(c"pd_video_send")?,
                 receive: library.symbol(c"pd_video_receive")?, release: library.symbol(c"pd_video_frame_release")?,
                 flush: library.symbol(c"pd_video_flush")?, luma: library.symbol(c"pd_video_test_luma")?,
+                // Added after ABI 1 shipped; an older plugin simply lacks it.
+                backend: library.symbol(c"pd_video_backend").ok(),
+                rgba: library.symbol(c"pd_video_test_rgba").ok(),
                 _library: library,
             });
             let mut error = [0u8; 512];
@@ -142,6 +151,15 @@ impl Decoder {
             3 => Ok(ReceiveStatus::FramesHeld), _ => Err(error_text(&error, status)),
         }
     }
+    /// Which hardware API decodes: `"vaapi"` or `"vulkan"`. `None` for a plugin
+    /// built before the bridge reported it.
+    pub fn backend(&self) -> Option<&'static str> {
+        let name = unsafe { (self.api.backend?)(self.pointer.as_ptr()) };
+        if name.is_null() { return None; }
+        match unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() {
+            b"vaapi" => Some("vaapi"), b"vulkan" => Some("vulkan"), _ => None,
+        }
+    }
     /// Flush queued codec work; previously returned GPU frames remain owned.
     pub fn flush(&mut self) { unsafe { (self.api.flush)(self.pointer.as_ptr()); } }
 }
@@ -172,7 +190,17 @@ impl HardwareFrame {
         frame.validate()?;
         Ok(frame)
     }
-    /// Diagnostic CPU readback, explicitly separate from GPU presentation.
+    /// Diagnostic CPU readback of a whole RGBA frame (`width * height * 4`
+    /// bytes). Only frames from the Vulkan backend are RGBA.
+    pub fn test_rgba(&self) -> Result<Vec<u8>, String> {
+        let rgba = self.api.rgba.ok_or("this host video bridge has no RGBA readback")?;
+        let mut pixels = vec![0u8; self.width() as usize * self.height() as usize * 4];
+        let mut error = [0u8; 512];
+        let status = unsafe { rgba(self.pointer.as_ptr(), pixels.as_mut_ptr(), pixels.len() as u32, error.as_mut_ptr().cast(), error.len() as u32) };
+        if status == 0 { Ok(pixels) } else { Err(error_text(&error, status)) }
+    }
+    /// Diagnostic CPU readback of the first luma sample, explicitly separate
+    /// from GPU presentation. Only frames from the VA-API backend are YUV.
     pub fn test_luma(&self) -> Result<u32, String> {
         let mut error = [0u8; 512]; let mut sample = 0;
         let status = unsafe { (self.api.luma)(self.pointer.as_ptr(), &mut sample, error.as_mut_ptr().cast(), error.len() as u32) };

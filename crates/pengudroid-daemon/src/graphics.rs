@@ -1714,7 +1714,13 @@ mod imp {
                     ReceiveStatus::Frame(frame) => frame, _ => panic!("no hardware frame"),
                 };
                 let export = frame.export().unwrap();
-                assert_eq!(export.planes.len(), 2, "NV12 planes must reach the compositor unchanged");
+                // VA-API hands over the decode surface (NV12, two planes); the
+                // Vulkan Video backend hands over one RGBA plane.
+                if export.fourcc == u32::from_le_bytes(*b"NV12") {
+                    assert_eq!(export.planes.len(), 2, "NV12 planes must reach the compositor unchanged");
+                } else {
+                    assert_eq!((export.fourcc, export.planes.len()), (u32::from_le_bytes(*b"XB24"), 1));
+                }
                 let released = graphics.present_video_dmabuf(id, export).unwrap().expect("frame slot available");
                 graphics.refresh();
                 if pts == 31 { assert!(graphics.destroy_surface(id)); }

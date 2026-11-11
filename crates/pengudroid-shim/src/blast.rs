@@ -934,7 +934,23 @@ fn consumer_loop(addr: usize) {
                     };
                     blast.video_surface.store(surface_id, std::sync::atomic::Ordering::Release);
 
-                    if surface_id != 0 {
+                    // A block the hooked AVC component tagged holds no pixels:
+                    // it names a frame the daemon decoded on the GPU.
+                    let hardware = if surface_id != 0 { crate::avc_hw::present_tagged(fd, surface_id) } else { None };
+                    if let Some(result) = hardware {
+                        match result {
+                            Ok(()) => {
+                                presented += 1;
+                                if !announced {
+                                    announced = true;
+                                    eprintln!("[blast] video: first hardware frame submitted (layer {surface_id})");
+                                } else if trace && presented % 30 == 0 {
+                                    eprintln!("[blast] video: {presented} frames");
+                                }
+                            }
+                            Err(e) => if trace { eprintln!("[blast] video: hardware frame not shown: {e}"); },
+                        }
+                    } else if surface_id != 0 {
                         // Our GraphicBuffer allocator returns a CPU memfd, not
                         // a DMA_BUF fd. Importing it through linux-dmabuf kills
                         // the compositor connection. Snapshot via wl_shm instead.

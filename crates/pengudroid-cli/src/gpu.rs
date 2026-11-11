@@ -43,7 +43,7 @@ pub fn info() -> i32 {
                                 println!("VA-API version:   {}.{}", video.version.0, video.version.1);
                                 println!("VLD profiles:     {}", video.profiles.join(", "));
                             }
-                            Err(error) => println!("VA-API:           unavailable ({error}); other decode backends not probed"),
+                            Err(error) => println!("VA-API:           unavailable ({error}); Vulkan Video is tried at decode time, see video-decode-test"),
                         }
                     }
                 }
@@ -123,7 +123,8 @@ pub fn test() -> i32 {
     0
 }
 
-/// Decode one Annex-B H.264 access unit on VA-API and export GPU planes.
+/// Decode one Annex-B H.264 access unit on the GPU (VA-API, or Vulkan Video
+/// where the driver has no VA-API) and export GPU planes.
 /// The optional readback verifies a fixture; normal decode never downloads it.
 pub fn video_test(args: &[String]) -> i32 {
     let mut device = std::path::PathBuf::from("/dev/dri/renderD128");
@@ -152,6 +153,7 @@ pub fn video_test(args: &[String]) -> i32 {
             return video_broker_test(&bytes, &device);
         }
         let mut decoder = Decoder::open("h264", &device, &[])?;
+        let backend = decoder.backend().unwrap_or("hardware");
         if decoder.send(&bytes, 123456)? != SendStatus::Accepted { return Err("initial packet was not accepted".into()); }
         let mut eos = false;
         let mut count = 0;
@@ -166,7 +168,18 @@ pub fn video_test(args: &[String]) -> i32 {
                             plane.object_index, plane.stride, plane.offset,
                             frame.object_modifier(plane.object_index as usize).unwrap());
                     }
-                    if verify {
+                    if verify && backend == "vulkan" {
+                        // This backend exports RGBA. The fixture's first block is
+                        // Y=64 Cb=128 Cr=192, limited range; the bridge uses
+                        // BT.709 from 720 lines up and BT.601 below.
+                        let want = if frame.height() >= 720 { [171i32, 22, 56] } else { [158, 4, 56] };
+                        let pixels = frame.test_rgba()?;
+                        let got = [pixels[0] as i32, pixels[1] as i32, pixels[2] as i32];
+                        if got.iter().zip(want).any(|(g, w)| (g - w).abs() > 1) {
+                            return Err(format!("gradient verification failed: first pixel {got:?}, expected {want:?}"));
+                        }
+                        println!("diagnostic GPU readback: first pixel rgb={got:?}, verified");
+                    } else if verify {
                         let luma = frame.test_luma()?;
                         if luma != 64 { return Err(format!("gradient verification failed: luma={luma}, expected 64")); }
                         println!("diagnostic GPU readback: first luma=64, verified");
@@ -180,7 +193,7 @@ pub fn video_test(args: &[String]) -> i32 {
             }
         }
         if count == 0 { return Err("no hardware-decoded frame received".into()); }
-        println!("VA-API decode and synchronized GPU export: OK ({count} frames); NewPipe adapter pending");
+        println!("{backend} decode and synchronized GPU export: OK ({count} frames); NewPipe adapter pending");
         Ok(())
     })();
     match result { Ok(()) => 0, Err(error) => { eprintln!("pengudroid video: {error}"); 1 } }

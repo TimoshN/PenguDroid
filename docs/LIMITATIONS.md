@@ -104,9 +104,11 @@ What that does **not** give you is a real system: there is still no package
 manager (installed packages are synthesised per launch), no `ActivityManager`
 lifecycle (no `onPause`/`onStop`/task switching), no input dispatch, no
 `SurfaceFlinger` (the app's frames are exported straight to the compositor), and
-no `AudioFlinger`. `MediaCodec` decodes in ByteBuffer mode (H.264 through
-`libcodec2_soft_avcdec.so`, verified byte-exact against `ffmpeg`) but not yet to
-a `Surface`. Apps that only need to draw a view hierarchy work; apps that need
+no `AudioFlinger`. `MediaCodec` decodes H.264 in software (`libcodec2_soft_avcdec.so`,
+verified byte-exact against `ffmpeg` in ByteBuffer mode) and to a `Surface`:
+NewPipe's `SurfaceView` picture is on screen. Hardware decode exists on the host
+only (see [HARDWARE_VIDEO.md](HARDWARE_VIDEO.md)) and is not yet wired to
+`MediaCodec`. Apps that only need to draw a view hierarchy work; apps that need
 the platform's services do not.
 
 ### 2.1 ARM translation (Intel's NDK translation / Houdini lineage)
@@ -470,9 +472,9 @@ hanging forever, so a wedged guest cannot freeze its peers.
     the in-process codec2 service decodes H.264 and the frame reaches Java with
     the right pixels. Surface (`SurfaceView`) output works for an `ImageReader`
     consumer. ~~`AudioTrack`~~ **Done**: the class is hosted at the JNI boundary
-    and streams into `pw-cat`, so ExoPlayer plays. **Next**: `SurfaceView` —
-    decoded frames still have no `BLASTBufferQueue` to be composited from, which
-    is what keeps the picture off the window.
+    and streams into `pw-cat`, so ExoPlayer plays. `SurfaceView` output **done** as well: decoded frames
+    go through the real `BLASTBufferQueue` to a Wayland subsurface. **Next**: a
+    Codec2 component backed by the host hardware decoder.
 13. Input dispatch (touch/key) from the Wayland seat into the app's window.
 14. Guest ARM code execution, so arm64-only apps (Beach Buggy Racing 2,
     Genshin Impact) can run at all — see §2.1.

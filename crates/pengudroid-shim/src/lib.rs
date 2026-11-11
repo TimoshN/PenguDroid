@@ -87,6 +87,7 @@ use pengudroid_proto::abi::{validate_platform_property_override, ANDROID_API_LEV
 mod ahardwarebuffer;
 mod android_native;
 mod audiotrack;
+mod avc_hw;
 mod binder;
 mod audiofocus;
 mod virtual_input;

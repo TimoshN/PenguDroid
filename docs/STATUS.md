@@ -26,14 +26,31 @@ Verified this session on the shipped AppImage, not on the dev tree:
 
 ### Next concrete task
 
-1. **Hardware video decode** (`MediaCodec` with a real `AHardwareBuffer`
-   backing) — the last piece NewPipe playback needs.
+1. **Hardware video decode, guest half.** NewPipe plays today, in software:
+   `c2.android.avc.decoder` → BLAST → `wl_shm` snapshot (630 frames in a 60 s
+   run on 2026-11-11, picture confirmed from `PENGUDROID_DUMP_PRESENT`). The
+   host half now works on both Intel (VA-API) and NVIDIA (Vulkan Video); what
+   is missing is the Codec2 component that feeds compressed access units to
+   the daemon's packet broker instead of `libcodec2_soft_avcdec.so`.
 2. **Icons.** The shell logs `Error loading image …/icons/<pkg>.png` when icon
    extraction fails; fall back silently to the placeholder instead.
 3. `AHardwareBuffer`/gralloc, camera, and broader aarch64 translation coverage —
    tracked in [LIMITATIONS.md](LIMITATIONS.md).
 
 ### Done since the last handoff (2026-11-11)
+
+* **Hardware decode on NVIDIA.** The host decoder was VA-API only, which does
+  not exist on the proprietary NVIDIA driver. `libpengudroid_video.so` now has
+  a second backend, Vulkan Video, selected automatically when the render node
+  has no VA-API. On an RTX 3080 (595.99, GNOME Shell 50): the real-hardware
+  lifecycle test (2,000 decode/flush/export cycles, fd 85 → 85), the compositor
+  import test (32 frames) and `video-decode-test --broker` all pass. Output is
+  RGBA after one GPU compute pass, because Mutter cannot import a YUV dma-buf
+  from this driver; every frame of two x264 streams with P/B frames matches
+  FFmpeg's software conversion to within one code. The four driver facts that
+  forced this design are recorded in [HARDWARE_VIDEO.md](HARDWARE_VIDEO.md).
+  The VA-API path is unchanged in behaviour but **was not re-run** (no Intel
+  GPU on this machine).
 
 * **Frame pacing.** `eglSwapBuffers` now paces the guest to
   `PENGUDROID_MAX_FPS` (default 60, `0` = off): the daemon acks a present as

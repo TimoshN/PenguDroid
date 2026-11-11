@@ -95,4 +95,4 @@ pub fn decode_info(device: &Path) -> Result<VideoDecodeInfo, String> {
 }
 
 mod decode;
-pub use decode::{Decoder, ExportedFrame, ExportedPlane, HardwareFrame, Plane, ReceiveStatus, SendStatus};
+pub use decode::{Decoder, MAX_HELD_FRAMES, ExportedFrame, ExportedPlane, HardwareFrame, Plane, ReceiveStatus, SendStatus};
