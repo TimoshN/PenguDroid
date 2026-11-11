@@ -70,6 +70,15 @@ PLATFORM_SHARED = {
     "liblog": {"artifact": "", "relative": "system/lib64/liblog.so",
                "required_exports": ["__android_log_print", "__android_log_assert",
                                     "__android_log_write", "__android_log_vprint"]},
+    # The host side of libberberis_proxy_libOpenSLES. Without the proxy a guest
+    # app links the ARM64 Bionic libOpenSLES, whose libwilhelm -> libaudioclient
+    # -> libbinder chain opens /dev/binder from translated code and aborts
+    # (Genshin Impact's audio libraries).
+    "libOpenSLES": {"artifact": "", "relative": "system/lib64/libOpenSLES.so",
+                    "required_exports": ["slCreateEngine"]},
+    # Same reason as libOpenSLES: the ARM64 libaaudio reaches libbinder.
+    "libaaudio": {"artifact": "", "relative": "system/lib64/libaaudio.so",
+                  "required_exports": ["AAudio_createStreamBuilder", "AAudioStreamBuilder_openStream"]},
 }
 # Proxies use private platform libc APIs absent from the NDK link declarations.
 # Import on demand rather than silently accepting an unresolved allocator API.
@@ -1353,11 +1362,14 @@ class NativeBuild:
                     str(self.model.source_directory(blueprint))] + props.get("export_include_dirs", []) + props.get("local_include_dirs", []) + props.get("include_dirs", [])
         for key in ("header_libs", "static_libs", "whole_static_libs", "shared_libs"):
             for dep in props.get(key, []):
-                # liblog is a verified link input with no source declaration in
-                # this slice; its public `log/log.h` headers are already on the
-                # include path. The other platform imports (`libandroid`,
+                # liblog and libOpenSLES are verified link inputs with no
+                # source declaration in this slice; their public headers
+                # (`log/log.h`, `SLES/OpenSLES.h`) are already on the include
+                # path. The other platform imports (`libandroid`,
                 # `libdl_android`) do export headers consumers compile against.
-                if key == "shared_libs" and self.model.canonical(dep) == "liblog":
+                canonical = self.model.canonical(dep)
+                if key == "shared_libs" and canonical in PLATFORM_SHARED \
+                        and not PLATFORM_SHARED[canonical].get("artifact"):
                     continue
                 includes += self.exports(dep, (name,), linkage="shared" if key == "shared_libs" else "static")
         includes += [str(self.generate(gen)) for gen in props.get("generated_headers", [])]
@@ -2004,9 +2016,12 @@ def main():
                         and "kGearSwitchThreshold = UINT32_MAX;" in
                         (path / "base/include/berberis/base/config.h").read_text()
                     ) or (
+                        # The host-accessor pthread_attr overlay; its first form
+                        # discarded the result, the current one checks it.
                         artifact.get("destination") == "sources/native_bridge_support"
-                        and "pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size);" in
-                        (path / "android_api/libc/proxy/pthread_translation.cc").read_text()
+                        and any(marker in (path / "android_api/libc/proxy/pthread_translation.cc").read_text()
+                                for marker in ("pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size);",
+                                               "pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size) != 0"))
                     )
                     if not digest_matches and not is_known_compatibility_overlay:
                         raise BuildError(f"modified dependency: {path}")

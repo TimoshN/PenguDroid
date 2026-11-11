@@ -87,6 +87,7 @@ use pengudroid_proto::abi::{validate_platform_property_override, ANDROID_API_LEV
 mod ahardwarebuffer;
 mod android_native;
 mod audiotrack;
+mod aaudio;
 mod avc_hw;
 mod binder;
 mod audiofocus;
@@ -4794,7 +4795,7 @@ enum ObjKind {
 /// Both `ChildStdin` and `Child` are dropped by `Sink`'s `Drop`.
 struct Sink {
     child: Child,
-    stdin: Option<ChildStdin>,
+    pub(crate) stdin: Option<ChildStdin>,
 }
 
 impl Drop for Sink {
@@ -5325,7 +5326,7 @@ fn host_sink_command(program: &str) -> Command {
 }
 
 /// Spawn `pw-cat` (preferred) or `aplay` reading S16 PCM from stdin.
-fn spawn_sink(rate: u32, channels: u32) -> Option<Sink> {
+pub(crate) fn spawn_sink(rate: u32, channels: u32) -> Option<Sink> {
     let rate = rate.to_string();
     let channels = channels.to_string();
 

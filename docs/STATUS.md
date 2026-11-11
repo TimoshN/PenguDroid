@@ -26,6 +26,15 @@ Verified this session on the shipped AppImage, not on the dev tree:
 
 ### Next concrete task
 
+0. **Genshin Impact: guest GL calls crash in the host driver.** After the
+   fixes below Unity's first `glGenTextures`/`glBindBuffer` faults inside
+   `libnvidia-eglcore` (reads `[page+0x248]` in the low 32-bit window the
+   translator's code cache also uses) and, on Mesa, jumps to an unmapped host
+   address. The context hand-off between UnityMain and the render thread is
+   correct in the gleshim trace (`PENGUDROID_TRACE_GLESHIM=1` now prints tids).
+   Next measurement: which host function pointer the proxy/forwarder slot for
+   the faulting call holds, and whether it is still mapped.
+
 1. **Hardware video decode, guest half.** NewPipe plays today, in software:
    `c2.android.avc.decoder` → BLAST → `wl_shm` snapshot (630 frames in a 60 s
    run on 2026-11-11, picture confirmed from `PENGUDROID_DUMP_PRESENT`). The
@@ -38,6 +47,32 @@ Verified this session on the shipped AppImage, not on the dev tree:
    tracked in [LIMITATIONS.md](LIMITATIONS.md).
 
 ### Done since the last handoff (2026-11-11)
+
+* **Beach Buggy Racing 2 rendered black on most runs.** gleshim kept the
+  current EGL context/surface process-wide, so hwui's RenderThread and the
+  game's SDL thread overwrote each other's `glBindFramebuffer(0)` target.
+  Now per thread; 4/4 runs reach the race (was 1/3), NVIDIA and Mesa alike.
+* **Genshin Impact 7.2 (ARM64, Unity) gets to Unity's GL start-up.** Measured
+  blockers fixed in order: `resolveContentProvider` (FileProvider), app
+  `<meta-data>` + `resources.arsc` reference resolution (Play services
+  version), a primary storage volume (`getExternalFilesDir()` was null →
+  mkdir `/Persistent` → abort), window focus without input (UnityMain waits
+  for it), guest `pthread_self()` records passed to glibc
+  (`pthread_detach` crash), and ARM64 `libOpenSLES`/`libaaudio` replaced by
+  native-bridge stubs + proxies (the Bionic copies open `/dev/binder` from
+  translated code and abort). AAudio output is a new shim implementation on
+  the `pw-cat` sink. The HoYoverse splash renders; Unity then creates its
+  GLES contexts, swaps, and **crashes in its first GL calls**
+  (`glGenTextures`/`glBindBuffer`) inside the host driver — on NVIDIA and on
+  Mesa llvmpipe alike, so the fault is in the guest→host GL call path, not a
+  driver bug. That is the next task. Genshin is **not** playable yet.
+
+  Local, non-repository steps this needed (redo on a fresh `.toolchain`):
+  `tools/build-nativebridge.py --module libberberis_proxy_libOpenSLES` and
+  `..._libaaudio` (with `PENGUDROID_LLVM_DIR=.toolchain/llvm-bin` and
+  `--reuse-report` of a run that contains `libberberis_arm64`), copying the
+  `glibc/` outputs into `target/guest-pc-ring/lib/`, and
+  `tools/build-guest-stubs.py --only libOpenSLES libaaudio`.
 
 * **Hardware decode on NVIDIA.** The host decoder was VA-API only, which does
   not exist on the proprietary NVIDIA driver. `libpengudroid_video.so` now has

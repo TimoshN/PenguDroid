@@ -1413,7 +1413,13 @@ pub unsafe extern "C" fn eglCreateContext(
     let attribs = if translated.is_empty() { attribs } else { translated.as_ptr() };
     match host() {
         // SAFETY: forwarded verbatim.
-        Ok(host) => (host.create_context)(dpy, config, share_context, attribs),
+        Ok(host) => {
+            let context = (host.create_context)(dpy, config, share_context, attribs);
+            if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                eprintln!("[gleshim] eglCreateContext share={share_context:p} -> {context:p} tid={}", libc::gettid());
+            }
+            context
+        }
         Err(e) => {
             log_once(format_args!("{e}"));
             std::ptr::null_mut()
@@ -1423,6 +1429,9 @@ pub unsafe extern "C" fn eglCreateContext(
 
 #[no_mangle]
 pub unsafe extern "C" fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> u32 {
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] eglDestroyContext ctx={ctx:p} tid={}", libc::gettid());
+    }
     let ok = match host() {
         // SAFETY: forwarded verbatim.
         Ok(host) => (host.destroy_context)(dpy, ctx),
@@ -1456,7 +1465,7 @@ pub unsafe extern "C" fn eglMakeCurrent(
     // A surfaceless host display has no window surfaces; the app renders into
     // our FBO instead, so only the context is made current.
     if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] eglMakeCurrent dpy={dpy:p} draw={draw:p} ctx={ctx:p}");
+        eprintln!("[gleshim] eglMakeCurrent dpy={dpy:p} draw={draw:p} ctx={ctx:p} tid={}", libc::gettid());
     }
     let dpy = resolve_display(dpy);
     let ok = (host.make_current)(

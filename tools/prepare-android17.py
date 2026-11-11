@@ -55,6 +55,10 @@ REQUIRED = (
     # Link input for the native bridge's libbase dependency; the bridge build
     # does not recompile system/core's liblog from the incomplete source slice.
     "system/lib64/liblog.so",
+    # Link input for the native bridge's OpenSL ES proxy: ARM64 games reach
+    # audio through it instead of the guest's binder-backed libwilhelm.
+    "system/lib64/libOpenSLES.so",
+    "system/lib64/libaaudio.so",
 )
 
 

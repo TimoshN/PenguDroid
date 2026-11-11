@@ -267,7 +267,9 @@ silently fall back to a container.
   `pengudroid native`, with `AAssetManager`, `ALooper`, EGL/GLES and Vulkan. This
   is the path `pengudroid launch` picks, and `fixtures/native-game` is a playable
   game at ~56 fps on an RTX 3080.
-* **Genshin Impact still cannot run here.** Its Android build is `arm64-v8a`
+* **Genshin Impact still cannot be played here** (2026-11-11: it now boots
+  through its SDKs to the HoYoverse splash and Unity's GL start-up, then
+  crashes in the guest→host GL path; see STATUS.md). The original note: Its Android build is `arm64-v8a`
   only; the NDK translator above is the right tool for that and now initialises
   and starts ARM64 code, but it does not yet complete guest execution (see 2.1).
   On top of that it ships ~20 GB of OBB data, a proprietary anti-cheat, and it

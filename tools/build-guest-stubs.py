@@ -61,6 +61,10 @@ STUB_LIBRARIES = (
     "libGLESv2",
     "libGLESv3",
     "libandroid",
+    # The Bionic original pulls libwilhelm -> libaudioclient -> libbinder into
+    # the guest, and translated code then aborts opening /dev/binder.
+    "libOpenSLES",
+    "libaaudio",
 )
 
 INTERCEPT_SYMBOL = "native_bridge_intercept_symbol"
@@ -76,6 +80,8 @@ INTERCEPT_SYMBOL = "native_bridge_intercept_symbol"
 VERSION_NODES: dict[str, tuple[tuple[str, str | None], ...]] = {
     "libGLESv1_CM": (("LIBGLESV1_CM", None),),
     "libandroid": (("LIBANDROID", None), ("LIBANDROID_PLATFORM", "LIBANDROID")),
+    "libOpenSLES": (("LIBOPENSLES", None),),
+    "libaaudio": (("LIBAAUDIO", None),),
 }
 
 

@@ -119,6 +119,8 @@ pub fn ensure_compat_dir() -> Result<PathBuf, String> {
         "libnativewindow.so",
         "libnativehelper.so",
         "libOpenSLES.so",
+        // AAudio output is implemented on the same host sink (shim aaudio.rs).
+        "libaaudio.so",
         // Android's linker API (`android_dlopen_ext`, `android_create_namespace`,
         // the `__loader_*` entry points) is translated to glibc by the shim, so
         // the linker and its `libdl_android` wrapper resolve here too.
