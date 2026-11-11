@@ -364,15 +364,43 @@ fn cast_fn<T: Copy>(ptr: *mut c_void) -> Option<T> {
 struct State {
     /// Host `EGLDisplay`, stored as `usize` so `State` stays `Send`.
     display: usize,
-    /// Host `EGLContext` that the app most recently made current.
+    /// Host `EGLContext` that some thread most recently made current. Only a
+    /// fallback for a thread that has none; what is current is per thread.
     context: usize,
-    /// Our `EGLSurface` (`*mut SurfaceRec`) currently made current.
-    current_surface: usize,
 
     conn: Option<Connection>,
     surface_id: Option<u32>,
     /// Whether we already tried (and possibly failed) to reach the daemon.
     connect_attempted: bool,
+}
+
+// EGL's current context and draw surface are per *thread*. They used to be one
+// process-wide value, so when hwui's RenderThread made its surface current, a
+// game's SDL render thread had its `glBindFramebuffer(0)` redirected to hwui's
+// FBO name, which does not exist in the game's context: every frame went
+// nowhere and the window stayed black. Which thread made its surface current
+// last depended on scheduling, so the same APK rendered on some runs and was
+// black on others (measured on Beach Buggy Racing 2).
+thread_local! {
+    static CURRENT_CONTEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CURRENT_SURFACE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Every `SurfaceRec` this module created and has not destroyed. Another
+/// thread may still name a surface as current after this thread destroyed it;
+/// it is only dereferenced while it is in here.
+fn live_surfaces() -> &'static Mutex<std::collections::HashSet<usize>> {
+    static LIVE: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+fn current_surface() -> usize {
+    let surface = CURRENT_SURFACE.with(|c| c.get());
+    if surface != 0 && !live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).contains(&surface) {
+        CURRENT_SURFACE.with(|c| c.set(0));
+        return 0;
+    }
+    surface
 }
 
 fn state() -> &'static Mutex<State> {
@@ -556,10 +584,12 @@ unsafe fn ensure_host_context(host: &Host) -> Result<(), String> {
         if !get_current_context().is_null() {
             return Ok(());
         }
-        let (display, context) = {
+        let (display, fallback) = {
             let st = lock_state();
             (st.display, st.context)
         };
+        let own = CURRENT_CONTEXT.with(|c| c.get());
+        let context = if own != 0 { own } else { fallback };
         if display != 0 && context != 0 {
             let ok = (host.make_current)(
                 display as EGLDisplay,
@@ -632,7 +662,8 @@ pub fn export_surface_dmabuf(surface: EGLSurface) -> Result<DmabufExport, String
     // The display and current context. Never pass `EGL_NO_CONTEXT`.
     let (cached_display, cached_context) = {
         let st = lock_state();
-        (st.display, st.context)
+        let own = CURRENT_CONTEXT.with(|c| c.get());
+        (st.display, if own != 0 { own } else { st.context })
     };
     let current_context = host
         .get_current_context
@@ -1402,6 +1433,7 @@ pub unsafe extern "C" fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> 
         if st.context == ctx as usize {
             st.context = 0;
         }
+        CURRENT_CONTEXT.with(|c| if c.get() == ctx as usize { c.set(0) });
     }
     ok
 }
@@ -1434,8 +1466,7 @@ pub unsafe extern "C" fn eglMakeCurrent(
         ctx,
     );
     if ok != EGL_TRUE {
-        let mut st = lock_state();
-        st.current_surface = 0;
+        // A failed eglMakeCurrent leaves the previous binding in place.
         return EGL_FALSE;
     }
 
@@ -1444,9 +1475,12 @@ pub unsafe extern "C" fn eglMakeCurrent(
         if !dpy.is_null() {
             st.display = dpy as usize;
         }
-        st.context = ctx as usize;
-        st.current_surface = draw as usize;
+        if !ctx.is_null() {
+            st.context = ctx as usize;
+        }
     }
+    CURRENT_CONTEXT.with(|c| c.set(ctx as usize));
+    CURRENT_SURFACE.with(|c| c.set(draw as usize));
 
     // `read` is ignored: the FBO is both the draw and read target.
     let _ = read;
@@ -1468,7 +1502,7 @@ pub unsafe extern "C" fn eglGetCurrentContext() -> EGLContext {
         // SAFETY: plain entry point.
         return get_current_context();
     }
-    lock_state().context as EGLContext
+    CURRENT_CONTEXT.with(|c| c.get()) as EGLContext
 }
 
 #[no_mangle]
@@ -1485,7 +1519,7 @@ pub unsafe extern "C" fn eglGetCurrentDisplay() -> EGLDisplay {
 
 #[no_mangle]
 pub unsafe extern "C" fn eglGetCurrentSurface(_readdraw: i32) -> EGLSurface {
-    lock_state().current_surface as EGLSurface
+    current_surface() as EGLSurface
 }
 
 #[no_mangle]
@@ -1613,7 +1647,7 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
         owns_surface: false,
     });
     let surface = Box::into_raw(rec) as EGLSurface;
-    lock_state().current_surface = surface as usize;
+    live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).insert(surface as usize);
     surface
 }
 
@@ -1651,10 +1685,9 @@ pub unsafe extern "C" fn eglDestroySurface(_dpy: EGLDisplay, surface: EGLSurface
         return EGL_FALSE;
     }
     {
+        live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&(surface as usize));
+        CURRENT_SURFACE.with(|c| if c.get() == surface as usize { c.set(0) });
         let mut st = lock_state();
-        if st.current_surface == surface as usize {
-            st.current_surface = 0;
-        }
         let rec = &mut *(surface as *mut SurfaceRec);
         if let Err(e) = destroy_daemon_surface(&mut st, rec) {
             eprintln!("[pengudroid-gleshim] {e}");
@@ -1695,7 +1728,7 @@ pub unsafe extern "C" fn eglCreatePbufferSurface(
     }
     let rec = Box::new(SurfaceRec { w, h, tex: 0, fbo: 0, surface_id: 0, owns_surface: false });
     let surface = Box::into_raw(rec) as EGLSurface;
-    lock_state().current_surface = surface as usize;
+    live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).insert(surface as usize);
     surface
 }
 
@@ -2133,7 +2166,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         fd.as_raw_fd(),
     ) {
         Ok(()) => {
-            pace_swap();
+            pace_swap(surface as usize);
             EGL_TRUE
         }
         Err(e) => {
@@ -2173,10 +2206,13 @@ fn micros_to_sleep(last_us: u64, now_us: u64, gap_us: u64) -> u64 {
 /// remainder of the frame budget here paces the guest to `PENGUDROID_MAX_FPS`
 /// (default 60, `0` disables). This is deliberately guest-side: blocking the
 /// daemon on a wl_callback would stall every other client, including input.
-fn pace_swap() {
-    use std::sync::atomic::{AtomicU64, Ordering};
+///
+/// The budget is per surface. One process-wide clock made every surface share
+/// one 60 Hz budget, so an app with an hwui window and a game surface (Beach
+/// Buggy Racing 2 has four) slowed each of them down.
+fn pace_swap(surface: usize) {
     use std::time::{Duration, Instant};
-    static LAST_US: AtomicU64 = AtomicU64::new(0);
+    static LAST_US: OnceLock<Mutex<std::collections::HashMap<usize, u64>>> = OnceLock::new();
     static MAX_FPS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let max_fps = *MAX_FPS.get_or_init(|| {
         std::env::var("PENGUDROID_MAX_FPS")
@@ -2190,8 +2226,15 @@ fn pace_swap() {
     static ANCHOR: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let anchor = *ANCHOR.get_or_init(Instant::now);
     let now_us = anchor.elapsed().as_micros() as u64;
-    let last = LAST_US.swap(now_us, Ordering::Relaxed);
-    let sleep = micros_to_sleep(last, now_us, gap);
+    let sleep = {
+        let mut last = LAST_US.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        // A destroyed surface's address can be reused; a stale entry only
+        // costs at most one frame budget, and the map stays as small as the
+        // number of surfaces ever swapped.
+        if last.len() > 256 { last.clear(); }
+        let previous = last.insert(surface, now_us);
+        previous.map_or(0, |previous| micros_to_sleep(previous, now_us, gap))
+    };
     if sleep > 0 {
         std::thread::sleep(Duration::from_micros(sleep));
     }
@@ -2356,10 +2399,7 @@ pub unsafe extern "C" fn glBindFramebuffer(target: u32, framebuffer: u32) {
         return;
     };
     if framebuffer == 0 {
-        let surface = {
-            let st = lock_state();
-            st.current_surface as EGLSurface
-        };
+        let surface = current_surface() as EGLSurface;
         if !surface.is_null() && ensure_fbo(surface, host).is_ok() {
             let rec = &*(surface as *const SurfaceRec);
             bind(target, rec.fbo);
@@ -2545,5 +2585,29 @@ mod tests {
             assert_eq!(eglDestroySurface(dpy, surface), EGL_TRUE);
             assert_eq!(eglDestroyContext(dpy, ctx), EGL_TRUE);
         }
+    }
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+
+    /// The current surface is per thread: another thread making its own
+    /// surface current must not change what this thread binds as FBO 0.
+    #[test]
+    fn current_surface_is_per_thread_and_forgets_destroyed_surfaces() {
+        let mine = 0x1000usize;
+        let theirs = 0x2000usize;
+        live_surfaces().lock().unwrap().extend([mine, theirs]);
+        CURRENT_SURFACE.with(|c| c.set(mine));
+        std::thread::spawn(move || {
+            assert_eq!(current_surface(), 0, "a new thread has no current surface");
+            CURRENT_SURFACE.with(|c| c.set(theirs));
+            assert_eq!(current_surface(), theirs);
+        }).join().unwrap();
+        assert_eq!(current_surface(), mine);
+        live_surfaces().lock().unwrap().remove(&mine);
+        assert_eq!(current_surface(), 0, "a destroyed surface is never handed out");
+        live_surfaces().lock().unwrap().remove(&theirs);
     }
 }
