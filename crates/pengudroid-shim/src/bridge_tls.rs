@@ -13,9 +13,10 @@
 //! Allocations intentionally survive until process exit: Rust TLS destructors
 //! can precede the translator's pthread-key guest destructors. This costs one
 //! approximately 16 KiB mapping per participating host thread. No unmap or
-//! pthread registry/destructor emulation is claimed. Guest pthread handles
-//! MUST NOT be passed directly to glibc join/detach/etc.; proxy adaptation is
-//! separate work. Bootstrap bionic_tcb remains null until ConfigStaticTls binds
+//! pthread destructor emulation is claimed. A guest `pthread_self()` returns
+//! the synthetic record below, while every pthread function that takes a
+//! `pthread_t` is served by glibc; [`host_handle`] maps a record back to its
+//! host thread, and the shim's pthread wrappers apply it at that boundary. Bootstrap bionic_tcb remains null until ConfigStaticTls binds
 //! the actual guest TCB. MTE/guest pthread enumeration are not implemented here.
 
 use core::ffi::{c_int, c_void};
@@ -70,6 +71,24 @@ thread_local! {
 }
 const BUSY: *mut State = 1usize as *mut State;
 
+/// Synthetic guest pthread record → the host `pthread_t` it stands for. Records
+/// are never unmapped, so a stale entry names a finished host thread, which is
+/// exactly what glibc would be told about it.
+static HANDLES: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The host `pthread_t` for `handle`: unchanged unless it is a guest record.
+pub fn host_handle(handle: usize) -> usize {
+    HANDLES.lock().unwrap_or_else(|e| e.into_inner()).get(&handle).copied().unwrap_or(handle)
+}
+
+/// The kernel TID stored in a guest record, if `handle` is one.
+pub fn guest_record_tid(handle: usize) -> Option<i32> {
+    if !HANDLES.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&handle) { return None; }
+    // SAFETY: registered records live until process exit.
+    Some(unsafe { ptr::read((handle as *const u8).add(PTHREAD_TID).cast::<i32>()) })
+}
+
 unsafe fn store<T: Copy>(base: *mut u8, offset: usize, value: T) {
     ptr::write(base.add(offset).cast::<T>(), value);
 }
@@ -121,6 +140,7 @@ unsafe fn initialize() -> Result<*mut State, c_int> {
     let state = allocation.cast::<State>();
     (*state).host_pthread = host as usize;
     let pthread = ptr::addr_of_mut!((*state).pthread.0).cast::<u8>();
+    HANDLES.lock().unwrap_or_else(|e| e.into_inner()).insert(pthread as usize, host as usize);
     let tls = ptr::addr_of_mut!((*state).tls.0).cast::<u8>();
     let libgen = ptr::addr_of_mut!((*state).libgen.0).cast::<u8>();
     store(pthread, PTHREAD_BIONIC_TLS, tls);
@@ -219,6 +239,21 @@ pub unsafe extern "C" fn pengudroid_bridge_tls_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_records_map_to_their_host_thread_and_other_handles_pass_through() {
+        unsafe {
+            let record = Box::into_raw(Box::new([0u8; PTHREAD_SIZE]));
+            ptr::write((record as *mut u8).add(PTHREAD_TID).cast::<i32>(), 4242);
+            HANDLES.lock().unwrap().insert(record as usize, 0x1234_5000);
+            assert_eq!(host_handle(record as usize), 0x1234_5000);
+            assert_eq!(guest_record_tid(record as usize), Some(4242));
+            assert_eq!(host_handle(0x7777_0000), 0x7777_0000);
+            assert_eq!(guest_record_tid(0x7777_0000), None);
+            HANDLES.lock().unwrap().remove(&(record as usize));
+            drop(Box::from_raw(record));
+        }
+    }
 
     unsafe fn view(tp: *mut c_void, storage: *mut c_void) -> BridgeTlsView {
         let mut out = MaybeUninit::<BridgeTlsView>::uninit();

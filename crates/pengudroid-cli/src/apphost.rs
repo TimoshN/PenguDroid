@@ -110,6 +110,8 @@ pub struct AppSpec<'a> {
     pub version_name: Option<&'a str>,
     /// `android:versionCode` from the manifest.
     pub version_code: u32,
+    /// `<application>`'s `<meta-data>`, references already resolved.
+    pub application_meta: &'a [(String, crate::apk::MetaValue)],
 }
 
 fn new_instance(env: &JniEnv, class_name: &str) -> Option<(JClass, JObject)> {
@@ -193,6 +195,13 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
     // ever drawn. `FLAG_HAS_CODE` (0x4) and `FLAG_SUPPORTS_SCREEN_DENSITIES`
     // (0x2000) are what a normal APK declares.
     set_int("flags", 0x1000_0000 | 0x2000 | 0x4);
+    // `<application>`'s own `<meta-data>`. Google Play services, Firebase and
+    // most SDK initializers read their configuration from here.
+    if let Some(bundle) = build_meta_bundle(env, spec.application_meta) {
+        if let Some(id) = env.field_id(class, "metaData", "Landroid/os/Bundle;") {
+            env.set_object_field(info, id, bundle);
+        }
+    }
     // Read back the fields `LoadedApk` depends on: a silently failed write here
     // shows up much later as "No data directory found for package".
     if let Some(id) = env.field_id(class, "dataDir", "Ljava/lang/String;") {
@@ -880,6 +889,10 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         return false;
     };
     install_package_manager_replies(env, app_info, spec);
+    if install_storage_volumes(env, spec).is_none() {
+        env.exception_check();
+        eprintln!("apphost: no primary storage volume; getExternalFilesDir() will be null");
+    }
     // `RobloxApplication.onCreate` reads `Settings.Global` (through
     // `Settings.NameValueCache`), which resolves the `settings` provider via
     // `IActivityManager.getContentProvider` *during* the bind. The reply has to
@@ -4719,6 +4732,18 @@ fn spawn_input_pump(env: &JniEnv) {
                 last_geometry = std::time::Instant::now();
                 if let Some(_frame) = env.local_frame(64) {
                     refresh_surface_views_after_resize(&env, &mut root_sizes);
+                    // The window manager gives the top window focus as soon as
+                    // it is shown, not on the first input event. Engines wait
+                    // for it: Unity's UnityMain stays idle in its Looper until
+                    // onWindowFocusChanged(true), so Genshin Impact never
+                    // started rendering when nobody touched the window.
+                    // `keyboard_root` only notifies roots whose focus changes.
+                    if let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) {
+                        let roots = env.object_field(wmg, roots_field);
+                        if !roots.is_null() {
+                            let _ = keyboard_root(&env, roots, root_class, size_m, get_m);
+                        }
+                    }
                 }
             }
             if trace_input && input_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
@@ -6527,6 +6552,18 @@ fn install_application_transactions(env: &JniEnv) -> Option<()> {
     println!(
         "binder: framework application transaction codes = {codes:?}, activity lifecycle = {lifecycle:?}"
     );
+    // Optional: an app without a FileProvider never asks.
+    let resolve = env.find_class("android/content/pm/IPackageManager$Stub").and_then(|class| {
+        let field = env.static_field_id(class, "TRANSACTION_resolveContentProvider", "I")?;
+        u32::try_from(env.static_int_field(class, field)).ok()
+    });
+    match (resolve, shim_symbol("__pengudroid_binder_set_package_transactions")) {
+        (Some(code), Some(setter)) => {
+            let setter: unsafe extern "C" fn(u32) -> bool = unsafe { std::mem::transmute(setter) };
+            if unsafe { setter(code) } { println!("binder: resolveContentProvider = {code}"); }
+        }
+        _ => { env.exception_check(); eprintln!("binder: resolveContentProvider code unavailable"); }
+    }
     Some(())
 }
 
@@ -6970,6 +7007,60 @@ fn marshal_object(env: &JniEnv, obj: JObject, class_name: &str) -> Option<Vec<u8
     let marshall = env.method_id(parcel_class, "marshall", "()[B")?;
     let bytes = env.call_object(parcel, marshall, &[])?;
     env.byte_array_copy(bytes)
+}
+
+/// Publish one primary, emulated storage volume for `IStorageManager.getVolumeList`.
+///
+/// Its directory is a real host directory under the app's data directory, so
+/// Java's `File.mkdirs` and native `mkdir` both work on what
+/// `getExternalFilesDir()` returns, without any path translation.
+fn install_storage_volumes(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
+    let _frame = env.local_frame(32)?;
+    let root = spec.data_dir.join("external_storage");
+    std::fs::create_dir_all(&root).ok()?;
+    let root = root.display().to_string();
+    let stub = env.find_class("android/os/storage/IStorageManager$Stub")?;
+    let code = u32::try_from(env.static_int_field(stub, env.static_field_id(stub, "TRANSACTION_getVolumeList", "I")?)).ok()?;
+
+    let file_class = env.find_class("java/io/File")?;
+    let file_ctor = env.method_id(file_class, "<init>", "(Ljava/lang/String;)V")?;
+    let path = env.new_object(file_class, file_ctor, &[JValue { l: env.new_string(&root) }])?;
+    let user_class = env.find_class("android/os/UserHandle")?;
+    let user_of = env.static_method_id(user_class, "of", "(I)Landroid/os/UserHandle;")?;
+    let owner = env.call_static_object(user_class, user_of, &[JValue { i: 0 }])?;
+    let volume_class = env.find_class("android/os/storage/StorageVolume")?;
+    let (id, description, state) = (env.new_string("emulated;0"), env.new_string("Internal shared storage"), env.new_string("mounted"));
+    let flag = |value: bool| JValue { z: value as u8 };
+    // primary, removable, emulated, [externallyManaged,] allowMassStorage.
+    let flags = [flag(true), flag(false), flag(true), flag(false), flag(false)];
+    let mut volume = None;
+    for (signature, flag_count) in [
+        ("(Ljava/lang/String;Ljava/io/File;Ljava/io/File;Ljava/lang/String;ZZZZZJLandroid/os/UserHandle;Ljava/util/UUID;Ljava/lang/String;Ljava/lang/String;)V", 5),
+        ("(Ljava/lang/String;Ljava/io/File;Ljava/io/File;Ljava/lang/String;ZZZZJLandroid/os/UserHandle;Ljava/util/UUID;Ljava/lang/String;Ljava/lang/String;)V", 4),
+    ] {
+        let Some(ctor) = env.method_id(volume_class, "<init>", signature) else { env.exception_check(); continue };
+        let mut args = vec![JValue { l: id }, JValue { l: path }, JValue { l: path }, JValue { l: description }];
+        args.extend(if flag_count == 5 { flags.to_vec() } else { vec![flags[0], flags[1], flags[2], flags[4]] });
+        args.extend([JValue { j: 0 }, JValue { l: owner }, JValue { l: std::ptr::null_mut() },
+            JValue { l: std::ptr::null_mut() }, JValue { l: state }]);
+        volume = env.new_object(volume_class, ctor, &args);
+        if volume.is_some() { break; }
+    }
+    let volume = volume?;
+    let array = env.new_object_array(1, volume_class, std::ptr::null_mut())?;
+    env.set_object_array_element(array, 0, volume);
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let parcel = env.call_static_object(parcel_class, obtain, &[])?;
+    let write = env.method_id(parcel_class, "writeTypedArray", "([Landroid/os/Parcelable;I)V")?;
+    if !env.call_void(parcel, write, &[JValue { l: array }, JValue { i: 0 }]) { return None; }
+    let marshall = env.method_id(parcel_class, "marshall", "()[B")?;
+    let bytes = env.byte_array_copy(env.call_object(parcel, marshall, &[])?)?;
+    let setter = shim_symbol("__pengudroid_binder_set_storage_volumes")?;
+    let setter: unsafe extern "C" fn(u32, *const u8, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(code, bytes.as_ptr(), bytes.len()) } { return None; }
+    println!("apphost: primary storage volume {root} (getVolumeList = {code}, {} bytes)", bytes.len());
+    Some(())
 }
 
 /// Hand a serialized reply to the binder broker.
@@ -7543,6 +7634,9 @@ fn install_provider_list(env: &JniEnv, list: JObject, app_info: JObject, spec: &
         // `metaData`; publish the same object under the class name.
         if let Some(bytes) = marshal_object(env, info, "android/content/pm/ProviderInfo") {
             install_provider_entry(&provider.name, &bytes);
+            if let Some(authority) = &provider.authority {
+                install_provider_authority(&provider.name, authority);
+            }
         }
         if env.call_boolean(list, add, &[JValue { l: info }]) == Some(true) {
             added += 1;
@@ -7585,7 +7679,8 @@ fn build_meta_bundle(
                     env.call_void(bundle, m, &[JValue { l: k }, JValue { z: *b as u8 }]);
                 }
             }
-            crate::apk::MetaValue::Ref(r) => {
+            // Unresolvable `android:value` reference: the id is all there is.
+            crate::apk::MetaValue::Ref(r) | crate::apk::MetaValue::ValueRef(r) => {
                 if let Some(m) = put_int {
                     env.call_void(bundle, m, &[JValue { l: k }, JValue { i: *r as i32 }]);
                 }
@@ -7593,6 +7688,13 @@ fn build_meta_bundle(
         }
     }
     Some(bundle)
+}
+
+/// Let `resolveContentProvider(authority)` find the entry published above.
+fn install_provider_authority(name: &str, authority: &str) {
+    let Some(f) = shim_symbol("__pengudroid_binder_set_provider_authority") else { return };
+    let f: unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> bool = unsafe { std::mem::transmute(f) };
+    unsafe { f(name.as_ptr(), name.len(), authority.as_ptr(), authority.len()) };
 }
 
 /// Publish one marshalled `ProviderInfo` under its class name.

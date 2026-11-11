@@ -4022,13 +4022,54 @@ pub unsafe extern "C" fn sigaction64(
 
 /// `pthread_gettid_np(thread)` — Bionic's accessor for a thread's kernel TID.
 ///
-/// glibc's `pthread_t` is a TCB address rather than a TID, so the TID is read
-/// from the kernel. Only the calling thread is resolved exactly; for any other
-/// thread the caller's own TID is returned, which is correct for the common case
-/// (a thread asking for its own id) and harmless otherwise.
+/// A guest record carries its TID. Otherwise glibc 2.42+ answers for any host
+/// thread; an older glibc has no such call, so only the caller's own TID can
+/// be given (the common case: a thread asking about itself).
 #[no_mangle]
-pub unsafe extern "C" fn pthread_gettid_np(_thread: libc::pthread_t) -> libc::pid_t {
-    libc::gettid()
+pub unsafe extern "C" fn pthread_gettid_np(thread: libc::pthread_t) -> libc::pid_t {
+    if let Some(tid) = bridge_tls::guest_record_tid(thread as usize) { return tid; }
+    type Gettid = unsafe extern "C" fn(libc::pthread_t) -> libc::pid_t;
+    static NEXT: OnceLock<Option<Gettid>> = OnceLock::new();
+    match NEXT.get_or_init(|| dlsym_next(b"pthread_gettid_np\0")) {
+        Some(next) => next(thread),
+        None => libc::gettid(),
+    }
+}
+
+// A translated ARM64 thread's `pthread_self()` is a synthetic Bionic record
+// (see bridge_tls), but every call below is served by glibc, which reads its
+// argument as its own TCB. Genshin Impact's worker threads begin with
+// `pthread_detach(pthread_self())`; glibc then followed garbage into
+// `__nptl_deallocate_stack` and the process died. Each wrapper maps a guest
+// record to the host thread it stands for and passes anything else through,
+// so host callers are unaffected.
+macro_rules! host_pthread_call {
+    ($name:ident, $symbol:literal, ($($arg:ident: $ty:ty),*) -> $ret:ty) => {
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(thread: libc::pthread_t $(, $arg: $ty)*) -> $ret {
+            type Next = unsafe extern "C" fn(libc::pthread_t $(, $ty)*) -> $ret;
+            static NEXT: OnceLock<Option<Next>> = OnceLock::new();
+            let Some(next) = *NEXT.get_or_init(|| dlsym_next($symbol)) else { return libc::ENOSYS as $ret };
+            next(bridge_tls::host_handle(thread as usize) as libc::pthread_t $(, $arg)*)
+        }
+    };
+}
+host_pthread_call!(pthread_detach, b"pthread_detach\0", () -> c_int);
+host_pthread_call!(pthread_join, b"pthread_join\0", (retval: *mut *mut c_void) -> c_int);
+host_pthread_call!(pthread_kill, b"pthread_kill\0", (signal: c_int) -> c_int);
+host_pthread_call!(pthread_getattr_np, b"pthread_getattr_np\0", (attr: *mut libc::pthread_attr_t) -> c_int);
+host_pthread_call!(pthread_setname_np, b"pthread_setname_np\0", (name: *const c_char) -> c_int);
+host_pthread_call!(pthread_getname_np, b"pthread_getname_np\0", (name: *mut c_char, len: usize) -> c_int);
+host_pthread_call!(pthread_getschedparam, b"pthread_getschedparam\0", (policy: *mut c_int, param: *mut libc::sched_param) -> c_int);
+host_pthread_call!(pthread_setschedparam, b"pthread_setschedparam\0", (policy: c_int, param: *const libc::sched_param) -> c_int);
+host_pthread_call!(pthread_setschedprio, b"pthread_setschedprio\0", (priority: c_int) -> c_int);
+host_pthread_call!(pthread_getcpuclockid, b"pthread_getcpuclockid\0", (clock: *mut libc::clockid_t) -> c_int);
+host_pthread_call!(pthread_sigqueue, b"pthread_sigqueue\0", (signal: c_int, value: libc::sigval) -> c_int);
+
+/// `pthread_equal(a, b)` — a guest record and its host thread are one thread.
+#[no_mangle]
+pub extern "C" fn pthread_equal(a: libc::pthread_t, b: libc::pthread_t) -> c_int {
+    (bridge_tls::host_handle(a as usize) == bridge_tls::host_handle(b as usize)) as c_int
 }
 
 /// Bionic's `__assert`/`__assert2`: report and abort (glibc's are different).

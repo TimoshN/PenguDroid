@@ -582,6 +582,64 @@ pub extern "C" fn __pengudroid_binder_set_application_transactions(
     true
 }
 
+/// `IStorageManager.getVolumeList` and its reply body: a typed
+/// `StorageVolume[]` marshalled by the framework's own `Parcel`. With no
+/// answer the list is empty, `Context.getExternalFilesDir()` returns null and
+/// apps that build paths on it fail (Genshin Impact: `"" + "/Persistent"`).
+static STORAGE_VOLUMES: Mutex<(u32, Vec<u8>)> = Mutex::new((u32::MAX, Vec::new()));
+
+/// # Safety
+/// `ptr` must be readable for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_storage_volumes(code: u32, ptr: *const u8, len: usize) -> bool {
+    if code == 0 || code >= 0x00ff_fffe || ptr.is_null() || len < 4 { return false; }
+    *STORAGE_VOLUMES.lock().unwrap_or_else(|e| e.into_inner()) = (code, std::slice::from_raw_parts(ptr, len).to_vec());
+    true
+}
+
+/// `IPackageManager.resolveContentProvider`, read from the loaded Stub.
+/// androidx `FileProvider` looks its own `ProviderInfo` up this way (by
+/// authority, with `GET_META_DATA`) to find its paths XML; without an answer
+/// the app dies in `installContentProviders` (Genshin Impact's ShareProvider).
+static RESOLVE_CONTENT_PROVIDER_CODE: Mutex<u32> = Mutex::new(u32::MAX);
+/// Authority → provider class, so a lookup by authority finds the same
+/// marshalled `ProviderInfo` that `getProviderInfo` serves by class name.
+static PROVIDER_AUTHORITIES: Mutex<std::collections::BTreeMap<String, String>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_package_transactions(resolve_content_provider: u32) -> bool {
+    if resolve_content_provider == 0 || resolve_content_provider >= 0x00ff_fffe { return false; }
+    *RESOLVE_CONTENT_PROVIDER_CODE.lock().unwrap_or_else(|e| e.into_inner()) = resolve_content_provider;
+    true
+}
+
+/// `bool __pengudroid_binder_set_provider_authority(name, name_len, authority, authority_len)`.
+/// `authority` may be a `;`-separated list, as in the manifest.
+///
+/// # Safety
+/// Both pointers must be readable for their stated lengths.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_provider_authority(
+    name: *const u8, name_len: usize, authority: *const u8, authority_len: usize,
+) -> bool {
+    if name.is_null() || authority.is_null() || name_len == 0 || authority_len == 0 { return false; }
+    let name = String::from_utf8_lossy(std::slice::from_raw_parts(name, name_len)).into_owned();
+    let authorities = String::from_utf8_lossy(std::slice::from_raw_parts(authority, authority_len)).into_owned();
+    let mut map = PROVIDER_AUTHORITIES.lock().unwrap_or_else(|e| e.into_inner());
+    for authority in authorities.split(';').map(str::trim).filter(|a| !a.is_empty()) {
+        map.insert(authority.to_string(), name.clone());
+    }
+    true
+}
+
+/// The provider class whose authority is the request's `String16` argument.
+/// Matched as a whole, aligned String16 field, so `a.b` never answers `a.b.c`.
+fn provider_for_authority(data: &[u8]) -> Option<String> {
+    let map = PROVIDER_AUTHORITIES.lock().unwrap_or_else(|e| e.into_inner());
+    map.iter().find(|(authority, _)| parcel_contains_string16(data, authority)).map(|(_, name)| name.clone())
+}
+
 /// `startActivity` on the task/activity manager, then `finishActivity` on the
 /// activity manager/client controller. Installed from the loaded API-37 Stubs.
 static ACTIVITY_LIFECYCLE_CODES: Mutex<[u32; 4]> = Mutex::new([u32::MAX; 4]);
@@ -1903,6 +1961,35 @@ fn vsync_channel() -> Option<(RawFd, RawFd)> {
 }
 
 /// Whether `data` contains `s` encoded as UTF-16LE (a `String16` payload).
+#[cfg(test)]
+mod provider_authority_tests {
+    use super::*;
+    fn string16(value: &str) -> Vec<u8> {
+        let units: Vec<u16> = value.encode_utf16().collect();
+        let mut out = (units.len() as u32).to_le_bytes().to_vec();
+        out.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+        out.extend_from_slice(&[0, 0]);
+        while out.len() % 4 != 0 { out.push(0); }
+        out
+    }
+    #[test]
+    fn resolve_content_provider_matches_whole_authorities_only() {
+        unsafe {
+            let (name, list) = ("com.example.Share", "com.example.share;com.example.share2");
+            assert!(__pengudroid_binder_set_provider_authority(name.as_ptr(), name.len(), list.as_ptr(), list.len()));
+        }
+        let mut request = vec![0u8; 8];
+        request.extend(string16("com.example.share2"));
+        assert_eq!(provider_for_authority(&request).as_deref(), Some("com.example.Share"));
+        let mut other = vec![0u8; 8];
+        other.extend(string16("com.example.share3"));
+        assert_eq!(provider_for_authority(&other), None);
+        let mut prefix = vec![0u8; 8];
+        prefix.extend(string16("com.example"));
+        assert_eq!(provider_for_authority(&prefix), None);
+    }
+}
+
 fn parcel_contains_utf16(data: &[u8], s: &str) -> bool {
     let needle: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     !needle.is_empty() && data.windows(needle.len()).any(|w| w == needle.as_slice())
@@ -3225,6 +3312,31 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             parcel.extend_from_slice(&bytes);
             if trace_enabled() {
                 diag(&format!("[binder]   -> ProviderInfo ({} bytes)\n", bytes.len()));
+            }
+        }
+    }
+    {
+        let volumes = STORAGE_VOLUMES.lock().unwrap_or_else(|e| e.into_inner());
+        if tr.code == volumes.0 && tr.target_handle == handle_for("mount") {
+            parcel.extend_from_slice(&volumes.1);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> StorageVolume[] ({} bytes)\n", volumes.1.len()));
+            }
+        }
+    }
+    let resolve_code = *RESOLVE_CONTENT_PROVIDER_CODE.lock().unwrap_or_else(|e| e.into_inner());
+    if tr.target_handle == handle_for("package") && tr.code == resolve_code && tr.data_size > 0 && tr.data_ptr != 0 {
+        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+        let entry = provider_for_authority(data).and_then(|name| {
+            PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).get(&name).cloned()
+        });
+        // No entry: an empty reply reads as null, i.e. "no such provider",
+        // which is the truthful answer for an authority this app does not own.
+        if let Some(bytes) = entry {
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&bytes);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> resolveContentProvider ProviderInfo ({} bytes)\n", bytes.len()));
             }
         }
     }

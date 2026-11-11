@@ -555,7 +555,7 @@ unsafe fn try_install() -> Result<(), String> {
         return Err("cannot make the decoder entry writable".into());
     }
     ORIGINAL.store(trampoline as usize, Ordering::Release);
-    write_absolute_jump(entry, hook as usize);
+    write_absolute_jump(entry, hook as *const () as usize);
     *entry.add(14) = 0x90;
     libc::mprotect(first as *mut c_void, span, libc::PROT_READ | libc::PROT_EXEC);
     Ok(())

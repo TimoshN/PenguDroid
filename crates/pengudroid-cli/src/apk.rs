@@ -18,6 +18,11 @@ pub enum MetaValue {
     Bool(bool),
     /// `android:resource` — a resource id.
     Ref(u32),
+    /// `android:value="@type/name"` that `resources.arsc` could not resolve to
+    /// a simple value. Resolved ones become `Str`/`Int`/`Bool`, as the
+    /// platform's manifest parser does (it reads `value` through a TypedArray,
+    /// which follows the reference).
+    ValueRef(u32),
 }
 
 /// A declared Android component (`activity`, `service`, ...).
@@ -88,14 +93,144 @@ impl ApkInfo {
 
 /// Read and parse an APK at `path`.
 pub fn read_apk(path: &str) -> Result<ApkInfo, String> {
-    let manifest = extract_manifest(path)?;
-    parse_axml(&manifest)
+    let data = std::fs::read(path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
+    read_apk_bytes(&data)
 }
 
 /// Read and parse an APK that is already in memory.
 pub fn read_apk_bytes(data: &[u8]) -> Result<ApkInfo, String> {
     let manifest = extract_named_bytes(data, "AndroidManifest.xml")?;
-    parse_axml(&manifest)
+    let mut info = parse_axml(&manifest)?;
+    // A split has no resource table of its own worth reading here; the base
+    // APK's references stay `ValueRef` if it has none either.
+    if let Ok(table) = extract_named_bytes(data, "resources.arsc") {
+        resolve_meta_references(&mut info, &table);
+    }
+    Ok(info)
+}
+
+/// Replace every `ValueRef` in the manifest's `<meta-data>` with the value it
+/// names in `table`, where that value is a string, integer or boolean.
+pub fn resolve_meta_references(info: &mut ApkInfo, table: &[u8]) {
+    let Ok(table) = ResourceTable::parse(table) else { return };
+    let resolve = |meta: &mut Vec<(String, MetaValue)>| {
+        for (_, value) in meta.iter_mut() {
+            if let MetaValue::ValueRef(id) = *value {
+                if let Some(resolved) = table.simple_value(id) { *value = resolved; }
+            }
+        }
+    };
+    resolve(&mut info.application_meta);
+    for component in info.activities.iter_mut().chain(info.services.iter_mut())
+        .chain(info.receivers.iter_mut()).chain(info.providers.iter_mut()) {
+        resolve(&mut component.meta);
+    }
+}
+
+/// Just enough of `resources.arsc` to read simple values in the default
+/// configuration (frameworks/base/libs/androidfw/include/androidfw/ResourceTypes.h).
+struct ResourceTable<'a> {
+    data: &'a [u8],
+    strings: Vec<String>,
+    /// `(package id, chunk offset of the package)`.
+    packages: Vec<(u8, usize)>,
+}
+impl<'a> ResourceTable<'a> {
+    fn parse(data: &'a [u8]) -> Result<Self, String> {
+        if le_u16(data, 0)? != 0x0002 { return Err("not a resource table".into()); }
+        let header = le_u16(data, 2)? as usize;
+        let mut table = ResourceTable { data, strings: Vec::new(), packages: Vec::new() };
+        let mut offset = header;
+        while offset + 8 <= data.len() {
+            let kind = le_u16(data, offset)?;
+            let size = le_u32(data, offset + 4)? as usize;
+            if size < 8 || offset + size > data.len() { break; }
+            match kind {
+                0x0001 if table.strings.is_empty() => table.strings = parse_string_pool(data, offset)?,
+                0x0200 => table.packages.push((le_u32(data, offset + 8)? as u8, offset)),
+                _ => {}
+            }
+            offset += size;
+        }
+        Ok(table)
+    }
+    /// The `(type, data)` of `id` in the default configuration, or else in the
+    /// first configuration that has it. Follows up to eight references.
+    fn value(&self, mut id: u32) -> Option<(u8, u32)> {
+        for _ in 0..8 {
+            let (kind, data) = self.entry(id)?;
+            if kind != TYPE_REFERENCE { return Some((kind, data)); }
+            id = data;
+        }
+        None
+    }
+    fn simple_value(&self, id: u32) -> Option<MetaValue> {
+        let (kind, data) = self.value(id)?;
+        Some(match kind {
+            TYPE_STRING => MetaValue::Str(self.strings.get(data as usize)?.clone()),
+            TYPE_INT_BOOLEAN => MetaValue::Bool(data != 0),
+            // Decimal, hex and the four color encodings are all plain ints.
+            0x10 | 0x11 | 0x1c..=0x1f => MetaValue::Int(data as i32),
+            _ => return None,
+        })
+    }
+    fn entry(&self, id: u32) -> Option<(u8, u32)> {
+        let (package, kind, index) = ((id >> 24) as u8, ((id >> 16) & 0xff) as u8, (id & 0xffff) as usize);
+        let &(_, start) = self.packages.iter().find(|(p, _)| *p == package)?;
+        let d = self.data;
+        let package_size = le_u32(d, start + 4).ok()? as usize;
+        let mut offset = start + le_u16(d, start + 2).ok()? as usize;
+        let mut fallback = None;
+        while offset + 8 <= start + package_size {
+            let chunk = le_u16(d, offset).ok()?;
+            let size = le_u32(d, offset + 4).ok()? as usize;
+            if size < 8 { return None; }
+            if chunk == 0x0201 && d.get(offset + 8) == Some(&kind) {
+                if let Some(value) = Self::type_entry(d, offset, index) {
+                    let config_size = le_u32(d, offset + 20).ok()? as usize;
+                    let config = d.get(offset + 24..offset + 20 + config_size)?;
+                    if config.iter().all(|b| *b == 0) { return Some(value); }
+                    fallback.get_or_insert(value);
+                }
+            }
+            offset += size;
+        }
+        fallback
+    }
+    /// Entry `index` of the `ResTable_type` chunk at `chunk`, if it is simple.
+    fn type_entry(d: &[u8], chunk: usize, index: usize) -> Option<(u8, u32)> {
+        let flags = *d.get(chunk + 9)?;
+        let count = le_u32(d, chunk + 12).ok()? as usize;
+        let entries = chunk + le_u32(d, chunk + 16).ok()? as usize;
+        let offsets = chunk + le_u16(d, chunk + 2).ok()? as usize;
+        let entry_offset = if flags & 0x01 != 0 {
+            // FLAG_SPARSE: sorted {u16 index, u16 offset / 4} pairs.
+            (0..count).find_map(|i| {
+                let at = offsets + i * 4;
+                (le_u16(d, at).ok()? as usize == index).then(|| le_u16(d, at + 2).ok().map(|o| o as usize * 4)).flatten()
+            })?
+        } else if flags & 0x02 != 0 {
+            // FLAG_OFFSET16: u16 offset / 4, 0xffff for "no entry".
+            if index >= count { return None; }
+            let raw = le_u16(d, offsets + index * 2).ok()?;
+            if raw == 0xffff { return None; }
+            raw as usize * 4
+        } else {
+            if index >= count { return None; }
+            let raw = le_u32(d, offsets + index * 4).ok()?;
+            if raw == NO_INDEX { return None; }
+            raw as usize
+        };
+        let entry = entries + entry_offset;
+        let entry_flags = le_u16(d, entry + 2).ok()?;
+        if entry_flags & 0x0008 != 0 {
+            // FLAG_COMPACT: {u16 key, u16 flags with the type in the high byte, u32 data}.
+            return Some(((entry_flags >> 8) as u8, le_u32(d, entry + 4).ok()?));
+        }
+        if entry_flags & 0x0001 != 0 { return None; } // FLAG_COMPLEX: a bag
+        let value = entry + le_u16(d, entry).ok()? as usize;
+        Some((*d.get(value + 3)?, le_u32(d, value + 4).ok()?))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +612,7 @@ fn attr_meta_value(pool: &[String], attrs: &[Attr]) -> Option<MetaValue> {
             TYPE_STRING => MetaValue::Str(pool_get(pool, a.typed_data).unwrap_or_default()),
             TYPE_INT_DEC | TYPE_INT_HEX => MetaValue::Int(a.typed_data as i32),
             TYPE_INT_BOOLEAN => MetaValue::Bool(a.typed_data != 0),
+            TYPE_REFERENCE => MetaValue::ValueRef(a.typed_data),
             _ => match &a.raw {
                 Some(raw) => MetaValue::Str(raw.clone()),
                 None => MetaValue::Str(pool_get(pool, a.typed_data).unwrap_or_default()),
