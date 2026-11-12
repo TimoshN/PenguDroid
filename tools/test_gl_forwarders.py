@@ -167,7 +167,7 @@ class GuestStubTests(unittest.TestCase):
         # manager crash of run 11 was fixed by routing it through the bridge too.
         self.assertEqual(
             self.stubs.STUB_LIBRARIES,
-            ("libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3", "libandroid"),
+            ("libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3", "libandroid", "libOpenSLES", "libaaudio"),
         )
 
     def test_every_stub_library_has_a_declared_source(self):

@@ -201,6 +201,21 @@ static void *resolve(const char *name) {
     void *symbol = dlsym(handles[i], name);
     if (symbol && !is_own_symbol(symbol)) return symbol;
   }
+  // Extension entry points (glGetInternalformatSampleivNV, glDebugMessage-
+  // CallbackKHR, ...) are not exported by the host libraries at all; the only
+  // way to reach them is eglGetProcAddress. Without this fallback the slot
+  // became a stub returning 0: Chromium's GPU process then judged every MSAA
+  // sample count non-conformant, emptied the list and trapped on its CHECK
+  // (any antialiased WebGL page, e.g. Genshin Impact's login verification).
+  if ((name[0] == 'g' && name[1] == 'l') || (name[0] == 'e' && name[1] == 'g' && name[2] == 'l')) {
+    typedef void *(*GetProcAddress)(const char *);
+    for (size_t i = 0; i < count; ++i) {
+      GetProcAddress get = (GetProcAddress)dlsym(handles[i], "eglGetProcAddress");
+      if (get == NULL || is_own_symbol((void *)get)) continue;
+      void *symbol = get(name);
+      if (symbol && !is_own_symbol(symbol)) return symbol;
+    }
+  }
   return NULL;
 }
 

@@ -475,7 +475,10 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
             return None;
         }
         let load = env.method_id(view_class, "loadDataWithBaseURL", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V")?;
-        let html = "<!doctype html><title>Loading</title><script>document.title='PenguDroid JS OK'</script><p>PenguDroid WebView</p>";
+        // `PENGUDROID_PROBE_WEBVIEW_HTML=<file>` (test only) loads another page;
+        // it must set `document.title = 'PenguDroid JS OK'` once it worked.
+        let custom = std::env::var_os("PENGUDROID_PROBE_WEBVIEW_HTML").and_then(|path| std::fs::read_to_string(path).ok());
+        let html = custom.as_deref().unwrap_or("<!doctype html><title>Loading</title><script>document.title='PenguDroid JS OK'</script><p>PenguDroid WebView</p>");
         if !env.call_void(
             view,
             load,

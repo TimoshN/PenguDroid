@@ -1,0 +1,21 @@
+<!doctype html>
+<title>Loading</title>
+<!-- WebView probe page: an antialiased WebGL2 and WebGL1 canvas, the kind
+     captcha/verification pages draw. Antialiasing makes Chromium query the
+     renderbuffer sample counts (glGetInternalformativ). -->
+<canvas id="a" width="256" height="256"></canvas>
+<canvas id="b" width="256" height="256"></canvas>
+<script>
+function draw(id, kind) {
+  const gl = document.getElementById(id).getContext(kind, {antialias: true});
+  if (!gl) return kind + ':none';
+  gl.clearColor(0.2, 0.6, 0.9, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  const px = new Uint8Array(4);
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  return kind + ':' + px.join(',');
+}
+let result = [draw('a', 'webgl2'), draw('b', 'webgl')];
+console.log('webgl probe ' + result.join(' '));
+document.title = 'PenguDroid JS OK';
+</script>
