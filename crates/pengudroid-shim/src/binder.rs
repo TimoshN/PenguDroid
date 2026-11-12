@@ -1114,6 +1114,19 @@ static APPLICATION_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 static ACTIVITY_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+static SERVICE_ENTRIES: std::sync::LazyLock<std::sync::Mutex<(u32, std::collections::BTreeMap<String, Vec<u8>>)>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new((0, std::collections::BTreeMap::new())));
+
+#[derive(Default)]
+struct WebViewReplies {
+    codes: [u32; 4], // hasSystemFeature, waitForAndGetProvider, current name, current package
+    package: Vec<u8>,
+    application: Vec<u8>,
+    response: Vec<u8>,
+}
+static WEBVIEW_REPLIES: std::sync::LazyLock<Mutex<WebViewReplies>> =
+    std::sync::LazyLock::new(|| Mutex::new(WebViewReplies::default()));
+
 /// Marshalled `ProviderInfo`s, keyed by class name.
 static PROVIDER_ENTRIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
@@ -2975,7 +2988,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PACKAGE_INFO {
-        let cached = PACKAGE_INFO.lock().unwrap_or_else(|e| e.into_inner());
+        let webview = WEBVIEW_REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+        let cached_app = PACKAGE_INFO.lock().unwrap_or_else(|e| e.into_inner());
+        let data = if tr.data_ptr != 0 { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) } else { &[] };
+        let cached = if !webview.package.is_empty() && parcel_contains_string16(data, "com.android.webview") { &webview.package } else { &*cached_app };
         if !cached.is_empty() {
             // `IPackageManager$Stub$Proxy.getPackageInfo` reads the result with
             // `Parcel.readTypedObject`, which first reads a presence int and
@@ -3288,6 +3304,16 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag(&format!("[binder]   -> thermal code {} operation={operation}\n", tr.code));
         }
     }
+    if tr.target_handle == handle_for("package") {
+        let entries = SERVICE_ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.0 != 0 && tr.code == entries.0 && tr.data_size > 0 && tr.data_ptr != 0 {
+            let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+            if let Some((_, bytes)) = entries.1.iter().find(|(name, _)| parcel_contains_string16(data, name)) {
+                parcel.extend_from_slice(&1u32.to_ne_bytes());
+                parcel.extend_from_slice(bytes);
+            }
+        }
+    }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PROVIDER_INFO {
         // The request is `[interface token][ComponentName][flags][userId]`, so
         // the class name is not the last thing in the parcel. Match the parcel
@@ -3351,12 +3377,35 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_APPLICATION_INFO {
-        let cached = APPLICATION_INFO.lock().unwrap_or_else(|e| e.into_inner());
+        let webview = WEBVIEW_REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+        let cached_app = APPLICATION_INFO.lock().unwrap_or_else(|e| e.into_inner());
+        let data = if tr.data_ptr != 0 { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) } else { &[] };
+        let cached = if !webview.application.is_empty() && parcel_contains_string16(data, "com.android.webview") { &webview.application } else { &*cached_app };
         if !cached.is_empty() {
             parcel.extend_from_slice(&1u32.to_ne_bytes());
             parcel.extend_from_slice(&cached);
             if trace_enabled() {
                 diag(&format!("[binder]   -> ApplicationInfo ({} bytes)\n", cached.len()));
+            }
+        }
+    }
+    {
+        let view = WEBVIEW_REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+        if !view.response.is_empty() {
+            if tr.target_handle == handle_for("package") && tr.code == view.codes[0] {
+                let data = if tr.data_ptr != 0 { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) } else { &[] };
+                parcel.extend_from_slice(&(parcel_contains_string16(data, "android.software.webview") as u32).to_ne_bytes());
+            }
+            if tr.target_handle == handle_for("webviewupdate") {
+                if tr.code == view.codes[1] {
+                    parcel.extend_from_slice(&1u32.to_ne_bytes());
+                    parcel.extend_from_slice(&view.response);
+                } else if tr.code == view.codes[2] {
+                    parcel.extend_from_slice(&string16("com.android.webview"));
+                } else if tr.code == view.codes[3] {
+                    parcel.extend_from_slice(&1u32.to_ne_bytes());
+                    parcel.extend_from_slice(&view.package);
+                }
             }
         }
     }
@@ -4002,6 +4051,42 @@ pub unsafe extern "C" fn __pengudroid_binder_set_provider_entry(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, value);
+}
+
+/// Publish a manifest ServiceInfo and its framework-provided transaction code.
+///
+/// # Safety
+/// Both pointers must be readable for their stated lengths.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_service_entry(
+    code: u32, name: *const u8, name_len: usize, bytes: *const u8, len: usize,
+) {
+    if code == 0 || name.is_null() || bytes.is_null() || name_len == 0 || len == 0 { return; }
+    let key = String::from_utf8_lossy(std::slice::from_raw_parts(name, name_len)).into_owned();
+    let value = std::slice::from_raw_parts(bytes, len).to_vec();
+    let mut entries = SERVICE_ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
+    if entries.0 != code { entries.1.clear(); }
+    entries.0 = code;
+    entries.1.insert(key, value);
+}
+
+/// Install replies built from a framework-verified WebView provider APK.
+/// # Safety
+/// `codes` addresses four words; other pointers address their stated byte lengths.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_webview(
+    codes: *const u32, package: *const u8, package_len: usize,
+    application: *const u8, application_len: usize, response: *const u8, response_len: usize,
+) {
+    if codes.is_null() || package.is_null() || application.is_null() || response.is_null()
+        || package_len == 0 || application_len == 0 || response_len == 0 { return; }
+    let codes: [u32; 4] = std::slice::from_raw_parts(codes, 4).try_into().unwrap();
+    if codes.iter().any(|code| *code == 0) { return; }
+    *WEBVIEW_REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = WebViewReplies {
+        codes, package: std::slice::from_raw_parts(package, package_len).to_vec(),
+        application: std::slice::from_raw_parts(application, application_len).to_vec(),
+        response: std::slice::from_raw_parts(response, response_len).to_vec(),
+    };
 }
 
 /// `void __pengudroid_binder_set_window_relayout_result(const uint8_t *bytes, size_t len)`
@@ -5195,6 +5280,50 @@ mod tests {
         }
         for data in [vec![], service_request("not.IInputManager", "")] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, 203, &data), 1) });
+        }
+    }
+
+    #[test]
+    fn webview_routes_verified_provider_metadata_without_replacing_host_package() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&WEBVIEW_REPLIES, WebViewReplies::default());
+        let _package_restore = reset_table(&PACKAGE_INFO, 0x11111111u32.to_ne_bytes().to_vec());
+        let codes = [1001, 1002, 1003, 1004];
+        let package = 0x22222222u32.to_ne_bytes();
+        let application = 0x33333333u32.to_ne_bytes();
+        let response = 0x44444444u32.to_ne_bytes();
+        unsafe { __pengudroid_binder_set_webview(codes.as_ptr(), package.as_ptr(), 4, application.as_ptr(), 4, response.as_ptr(), 4) };
+        for (name, expected) in [("com.android.webview", package), ("host.app", 0x11111111u32.to_ne_bytes()), ("com.android.webview.fake", 0x11111111u32.to_ne_bytes())] {
+            let request = service_request("android.content.pm.IPackageManager", name);
+            let reply = unsafe { make_reply(&transaction(handle_for("package"), IPM_GET_PACKAGE_INFO, &request), 1) };
+            assert_eq!(&reply.parcel[4..8], &1u32.to_ne_bytes());
+            assert_eq!(&reply.parcel[8..12], &expected);
+        }
+        for (name, expected) in [("android.software.webview", 1u32), ("android.hardware.camera", 0)] {
+            let request = service_request("android.content.pm.IPackageManager", name);
+            let reply = unsafe { make_reply(&transaction(handle_for("package"), codes[0], &request), 1) };
+            assert_eq!(&reply.parcel[4..8], &expected.to_ne_bytes());
+        }
+        let reply = unsafe { make_reply(&transaction(handle_for("webviewupdate"), codes[1], &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &1u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[8..12], &response);
+    }
+
+    #[test]
+    fn service_info_metadata_uses_framework_code_and_component_name() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&SERVICE_ENTRIES, (0, std::collections::BTreeMap::new()));
+        let name = "com.google.firebase.components.ComponentDiscoveryService";
+        let bytes = [0x12345678u32, 0x87654321].into_iter().flat_map(u32::to_ne_bytes).collect::<Vec<_>>();
+        unsafe { __pengudroid_binder_set_service_entry(123, name.as_ptr(), name.len(), bytes.as_ptr(), bytes.len()) };
+        let request = service_request("android.content.pm.IPackageManager", name);
+        let reply = unsafe { make_reply(&transaction(handle_for("package"), 123, &request), 1) };
+        assert_eq!(&reply.parcel[..8], &[0u32, 1].into_iter().flat_map(u32::to_ne_bytes).collect::<Vec<_>>());
+        assert_eq!(&reply.parcel[8..16], bytes);
+        let missing = service_request("android.content.pm.IPackageManager", "missing.Service");
+        for (code, data) in [(123, &missing), (124, &request)] {
+            let reply = unsafe { make_reply(&transaction(handle_for("package"), code, data), 1) };
+            assert!(!reply.parcel.windows(bytes.len()).any(|window| window == bytes));
         }
     }
 

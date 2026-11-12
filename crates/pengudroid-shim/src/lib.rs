@@ -709,13 +709,21 @@ pub unsafe extern "C" fn ashmem_create_region(name: *const c_char, size: usize) 
     }
 }
 
-/// `ashmem_set_prot_region(fd, prot)` — no-op.
-///
-/// On Linux a memfd's protection is chosen at `mmap` time, so there is nothing
-/// to record here. Returns `0` to indicate success.
+/// Restrict future writable mappings of a memfd-backed ashmem region.
+/// Existing mappings remain usable, as on ashmem. Chromium checks the actual
+/// seals before accepting a read-only shared-memory handle.
 #[no_mangle]
-pub unsafe extern "C" fn ashmem_set_prot_region(_fd: c_int, _prot: c_int) -> c_int {
-    0
+pub unsafe extern "C" fn ashmem_set_prot_region(fd: c_int, prot: c_int) -> c_int {
+    let seals = libc::fcntl(fd, libc::F_GET_SEALS);
+    if seals < 0 { return -1; }
+    if prot & libc::PROT_WRITE != 0 {
+        if seals & (libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE) != 0 {
+            *libc::__errno_location() = libc::EINVAL;
+            return -1;
+        }
+        return 0;
+    }
+    libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_FUTURE_WRITE)
 }
 
 /// `ashmem_pin_region(fd, offset, len)`.
@@ -5909,6 +5917,36 @@ mod tests {
     fn ashmem_rejects_zero_size() {
         assert!(create_ashmem("test", 0).is_err());
         assert_eq!(unsafe { ashmem_create_region(std::ptr::null(), 0) }, -1);
+    }
+
+    #[test]
+    fn ashmem_read_only_protection_seals_future_writers() {
+        let fd = create_ashmem("readonly-test", 4096).unwrap();
+        let _file = unsafe { std::fs::File::from_raw_fd(fd) };
+        unsafe {
+            let writer = libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+            assert_ne!(writer, libc::MAP_FAILED);
+            assert_eq!(ashmem_set_prot_region(fd, libc::PROT_READ), 0);
+            assert_ne!(libc::fcntl(fd, libc::F_GET_SEALS) & libc::F_SEAL_FUTURE_WRITE, 0);
+            // A producer may retain its original writable mapping, while
+            // consumers and duplicated descriptors cannot acquire a new one.
+            *(writer as *mut u8) = 42;
+            let duplicate = libc::dup(fd);
+            assert!(duplicate >= 0);
+            let denied = libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, duplicate, 0);
+            assert_eq!(denied, libc::MAP_FAILED);
+            assert_eq!(*libc::__errno_location(), libc::EPERM);
+            let reader = libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ, libc::MAP_SHARED, duplicate, 0);
+            assert_ne!(reader, libc::MAP_FAILED);
+            assert_eq!(*(reader as *const u8), 42);
+            assert_eq!(ashmem_set_prot_region(duplicate, libc::PROT_READ | libc::PROT_WRITE), -1);
+            assert_eq!(*libc::__errno_location(), libc::EINVAL);
+            libc::munmap(reader, 4096);
+            libc::munmap(writer, 4096);
+            libc::close(duplicate);
+            assert_eq!(ashmem_set_prot_region(-1, libc::PROT_READ), -1);
+            assert_eq!(*libc::__errno_location(), libc::EBADF);
+        }
     }
 
     #[test]

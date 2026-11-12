@@ -459,6 +459,18 @@ fn prepare_art_libs(layout: &Layout, work: &Path) -> Result<PathBuf, String> {
             }
         }
     }
+    if let Some(source) = std::env::var_os("PENGUDROID_GL_FORWARDERS") {
+        let source = PathBuf::from(source);
+        for name in ["libEGL.so", "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so"] {
+            let bytes = std::fs::read(source.join(name))
+                .map_err(|e| format!("cannot read host GL forwarder {name}: {e}"))?;
+            let bytes = pengudroid_elf::strip_android_versions(&bytes)
+                .map_err(|e| format!("cannot prepare host GL forwarder {name}: {e}"))?;
+            std::fs::write(out.join(name), bytes)
+                .map_err(|e| format!("cannot stage host GL forwarder {name}: {e}"))?;
+        }
+        println!("art: installed explicit host EGL/GLES forwarders");
+    }
     println!("art: prepared {written} libraries in {}", out.display());
     Ok(out)
 }
@@ -2373,6 +2385,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         version_name: info.version_name.as_deref(),
         version_code: info.version_code.unwrap_or(1),
         application_meta: &info.application_meta,
+        services: &info.services,
     };
     crate::apphost::bind_application(env, thread, &spec)
 }

@@ -17,6 +17,9 @@
 
 use std::ffi::c_void;
 
+#[path = "webview.rs"]
+mod webview;
+
 /// The PenguDroid surface geometry, in pixels.
 ///
 /// This is the one place the size is written down. Everything that has to agree
@@ -86,6 +89,8 @@ pub struct AppSpec<'a> {
     /// every one of those stays uninitialised and the app dies on
     /// "WorkManager is not initialized properly".
     pub providers: &'a [crate::apk::Component],
+    /// Manifest services, including SDK component-discovery metadata.
+    pub services: &'a [crate::apk::Component],
     /// The manifest's `<activity>` entries.
     ///
     /// A hosted `startActivity` needs the same `ActivityInfo` a device's package
@@ -1017,6 +1022,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     let ok = env.call_void(thread, handle, &[JValue { l: data }]);
     if ok {
         println!("apphost: handleBindApplication returned normally");
+        if std::env::var_os("PENGUDROID_WEBVIEW").is_some() && webview::prepare(env, spec).is_none() {
+            eprintln!("webview: experimental provider setup or page probe failed");
+        }
         if let Some(compat) = compat {
             report_include_code(env, thread, app_info, compat, data);
         }
@@ -1040,6 +1048,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         }
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
+            if std::env::var_os("PENGUDROID_PROBE_WEBVIEW").is_some() {
+                let _ = webview::attach_probe(env, thread);
+            }
         }
     } else {
         eprintln!("apphost: handleBindApplication threw");
@@ -3322,6 +3333,7 @@ pub fn loop_forever(env: &JniEnv) {
     let mut scratch = vec![0u8; ACTIVITY_REQUEST_SCRATCH];
     loop {
         drain_activity_requests(env, &mut scratch);
+        webview::probe_tick(env);
         match env.call_static_boolean(
             looper_class,
             once,
@@ -5450,8 +5462,9 @@ fn launch_hosted_activity(
             eprintln!("apphost: handleLaunchActivity returned null for {activity_name}");
             None
         }
-        Some(_) => {
+        Some(activity) => {
             println!("apphost: handleLaunchActivity returned an Activity for {activity_name}");
+            let _ = webview::software_views(env, activity);
             // The device's TransactionExecutor steps ON_CREATE -> ON_START ->
             // ON_RESUME; deliver the missing START step so activities that gate
             // behavior on `onStart` (SDLActivity's native thread) work.
@@ -7089,6 +7102,9 @@ fn install_reply(data: &[u8], symbol: &str) {
 /// dereferences `metaData` on the result. There is no package manager here, so
 /// both answers are built from the `ApplicationInfo` we already have.
 fn install_package_manager_replies(env: &JniEnv, app_info: JObject, spec: &AppSpec<'_>) {
+    if install_service_info_replies(env, app_info, spec).is_none() {
+        eprintln!("apphost: could not publish manifest ServiceInfo metadata");
+    }
     let package = spec.package;
     let Some(pi_class) = env.find_class("android/content/pm/PackageInfo") else {
         eprintln!("apphost: PackageInfo not found");
@@ -7166,6 +7182,39 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, spec: &AppSp
     if let Some(data) = marshal_object(env, app_info, "android/content/pm/ApplicationInfo") {
         install_reply(&data, "__pengudroid_binder_set_application_info");
     }
+}
+
+/// Firebase discovers its registrars through ComponentDiscoveryService's
+/// ServiceInfo.metaData, before any service instance is actually started.
+fn install_service_info_replies(env: &JniEnv, app_info: JObject, spec: &AppSpec<'_>) -> Option<()> {
+    let stub = env.find_class("android/content/pm/IPackageManager$Stub")?;
+    let field = env.static_field_id(stub, "TRANSACTION_getServiceInfo", "I")?;
+    let code = u32::try_from(env.static_int_field(stub, field)).ok()?;
+    let symbol = shim_symbol("__pengudroid_binder_set_service_entry")?;
+    let publish: unsafe extern "C" fn(u32, *const u8, usize, *const u8, usize) =
+        unsafe { std::mem::transmute(symbol) };
+    for service in spec.services {
+        let _frame = env.local_frame(32)?;
+        let (class, info) = new_instance(env, "android/content/pm/ServiceInfo")?;
+        for (name, value) in [("name", service.name.as_str()), ("packageName", spec.package), ("processName", spec.package)] {
+            let field = env.field_id(class, name, "Ljava/lang/String;")?;
+            env.set_object_field(info, field, env.new_string(value));
+        }
+        let field = env.field_id(class, "applicationInfo", "Landroid/content/pm/ApplicationInfo;")?;
+        env.set_object_field(info, field, app_info);
+        for (name, value) in [("enabled", true), ("exported", service.exported)] {
+            let field = env.field_id(class, name, "Z")?;
+            env.set_boolean_field(info, field, value);
+        }
+        if let Some(bundle) = build_meta_bundle(env, &service.meta) {
+            let field = env.field_id(class, "metaData", "Landroid/os/Bundle;")?;
+            env.set_object_field(info, field, bundle);
+        }
+        let bytes = marshal_object(env, info, "android/content/pm/ServiceInfo")?;
+        unsafe { publish(code, service.name.as_ptr(), service.name.len(), bytes.as_ptr(), bytes.len()) };
+    }
+    println!("apphost: published {} manifest ServiceInfo entries", spec.services.len());
+    Some(())
 }
 
 /// Install the platform singletons `system_server` normally creates.

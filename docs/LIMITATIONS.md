@@ -267,16 +267,13 @@ silently fall back to a container.
   `pengudroid native`, with `AAssetManager`, `ALooper`, EGL/GLES and Vulkan. This
   is the path `pengudroid launch` picks, and `fixtures/native-game` is a playable
   game at ~56 fps on an RTX 3080.
-* **Genshin Impact still cannot be played here** (2026-11-11: it now boots
-  through its SDKs to the HoYoverse splash and Unity's GL start-up, then
-  crashes in the guest→host GL path; see STATUS.md). The original note: Its Android build is `arm64-v8a`
-  only; the NDK translator above is the right tool for that and now initialises
-  and starts ARM64 code, but it does not yet complete guest execution (see 2.1).
-  On top of that it ships ~20 GB of OBB data, a proprietary anti-cheat, and it
-  needs `system_server` for login and rendering surfaces. There is no legitimate
-  way to obtain or run it in this environment, so "Genshin renders" is not a
-  claim this project can make. What it *can* claim is the same class of workload:
-  NativeActivity games that call EGL/GLES/Vulkan directly.
+* **Genshin Impact gameplay is unverified** (2026-11-11). The ARM64 Android
+  build now renders the HoYoverse splash and interactive login form through
+  the native bridge. Missing service metadata had prevented Firebase component
+  discovery; the resulting Java exception started host teardown while Unity
+  was still rendering, causing the previously reported driver crash. That
+  metadata path is fixed; see STATUS.md. Account login, resource downloads,
+  in-world rendering, controls and sustained gameplay still require validation.
 
 ## 3. Native `.so` compatibility
 

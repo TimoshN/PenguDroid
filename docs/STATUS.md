@@ -4,6 +4,74 @@ This is the current handoff note. It records verified behavior, known limits, an
 
 ## Where we left off — desktop manager verified (2026-11-11)
 
+### Genshin follow-up — HoYoverse login reached (2026-11-11)
+
+The apparent guest→host GL crash below was a **shutdown race**, not a broken
+GL function pointer. GDB hardware watchpoints confirmed NVIDIA creates a valid
+low-address dispatch table. A `munmap` syscall catchpoint then caught NVIDIA
+itself freeing that table on the main thread while Unity's rendering thread
+was still active. Before this, `Looper.loopOnce` had thrown
+`NullPointerException: FirebaseCrashlytics component is not present` and the
+helper's main loop returned, starting host library teardown.
+
+The missing contract was `IPackageManager.getServiceInfo`: Firebase discovers
+its component registrars from **service** metadata, not application/provider
+metadata. `AppSpec` now carries manifest services; apphost marshals real
+`ServiceInfo` objects with their metadata and the binder shim serves them using
+the loaded API-37 Stub's transaction code. No game binary was modified.
+
+With this change, Crashlytics initializes and Genshin reaches the **interactive
+HoYoverse login form**, confirmed by frame 480 of `target/gi-service`.
+The user's login attempt reaches the new-device identity verification flow,
+which requires WebView. Gameplay and completed account login remain unverified.
+Do not mistake the old driver crash below for the current blocker.
+
+The opt-in WebView host now verifies the actual API-37 provider APK through
+`PackageManager.getPackageArchiveInfo(GET_SIGNATURES | GET_META_DATA)`, preserves
+its real signatures/version, publishes package-specific PackageInfo and
+ApplicationInfo, service metadata and a framework-marshalled
+WebViewProviderResponse (status 3: no shared RELRO), and loads the actual x86_64
+Chromium and platform-support libraries. Its pinned-provider development mode
+uses Chromium's in-process renderer; Android's isolated renderer service is
+**not implemented**. API-37 normally uses a separate renderer process.
+
+Three additional measured fixes were needed:
+
+* `ashmem_set_prot_region(PROT_READ)` now applies `F_SEAL_FUTURE_WRITE`, rather
+  than reporting success without changing the memfd. Chromium checks these
+  seals and otherwise deliberately traps. The regression test verifies old
+  writable mappings survive, new shared writers fail, duplicate fds share the
+  restriction, and writable protection cannot be restored.
+* Explicit host GL forwarders can replace the sysroot's Bionic EGL/GLES in the
+  prepared host library directory (`PENGUDROID_GL_FORWARDERS`). WebView uses
+  explicit dlopen/dlsym, which otherwise bypasses the preloaded GLES shim.
+* `PENGUDROID_FRAMEWORK_LOOPER=1` forwards NDK ALooper calls to real libandroid,
+  sharing ART's native message queue. The independent NativeActivity looper
+  never dispatched Chromium's queued work. The original standalone looper
+  remains the default.
+
+`target/webview-visible-shot/page.png` confirms a visible real HTML page, and
+the title changes to `PenguDroid JS OK` from JavaScript. The hardware WebView
+path still traps in Chromium's GL capability setup when attached inside
+Genshin, so `PENGUDROID_WEBVIEW_SOFTWARE=1` selects software Canvas layers on
+hosted WebViews. Unity's renderer remains on the GPU. This is **not** yet proof
+that the live identity-verification page completes; the current Genshin retry
+is `target/gi-webview-sw`.
+
+Development flags for that retry, in addition to the smoke helper:
+`PENGUDROID_WEBVIEW=1 PENGUDROID_WEBVIEW_SINGLE_PROCESS=1
+PENGUDROID_WEBVIEW_SOFTWARE=1 PENGUDROID_FRAMEWORK_LOOPER=1
+PENGUDROID_GL_FORWARDERS=$PWD/target/guest-pc-ring/lib`.
+`PENGUDROID_PROBE_WEBVIEW=1` is a test-only flag: it replaces the launched
+activity's content with the local HTML/JavaScript probe. Do not set it on the
+user's real game launch.
+
+Reproduce with `tools/smoke-genshin.sh <Genshin.apkm>`. It supplies the guest
+bundle, TLS-adapted bridge, both TLS opt-ins, and lite translation mode; use
+`SMOKE_DIR`/`SMOKE_SECONDS` for separate bounded runs. The bridge and guest bundle
+must already be built locally. Targeted CLI/shim regression suites: **264 tests
+passed**, including service-metadata routing and Android framework checks.
+
 Pick up here. The project currently does these things end to end:
 
 | Capability | Evidence |
@@ -26,14 +94,12 @@ Verified this session on the shipped AppImage, not on the dev tree:
 
 ### Next concrete task
 
-0. **Genshin Impact: guest GL calls crash in the host driver.** After the
-   fixes below Unity's first `glGenTextures`/`glBindBuffer` faults inside
-   `libnvidia-eglcore` (reads `[page+0x248]` in the low 32-bit window the
-   translator's code cache also uses) and, on Mesa, jumps to an unmapped host
-   address. The context hand-off between UnityMain and the render thread is
-   correct in the gleshim trace (`PENGUDROID_TRACE_GLESHIM=1` now prints tids).
-   Next measurement: which host function pointer the proxy/forwarder slot for
-   the faulting call holds, and whether it is still mapped.
+0. **Genshin Impact: complete live WebView identity verification.** The old
+   driver crash was explained and fixed through service metadata; see the
+   follow-up above. A real HTML/JavaScript WebView now renders in a standalone
+   visible-window probe. The current game retry enables software Canvas for
+   its WebViews to avoid Chromium's hardware GL capability trap. Completed
+   login, resource downloads and gameplay still need validation.
 
 1. **Hardware video decode, guest half.** NewPipe plays today, in software:
    `c2.android.avc.decoder` → BLAST → `wl_shm` snapshot (630 frames in a 60 s

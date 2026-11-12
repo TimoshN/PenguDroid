@@ -486,6 +486,17 @@ struct Looper {
 
 static LOOPER: OnceLock<Looper> = OnceLock::new();
 
+unsafe fn framework_looper_fn<F: Copy>(name: &std::ffi::CStr) -> Option<F> {
+    if std::env::var_os("PENGUDROID_FRAMEWORK_LOOPER").is_none() { return None; }
+    static ANDROID: OnceLock<usize> = OnceLock::new();
+    let handle = *ANDROID.get_or_init(|| libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) as usize);
+    if handle == 0 { return None; }
+    let pointer = libc::dlsym(handle as *mut c_void, name.as_ptr());
+    if pointer.is_null() { return None; }
+    assert_eq!(std::mem::size_of::<F>(), std::mem::size_of_val(&pointer));
+    Some(std::mem::transmute_copy(&pointer))
+}
+
 fn looper() -> &'static Looper {
     LOOPER.get_or_init(|| {
         let mut pipe = [0 as RawFd; 2];
@@ -505,22 +516,28 @@ fn looper() -> &'static Looper {
 /// `ALooper_prepare(opts)` — the process-wide looper.
 #[no_mangle]
 pub unsafe extern "C" fn ALooper_prepare(_opts: c_int) -> *mut c_void {
+    if let Some(real) = framework_looper_fn::<unsafe extern "C" fn(c_int) -> *mut c_void>(c"ALooper_prepare") { return real(_opts); }
     looper() as *const Looper as *mut c_void
 }
 
 /// `ALooper_forThread()` — the same looper (PenguDroid runs one per process).
 #[no_mangle]
 pub unsafe extern "C" fn ALooper_forThread() -> *mut c_void {
+    if let Some(real) = framework_looper_fn::<unsafe extern "C" fn() -> *mut c_void>(c"ALooper_forThread") { return real(); }
     looper() as *const Looper as *mut c_void
 }
 
 /// `ALooper_acquire(looper)`.
 #[no_mangle]
-pub unsafe extern "C" fn ALooper_acquire(_looper: *mut c_void) {}
+pub unsafe extern "C" fn ALooper_acquire(_looper: *mut c_void) {
+    if let Some(real) = framework_looper_fn::<unsafe extern "C" fn(*mut c_void)>(c"ALooper_acquire") { real(_looper); }
+}
 
 /// `ALooper_release(looper)`.
 #[no_mangle]
-pub unsafe extern "C" fn ALooper_release(_looper: *mut c_void) {}
+pub unsafe extern "C" fn ALooper_release(_looper: *mut c_void) {
+    if let Some(real) = framework_looper_fn::<unsafe extern "C" fn(*mut c_void)>(c"ALooper_release") { real(_looper); }
+}
 
 /// `ALooper_addFd(looper, fd, ident, events, callback, data)`.
 #[no_mangle]
@@ -532,6 +549,7 @@ pub unsafe extern "C" fn ALooper_addFd(
     callback: LooperCallback,
     data: *mut c_void,
 ) -> c_int {
+    if let Some(real) = framework_looper_fn::<unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, LooperCallback, *mut c_void) -> c_int>(c"ALooper_addFd") { return real(_looper, fd, ident, events, callback, data); }
     let mut fds = looper().fds.lock().unwrap_or_else(|e| e.into_inner());
     fds.retain(|e| e.fd != fd);
     fds.push(FdEntry { fd, ident, events, callback, data });
@@ -541,6 +559,7 @@ pub unsafe extern "C" fn ALooper_addFd(
 /// `ALooper_removeFd(looper, fd)`.
 #[no_mangle]
 pub unsafe extern "C" fn ALooper_removeFd(_looper: *mut c_void, fd: c_int) -> c_int {
+    if let Some(real) = framework_looper_fn::<unsafe extern "C" fn(*mut c_void, c_int) -> c_int>(c"ALooper_removeFd") { return real(_looper, fd); }
     let mut fds = looper().fds.lock().unwrap_or_else(|e| e.into_inner());
     let before = fds.len();
     fds.retain(|e| e.fd != fd);
@@ -586,6 +605,7 @@ pub unsafe extern "C" fn ALooper_pollOnce(
     out_events: *mut c_int,
     out_data: *mut *mut c_void,
 ) -> c_int {
+    if let Some(real) = framework_looper_fn::<unsafe extern "C" fn(c_int, *mut c_int, *mut c_int, *mut *mut c_void) -> c_int>(c"ALooper_pollOnce") { return real(timeout_millis, out_fd, out_events, out_data); }
     let l = looper();
     let entries: Vec<(RawFd, c_int, c_int, LooperCallback, *mut c_void)> = {
         let fds = l.fds.lock().unwrap_or_else(|e| e.into_inner());
@@ -679,6 +699,7 @@ pub unsafe extern "C" fn ALooper_pollAll(
 /// `ALooper_wake(looper)`.
 #[no_mangle]
 pub unsafe extern "C" fn ALooper_wake(_looper: *mut c_void) {
+    if let Some(real) = framework_looper_fn::<unsafe extern "C" fn(*mut c_void)>(c"ALooper_wake") { return real(_looper); }
     let byte = 1u8;
     // SAFETY: writing one byte to our own non-blocking pipe.
     let _ = libc::write(
