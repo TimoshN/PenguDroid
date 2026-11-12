@@ -1666,6 +1666,10 @@ unsafe fn create_native_buffer_image(host: &Host, dpy: EGLDisplay, buffer: EGLCl
     let key = buffer as usize;
     if let Some(entry) = native_images().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&key) {
         entry.references += 1;
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] AHardwareBuffer {buffer:p} reused EGLImage {:#x} (refs {}, tid {})",
+                entry.image, entry.references, libc::gettid());
+        }
         return entry.image as EGLImageKHR;
     }
     type Describe = unsafe extern "C" fn(*const c_void, *mut AhbDesc);
@@ -1705,6 +1709,10 @@ unsafe fn create_native_buffer_image(host: &Host, dpy: EGLDisplay, buffer: EGLCl
     }
     native_images().lock().unwrap_or_else(|e| e.into_inner())
         .insert(key, NativeImage { image: image as usize, references: 1 });
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] AHardwareBuffer {buffer:p} {}x{} format {:#x} usage {:#x} -> EGLImage {image:p} (ctx {context:p}, tid {})",
+            desc.width, desc.height, desc.format, desc.usage, libc::gettid());
+    }
     image
 }
 
@@ -2047,9 +2055,25 @@ static SYNC_SENTINEL: u8 = 0;
 #[no_mangle]
 pub unsafe extern "C" fn eglCreateSyncKHR(
     _dpy: EGLDisplay,
-    _type: u32,
-    _attrib_list: *const c_int,
+    kind: u32,
+    attrib_list: *const c_int,
 ) -> *mut c_void {
+    const EGL_SYNC_NATIVE_FENCE_ANDROID: u32 = 0x3144;
+    const EGL_SYNC_NATIVE_FENCE_FD_ANDROID: c_int = 0x3145;
+    if kind == EGL_SYNC_NATIVE_FENCE_ANDROID {
+        let imported = read_attribs(attrib_list).and_then(|list| {
+            list.chunks(2).find(|pair| pair.len() == 2 && pair[0] == EGL_SYNC_NATIVE_FENCE_FD_ANDROID)
+                .map(|pair| pair[1])
+        });
+        match imported {
+            // A consumer waiting on a producer's fence: the producer finished
+            // its GPU work before handing the fd out (see below), and EGL takes
+            // ownership of the fd.
+            Some(fd) if fd >= 0 => { libc::close(fd); }
+            // A producer asking for a fence over the work submitted so far.
+            _ => { if let Some(finish) = host().ok().and_then(|h| h.gl_finish) { finish(); } }
+        }
+    }
     std::ptr::addr_of!(SYNC_SENTINEL) as *mut c_void
 }
 
@@ -2099,13 +2123,19 @@ pub unsafe extern "C" fn eglGetSyncAttribKHR(
     EGL_TRUE
 }
 
-/// `eglDupNativeFenceFDANDROID(dpy, sync)` — no fence, so `EGL_NO_NATIVE_FENCE_FD_ANDROID`.
+/// `eglDupNativeFenceFDANDROID(dpy, sync)`: an already-signalled fence fd.
+///
+/// The GPU work it guards was finished when the sync was created, so the fd
+/// only has to read as signalled: an eventfd with a count of 1 is readable,
+/// which is what `sync_wait`/`poll(POLLIN)` check. Returning
+/// EGL_NO_NATIVE_FENCE_FD made Chromium drop every WebGL frame it hands to
+/// the compositor ("Unable to get a gpu fence object").
 #[no_mangle]
 pub unsafe extern "C" fn eglDupNativeFenceFDANDROID(
     _dpy: EGLDisplay,
     _sync: *mut c_void,
 ) -> c_int {
-    -1
+    libc::eventfd(1, libc::EFD_CLOEXEC)
 }
 
 /// `eglPresentationTimeANDROID(dpy, surface, time)`.

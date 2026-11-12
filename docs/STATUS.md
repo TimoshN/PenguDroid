@@ -109,6 +109,31 @@ Verified this session on the shipped AppImage, not on the dev tree:
   LLVM 22 comes from `~/.cache/pd-llvm22` through `.toolchain/llvm-bin`
   wrappers (`PENGUDROID_LLVM_DIR`).
 
+### 2026-11-12 (later): WebGL in WebView
+
+Reproduced Genshin's verification-page crash without a login, using the
+WebView probe and `fixtures/webview/webgl-msaa.html`
+(`PENGUDROID_PROBE_WEBVIEW=1 PENGUDROID_PROBE_WEBVIEW_HTML=<file>` on NewPipe).
+Fixed in order:
+
+1. `418b6ab` GL forwarders resolve extension functions through
+   `eglGetProcAddress` (`glGetInternalformatSampleivNV` was a 0-returning
+   stub → Chromium emptied its MSAA sample list → SIGILL).
+2. `6aa17d6` gleshim implements `EGL_ANDROID_image_native_buffer` (AHB →
+   EGLImage); the "invalid mailbox name" shared-image errors are gone.
+3. Native fence fds (`eglDupNativeFenceFDANDROID`) are real, already-signalled
+   eventfds after a `glFinish`; "Unable to get a gpu fence object" is gone.
+
+Measured now: the page runs, the 2D canvas is on screen, WebGL2 renders
+(`readPixels` = 51,153,229) but its canvas is **not composited** (white), in
+hardware and software WebView modes alike; WebGL1 is blocklisted by Chromium.
+The compositor never imports the AHardwareBuffers WebGL produced (gleshim
+traces only the producer's two `eglCreateImage` calls). Next: find where the
+WebGL frame is dropped between `PrepareTransferableResource` and the
+compositor. `PENGUDROID_WEBVIEW_SWITCHES="name=value;..."` passes Chromium
+switches for such experiments (`disable-features=WebViewSurfaceControl` did
+not change the result).
+
 ### Next concrete task
 
 0. **Genshin Impact: complete live WebView identity verification.** The old

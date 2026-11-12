@@ -438,6 +438,19 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
             return None;
         }
         println!("webview: Chromium single-process renderer switch installed");
+        // `PENGUDROID_WEBVIEW_SWITCHES=name[=value];...`: extra Chromium switches.
+        if let Ok(list) = std::env::var("PENGUDROID_WEBVIEW_SWITCHES") {
+            for item in list.split(';').map(str::trim).filter(|i| !i.is_empty()) {
+                let (name, value) = match item.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (item, None),
+                };
+                let value = value.map(|v| env.new_string(v)).unwrap_or(std::ptr::null_mut());
+                if env.call_void(instance, append, &[JValue { l: env.new_string(name) }, JValue { l: value }]) {
+                    println!("webview: Chromium switch --{item}");
+                }
+            }
+        }
     }
     if std::env::var_os("PENGUDROID_PROBE_WEBVIEW").is_some()
         || std::env::var_os("PENGUDROID_WEBVIEW_PREWARM").is_some()
