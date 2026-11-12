@@ -92,6 +92,23 @@ Verified this session on the shipped AppImage, not on the dev tree:
   `merge_installed` persists the merged list, so a batch install cannot leave the
   file and the window disagreeing.
 
+### 2026-11-12: WebView crash after login, toolchain moved
+
+* The identity-verification WebView opened (risk-verify URL loaded) and then
+  Chromium trapped (SIGILL in `libwebviewchromium`) right after
+  `BackFramebuffer::Create: GL_INVALID_OPERATION`. Cause: gleshim kept one
+  FBO per window surface, but FBOs are per context; Chromium's context bound
+  Unity's FBO name. Fixed (`ed498d0`): texture per share group, FBO per
+  context, with a real-driver regression test. Whether verification now
+  completes needs a user-driven login (credentials are never entered by the
+  harness).
+* The `.toolchain` now lives in this checkout again (copied from the
+  `denizomer10-verbose-winner` worktree). Its guest root is
+  `.toolchain/guest-arm64-bridge` and the bridge `.toolchain/nativebridge-stage`;
+  `libOpenSLES`/`libaaudio` there are rebuilt as stubs + proxies (see below).
+  LLVM 22 comes from `~/.cache/pd-llvm22` through `.toolchain/llvm-bin`
+  wrappers (`PENGUDROID_LLVM_DIR`).
+
 ### Next concrete task
 
 0. **Genshin Impact: complete live WebView identity verification.** The old
