@@ -464,8 +464,14 @@ fn log_once(args: std::fmt::Arguments<'_>) {
 struct SurfaceRec {
     w: u32,
     h: u32,
-    tex: u32,
-    fbo: u32,
+    /// The colour texture for each GL share group that drew into this surface,
+    /// and per context the FBO that wraps it. Textures are shared within a
+    /// share group but framebuffer objects never are: one FBO name per surface
+    /// was bound in every context that made the surface current, and in an
+    /// unrelated context (Chromium's GPU thread inside a WebView) that name
+    /// does not exist, so `glBindFramebuffer(0)` raised GL_INVALID_OPERATION and
+    /// Chromium aborted.
+    targets: Vec<Target>,
     /// The daemon's surface id for this window, or 0 until the first present.
     ///
     /// It lives here rather than on the shared `State` because the framework
@@ -476,6 +482,48 @@ struct SurfaceRec {
     surface_id: u32,
     /// Only surfaces created here may be destroyed here; injected ids are borrowed.
     owns_surface: bool,
+}
+
+struct Target {
+    group: u64,
+    tex: u32,
+    /// `(context serial, fbo)`.
+    fbos: Vec<(u64, u32)>,
+}
+
+/// What gleshim knows about a context: a serial unique to this creation (the
+/// driver may hand the same handle out again after a destroy) and the serial
+/// of its share group's first context.
+#[derive(Clone, Copy)]
+struct ContextInfo { serial: u64, group: u64 }
+
+fn contexts() -> &'static Mutex<std::collections::HashMap<usize, ContextInfo>> {
+    static CONTEXTS: OnceLock<Mutex<std::collections::HashMap<usize, ContextInfo>>> = OnceLock::new();
+    CONTEXTS.get_or_init(Default::default)
+}
+fn next_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+/// Record a context created here; `share` joins its group.
+fn register_context(context: usize, share: usize) {
+    if context == 0 { return; }
+    let mut map = contexts().lock().unwrap_or_else(|e| e.into_inner());
+    let serial = next_serial();
+    let group = if share == 0 { serial } else {
+        map.get(&share).map(|info| info.group).unwrap_or_else(next_serial)
+    };
+    map.insert(context, ContextInfo { serial, group });
+}
+fn forget_context(context: usize) {
+    contexts().lock().unwrap_or_else(|e| e.into_inner()).remove(&context);
+}
+/// A context created elsewhere (straight through the host EGL) is its own group.
+fn context_info(context: usize) -> ContextInfo {
+    *contexts().lock().unwrap_or_else(|e| e.into_inner()).entry(context).or_insert_with(|| {
+        let serial = next_serial();
+        ContextInfo { serial, group: serial }
+    })
 }
 
 /// Substitute the cached host display for `EGL_NO_DISPLAY`.
@@ -504,10 +552,21 @@ fn env_dim(name: &str, default: u32) -> u32 {
 
 /// Lazily create the colour texture + FBO for `surface`. The host context must
 /// be current on this thread.
-unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(), String> {
+/// The texture and FBO the *current* context renders this surface through,
+/// created on first use: the texture once per share group, the FBO once per
+/// context.
+unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), String> {
     let rec = &mut *(surface as *mut SurfaceRec);
-    if rec.tex != 0 && rec.fbo != 0 {
-        return Ok(());
+    let current = host.get_current_context.map(|f| f() as usize).filter(|c| *c != 0)
+        .unwrap_or_else(|| CURRENT_CONTEXT.with(|c| c.get()));
+    if current == 0 {
+        return Err("no current context for the surface's framebuffer".into());
+    }
+    let info = context_info(current);
+    if let Some(target) = rec.targets.iter().find(|t| t.group == info.group) {
+        if let Some(&(_, fbo)) = target.fbos.iter().find(|(serial, _)| *serial == info.serial) {
+            return Ok((target.tex, fbo));
+        }
     }
 
     let gen_textures = host
@@ -532,25 +591,32 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(), String> {
         .gl_framebuffer_texture_2d
         .ok_or_else(|| "host glFramebufferTexture2D is unavailable".to_string())?;
 
-    let mut tex = 0u32;
-    gen_textures(1, &mut tex);
-    if tex == 0 {
-        return Err("glGenTextures returned 0".into());
-    }
-    bind_texture(GL_TEXTURE_2D, tex);
-    tex_image_2d(
-        GL_TEXTURE_2D,
-        0,
-        GL_RGBA8,
-        rec.w as c_int,
-        rec.h as c_int,
-        0,
-        GL_RGBA as u32,
-        GL_UNSIGNED_BYTE,
-        std::ptr::null(),
-    );
-    tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    let tex = match rec.targets.iter().find(|t| t.group == info.group) {
+        Some(target) => target.tex,
+        None => {
+            let mut tex = 0u32;
+            gen_textures(1, &mut tex);
+            if tex == 0 {
+                return Err("glGenTextures returned 0".into());
+            }
+            bind_texture(GL_TEXTURE_2D, tex);
+            tex_image_2d(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGBA8,
+                rec.w as c_int,
+                rec.h as c_int,
+                0,
+                GL_RGBA as u32,
+                GL_UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+            tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            rec.targets.push(Target { group: info.group, tex, fbos: Vec::new() });
+            tex
+        }
+    };
 
     let mut fbo = 0u32;
     gen_framebuffers(1, &mut fbo);
@@ -559,18 +625,17 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(), String> {
     }
     bind_framebuffer(GL_FRAMEBUFFER, fbo);
     framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-
-    rec.tex = tex;
-    rec.fbo = fbo;
-    Ok(())
+    let target = rec.targets.iter_mut().find(|t| t.group == info.group).unwrap();
+    target.fbos.push((info.serial, fbo));
+    Ok((tex, fbo))
 }
 
 /// Bind the surface's FBO and set the viewport, creating it first if needed.
 unsafe fn bind_surface_fbo(surface: EGLSurface, host: &Host) -> Result<(), String> {
-    ensure_fbo(surface, host)?;
+    let (_, fbo) = ensure_fbo(surface, host)?;
     let rec = &*(surface as *const SurfaceRec);
     if let Some(bind_framebuffer) = host.gl_bind_framebuffer {
-        bind_framebuffer(GL_FRAMEBUFFER, rec.fbo);
+        bind_framebuffer(GL_FRAMEBUFFER, fbo);
     }
     if let Some(viewport) = host.gl_viewport {
         viewport(0, 0, rec.w as c_int, rec.h as c_int);
@@ -652,12 +717,9 @@ pub fn export_surface_dmabuf(surface: EGLSurface) -> Result<DmabufExport, String
         // Direct callers of this helper may not have made the context current
         // even though they set one up earlier.
         ensure_host_context(host)?;
-        ensure_fbo(surface, host)?;
     }
+    let (texture, _) = unsafe { ensure_fbo(surface, host)? };
     let rec = unsafe { &*(surface as *const SurfaceRec) };
-    if rec.tex == 0 {
-        return Err("export: surface has no texture".into());
-    }
 
     // The display and current context. Never pass `EGL_NO_CONTEXT`.
     let (cached_display, cached_context) = {
@@ -698,7 +760,7 @@ pub fn export_surface_dmabuf(surface: EGLSurface) -> Result<DmabufExport, String
             display,
             context,
             EGL_GL_TEXTURE_2D_KHR,
-            rec.tex as usize as EGLClientBuffer,
+            texture as usize as EGLClientBuffer,
             std::ptr::null(),
         )
     };
@@ -1415,6 +1477,7 @@ pub unsafe extern "C" fn eglCreateContext(
         // SAFETY: forwarded verbatim.
         Ok(host) => {
             let context = (host.create_context)(dpy, config, share_context, attribs);
+            register_context(context as usize, share_context as usize);
             if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
                 eprintln!("[gleshim] eglCreateContext share={share_context:p} -> {context:p} tid={}", libc::gettid());
             }
@@ -1438,6 +1501,7 @@ pub unsafe extern "C" fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> 
         Err(_) => EGL_FALSE,
     };
     if ok == EGL_TRUE {
+        forget_context(ctx as usize);
         let mut st = lock_state();
         if st.context == ctx as usize {
             st.context = 0;
@@ -1650,8 +1714,7 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
     let rec = Box::new(SurfaceRec {
         w,
         h,
-        tex: 0,
-        fbo: 0,
+        targets: Vec::new(),
         surface_id: 0,
         owns_surface: false,
     });
@@ -1735,7 +1798,7 @@ pub unsafe extern "C" fn eglCreatePbufferSurface(
             }
         }
     }
-    let rec = Box::new(SurfaceRec { w, h, tex: 0, fbo: 0, surface_id: 0, owns_surface: false });
+    let rec = Box::new(SurfaceRec { w, h, targets: Vec::new(), surface_id: 0, owns_surface: false });
     let surface = Box::into_raw(rec) as EGLSurface;
     live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).insert(surface as usize);
     surface
@@ -2409,10 +2472,11 @@ pub unsafe extern "C" fn glBindFramebuffer(target: u32, framebuffer: u32) {
     };
     if framebuffer == 0 {
         let surface = current_surface() as EGLSurface;
-        if !surface.is_null() && ensure_fbo(surface, host).is_ok() {
-            let rec = &*(surface as *const SurfaceRec);
-            bind(target, rec.fbo);
-            return;
+        if !surface.is_null() {
+            if let Ok((_, fbo)) = ensure_fbo(surface, host) {
+                bind(target, fbo);
+                return;
+            }
         }
     }
     bind(target, framebuffer);
@@ -2600,6 +2664,49 @@ mod tests {
 #[cfg(test)]
 mod thread_tests {
     use super::*;
+
+    /// Two unrelated contexts (a game's and a WebView's) take turns on one
+    /// surface. Binding framebuffer 0 must land on an FBO that exists in the
+    /// context doing the binding; one shared FBO name raised
+    /// GL_INVALID_OPERATION in the second context on ES3.
+    #[test]
+    fn unrelated_contexts_get_their_own_surface_framebuffer() {
+        let Ok(host) = host() else { eprintln!("skip: no host EGL"); return; };
+        let (Some(get_error), Some(make_current)) = (host.gl_get_error, Some(host.make_current)) else { return };
+        type CheckStatus = unsafe extern "C" fn(u32) -> u32;
+        let pointer = unsafe { eglGetProcAddress(c"glCheckFramebufferStatus".as_ptr()) };
+        if pointer.is_null() { return; }
+        let check_status: CheckStatus = unsafe { std::mem::transmute(pointer) };
+        unsafe {
+            let dpy = eglGetDisplay(std::ptr::null_mut());
+            let (mut major, mut minor) = (0, 0);
+            if dpy.is_null() || eglInitialize(dpy, &mut major, &mut minor) != EGL_TRUE { eprintln!("skip: no display"); return; }
+            eglBindAPI(0x30A0);
+            let attribs: [c_int; 5] = [0x3033, 0x0001, 0x3040, 0x0040, 0x3038]; // pbuffer, ES3
+            let (mut config, mut count): (EGLConfig, c_int) = (std::ptr::null_mut(), 0);
+            if eglChooseConfig(dpy, attribs.as_ptr(), &mut config, 1, &mut count) != EGL_TRUE || count < 1 { eprintln!("skip: no ES3 config"); return; }
+            let context_attribs = [0x3098, 3, 0x3038];
+            let first = eglCreateContext(dpy, config, std::ptr::null_mut(), context_attribs.as_ptr());
+            let second = eglCreateContext(dpy, config, std::ptr::null_mut(), context_attribs.as_ptr());
+            let surface_attribs = [0x3057, 32, 0x3056, 32, 0x3038];
+            let surface = eglCreatePbufferSurface(dpy, config, surface_attribs.as_ptr());
+            assert!(!first.is_null() && !second.is_null() && !surface.is_null());
+            for context in [first, second, first] {
+                assert_eq!(eglMakeCurrent(dpy, surface, surface, context), EGL_TRUE);
+                while get_error() != 0 {}
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                assert_eq!(get_error(), 0, "binding the default framebuffer failed in context {context:p}");
+                // A name from another context binds without an error on some
+                // drivers (NVIDIA), as an empty incomplete framebuffer.
+                assert_eq!(check_status(GL_FRAMEBUFFER), 0x8CD5, "framebuffer incomplete in context {context:p}");
+            }
+            let _ = make_current;
+            eglMakeCurrent(dpy, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+            eglDestroySurface(dpy, surface);
+            eglDestroyContext(dpy, first);
+            eglDestroyContext(dpy, second);
+        }
+    }
 
     /// The current surface is per thread: another thread making its own
     /// surface current must not change what this thread binds as FBO 0.
