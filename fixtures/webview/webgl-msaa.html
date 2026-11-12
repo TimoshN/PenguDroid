@@ -9,6 +9,7 @@
 <canvas id="c2d" width="200" height="120"></canvas>
 <canvas id="a" width="200" height="120"></canvas>
 <canvas id="b" width="200" height="120"></canvas>
+<canvas id="c" width="200" height="120"></canvas>
 <script>
 function draw2d() {
   const c = document.getElementById('c2d').getContext('2d');
@@ -16,8 +17,8 @@ function draw2d() {
   c.fillRect(0, 0, 200, 120);
   return '2d:' + Array.from(c.getImageData(5, 5, 1, 1).data).join(',');
 }
-function drawgl(id, kind) {
-  const gl = document.getElementById(id).getContext(kind, {antialias: true, preserveDrawingBuffer: true});
+function drawgl(id, kind, antialias) {
+  const gl = document.getElementById(id).getContext(kind, {antialias, preserveDrawingBuffer: true});
   if (!gl) return kind + ':none';
   gl.clearColor(0.2, 0.6, 0.9, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
@@ -25,6 +26,6 @@ function drawgl(id, kind) {
   gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
   return kind + ':' + px.join(',');
 }
-const result = [draw2d(), drawgl('a', 'webgl2'), drawgl('b', 'webgl')];
+const result = [draw2d(), drawgl('a', 'webgl2', true), drawgl('b', 'webgl', true), 'noaa-' + drawgl('c', 'webgl2', false)];
 document.title = 'PenguDroid JS OK ' + result.join(' ');
 </script>

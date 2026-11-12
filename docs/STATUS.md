@@ -124,24 +124,39 @@ Fixed in order:
 3. Native fence fds (`eglDupNativeFenceFDANDROID`) are real, already-signalled
    eventfds after a `glFinish`; "Unable to get a gpu fence object" is gone.
 
-Measured now: the page runs, the 2D canvas is on screen, WebGL2 renders
-(`readPixels` = 51,153,229) but its canvas is **not composited** (white), in
-hardware and software WebView modes alike; WebGL1 is blocklisted by Chromium.
-The compositor never imports the AHardwareBuffers WebGL produced (gleshim
-traces only the producer's two `eglCreateImage` calls). Next: find where the
-WebGL frame is dropped between `PrepareTransferableResource` and the
-compositor. `PENGUDROID_WEBVIEW_SWITCHES="name=value;..."` passes Chromium
-switches for such experiments (`disable-features=WebViewSurfaceControl` did
-not change the result).
+4. WebGL canvases now reach the screen. Root cause: gleshim cached the
+   extended `EGL_EXTENSIONS` string in one process-wide slot, filled by the
+   first query. Chromium's first query is the *client* list
+   (`EGL_NO_DISPLAY`), so its display query got the client list back, without
+   `EGL_KHR_fence_sync`/`EGL_KHR_image_base`/`EGL_KHR_gl_texture_2D_image`.
+   Chromium then computed `gpu_info.can_support_threaded_texture_mailbox =
+   false`, WebView set `FORCE_AUXILIARY_BITMAP_RENDERING` (obfuscated static
+   `WV.ld.a`) and drew every hardware canvas through a software bitmap, which
+   cannot show GPU-only content. hwui's `WebViewFunctor` was created but never
+   synced or drawn. gleshim now extends each display's list separately and
+   passes client lists through. The WebView probe prints
+   `webview: force auxiliary bitmap rendering = …`; it is now `false`, WebGL1
+   is no longer blocklisted, and the frame dump shows the 2D canvas and the
+   WebGL canvases (`target/wv43.png`).
+
+Open: in about one run of three, the *first* WebGL canvas of the page
+(antialiased WebGL2) stays white while the others show; it shows when another
+WebGL canvas is created first. Probably a first-frame race between the GPU
+thread's shared-image producer and the RenderThread compositor.
+`PENGUDROID_WEBVIEW_SWITCHES="name=value;..."` passes Chromium switches for
+experiments. Debug aids: `PENGUDROID_TRACE_GLESHIM=1` now labels EGL calls
+with `tid/thread-name`, and `PENGUDROID_ALLOW_PTRACE=1` lets gdb attach to the
+app process under Yama `ptrace_scope=1`.
 
 ### Next concrete task
 
 0. **Genshin Impact: complete live WebView identity verification.** The old
    driver crash was explained and fixed through service metadata; see the
    follow-up above. A real HTML/JavaScript WebView now renders in a standalone
-   visible-window probe. The current game retry enables software Canvas for
-   its WebViews to avoid Chromium's hardware GL capability trap. Completed
-   login, resource downloads and gameplay still need validation.
+   visible-window probe, and WebGL canvases are now composited in hardware
+   mode, which the verification page (captcha) needs. Retry the live
+   verification without `PENGUDROID_WEBVIEW_SOFTWARE`; completed login,
+   resource downloads and gameplay still need validation.
 
 1. **Hardware video decode, guest half.** NewPipe plays today, in software:
    `c2.android.avc.decoder` → BLAST → `wl_shm` snapshot (630 frames in a 60 s

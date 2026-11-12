@@ -93,6 +93,20 @@ pub(super) fn probe_tick(env: &JniEnv) {
     if started.elapsed().as_secs() < 3 {
         return;
     }
+    // Whether the WebView draws through hwui's GPU functor or in software:
+    // GPU-backed canvases (WebGL, accelerated 2D) only appear in the former.
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let _ = (|| -> Option<()> {
+            let _frame = env.local_frame(16)?;
+            let class = env.find_class("android/view/View")?;
+            let accelerated = env.call_boolean(view as JObject, env.method_id(class, "isHardwareAccelerated", "()Z")?, &[])?;
+            let layer = env.call_int(view as JObject, env.method_id(class, "getLayerType", "()I")?, &[])?;
+            let attached = env.call_boolean(view as JObject, env.method_id(class, "isAttachedToWindow", "()Z")?, &[])?;
+            println!("webview: probe view hardwareAccelerated={accelerated} layerType={layer} attached={attached}");
+            Some(())
+        })();
+    }
     let title = (|| -> Option<String> {
         let _frame = env.local_frame(16)?;
         let class = env.find_class("android/webkit/WebView")?;
@@ -466,6 +480,7 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
         let view_class = env.find_class("android/webkit/WebView")?;
         let ctor = env.method_id(view_class, "<init>", "(Landroid/content/Context;)V")?;
         let view = env.new_object(view_class, ctor, &[JValue { l: app }])?;
+        report_aux_bitmap_flag(env);
         if std::env::var_os("PENGUDROID_WEBVIEW_SOFTWARE").is_some() {
             let set = env.method_id(view_class, "setLayerType", "(ILandroid/graphics/Paint;)V")?;
             if !env.call_void(
@@ -522,5 +537,26 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
             Some((view as usize, std::time::Instant::now()));
         println!("webview: HTML/JavaScript page probe queued");
     }
+    Some(())
+}
+
+/// Probe diagnostic: WebView 145 keeps `FORCE_AUXILIARY_BITMAP_RENDERING`
+/// (= `!HasRequiredHardwareExtensions()`, i.e. Chromium's
+/// `gpu_info.can_support_threaded_texture_mailbox` is false) in the
+/// obfuscated static `WV.ld.a`. When set, hardware canvases are drawn through
+/// a software bitmap and GPU-only content (WebGL) never reaches the screen.
+fn report_aux_bitmap_flag(env: &JniEnv) -> Option<()> {
+    let factory = env.find_class("android/webkit/WebView")?;
+    let get = env.static_method_id(factory, "getWebViewClassLoader", "()Ljava/lang/ClassLoader;")?;
+    let loader = env.call_static_object(factory, get, &[])?;
+    let loader_class = env.find_class("java/lang/ClassLoader")?;
+    let load = env.method_id(loader_class, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")?;
+    let class = env.call_object(loader, load, &[JValue { l: env.new_string("WV.ld") }])?;
+    if class.is_null() {
+        return None;
+    }
+    let field = env.static_field_id(class as JClass, "a", "Z")?;
+    let forced = env.static_boolean_field(class as JClass, field);
+    println!("webview: force auxiliary bitmap rendering = {forced}");
     Some(())
 }

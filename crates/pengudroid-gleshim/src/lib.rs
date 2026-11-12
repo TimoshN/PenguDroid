@@ -182,6 +182,12 @@ impl Host {
         if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
             trace_mapped_gl();
         }
+        // Debug aid: let an unrelated gdb attach under Yama ptrace_scope=1.
+        if std::env::var_os("PENGUDROID_ALLOW_PTRACE").is_some() {
+            // SAFETY: prctl with integer arguments only.
+            unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
+            eprintln!("[gleshim] ptrace allowed for pid {}", std::process::id());
+        }
 
         // Core entry points are looked up in libEGL itself; the extension
         // entry points may only be published through `eglGetProcAddress`.
@@ -1267,33 +1273,62 @@ pub unsafe extern "C" fn eglQueryString(dpy: EGLDisplay, name: c_int) -> *const 
         // SAFETY: forwarded verbatim.
         Ok(host) => {
             let raw = (host.query_string)(dpy, name);
+            if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                let text = if raw.is_null() { String::new() } else { std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned() };
+                let has = |e: &str| text.split(' ').any(|x| x == e);
+                eprintln!(
+                    "[gleshim] eglQueryString dpy={dpy:p} name={name:#x} thread={} fence_sync={} image_base={} tex2d={} len={}",
+                    thread_label(), has("EGL_KHR_fence_sync"), has("EGL_KHR_image_base"), has("EGL_KHR_gl_texture_2D_image"), text.len()
+                );
+            }
             if name != EGL_EXTENSIONS || raw.is_null() {
                 return raw;
             }
-            // hwui hard-requires `EGL_KHR_swap_buffers_with_damage`
-            // (`EglManager::initialize` aborts without it), and a surfaceless
-            // Mesa display does not advertise it. The entry point below is a
-            // real implementation — it forwards to `eglSwapBuffers` — so
-            // advertising it is honest.
-            static EXTENSIONS: OnceLock<CString> = OnceLock::new();
-            let s = EXTENSIONS.get_or_init(|| {
-                let base = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();
-                let mut all = base.clone();
-                // Implemented below on top of the host's KHR_image_base.
-                for extension in ["EGL_KHR_swap_buffers_with_damage",
-                                  "EGL_ANDROID_get_native_client_buffer",
-                                  "EGL_ANDROID_image_native_buffer"] {
-                    if !base.split(' ').any(|e| e == extension) {
-                        all.push(' ');
-                        all.push_str(extension);
-                    }
-                }
-                CString::new(all).unwrap_or_default()
-            });
-            s.as_ptr()
+            // Client extensions (EGL_NO_DISPLAY) are a different list and
+            // stay untouched. Display lists are extended once per display:
+            // a single process-wide cache handed Chromium its client list
+            // back for the display query, hiding EGL_KHR_fence_sync and
+            // friends and forcing WebView onto software bitmap draws.
+            if dpy.is_null() {
+                return raw;
+            }
+            extended_display_extensions(dpy as usize, std::ffi::CStr::from_ptr(raw))
         }
         Err(_) => std::ptr::null(),
     }
+}
+
+/// `EGL_EXTENSIONS` of `display` plus the extensions this shim implements.
+/// The returned string lives for the rest of the process.
+fn extended_display_extensions(display: usize, base: &std::ffi::CStr) -> *const c_char {
+    static CACHE: Mutex<Vec<(usize, &'static std::ffi::CStr)>> = Mutex::new(Vec::new());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = cache.iter().find(|(d, _)| *d == display) {
+        return s.as_ptr();
+    }
+    let s: &'static std::ffi::CStr = Box::leak(extend_extension_list(&base.to_string_lossy()).into_boxed_c_str());
+    cache.push((display, s));
+    s.as_ptr()
+}
+
+/// Append the extensions this shim implements on top of the host's
+/// KHR_image_base to a host display extension list.
+fn extend_extension_list(base: &str) -> CString {
+    let mut all = base.to_string();
+    // hwui hard-requires `EGL_KHR_swap_buffers_with_damage`
+    // (`EglManager::initialize` aborts without it); the entry point forwards
+    // to `eglSwapBuffers`, so advertising it is honest.
+    for extension in ["EGL_KHR_swap_buffers_with_damage",
+                      "EGL_ANDROID_get_native_client_buffer",
+                      "EGL_ANDROID_image_native_buffer"] {
+        if !base.split(' ').any(|e| e == extension) {
+            if !all.is_empty() {
+                all.push(' ');
+            }
+            all.push_str(extension);
+        }
+    }
+    CString::new(all).unwrap_or_default()
 }
 
 /// `eglSwapBuffersWithDamageKHR(dpy, surface, rects, n_rects)`.
@@ -1484,7 +1519,7 @@ pub unsafe extern "C" fn eglCreateContext(
             let context = (host.create_context)(dpy, config, share_context, attribs);
             register_context(context as usize, share_context as usize);
             if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-                eprintln!("[gleshim] eglCreateContext share={share_context:p} -> {context:p} tid={}", libc::gettid());
+                eprintln!("[gleshim] eglCreateContext share={share_context:p} -> {context:p} thread={}", thread_label());
             }
             context
         }
@@ -1498,7 +1533,7 @@ pub unsafe extern "C" fn eglCreateContext(
 #[no_mangle]
 pub unsafe extern "C" fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> u32 {
     if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] eglDestroyContext ctx={ctx:p} tid={}", libc::gettid());
+        eprintln!("[gleshim] eglDestroyContext ctx={ctx:p} thread={}", thread_label());
     }
     let ok = match host() {
         // SAFETY: forwarded verbatim.
@@ -1534,7 +1569,7 @@ pub unsafe extern "C" fn eglMakeCurrent(
     // A surfaceless host display has no window surfaces; the app renders into
     // our FBO instead, so only the context is made current.
     if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] eglMakeCurrent dpy={dpy:p} draw={draw:p} ctx={ctx:p} tid={}", libc::gettid());
+        eprintln!("[gleshim] eglMakeCurrent dpy={dpy:p} draw={draw:p} ctx={ctx:p} thread={}", thread_label());
     }
     let dpy = resolve_display(dpy);
     let ok = (host.make_current)(
@@ -1574,8 +1609,35 @@ pub unsafe extern "C" fn eglMakeCurrent(
     EGL_TRUE
 }
 
+/// `tid/comm` of the calling thread, for traces.
+fn thread_label() -> String {
+    // SAFETY: gettid has no preconditions.
+    let tid = unsafe { libc::gettid() };
+    let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).unwrap_or_default();
+    format!("{tid}/{}", comm.trim())
+}
+
+/// Under `PENGUDROID_TRACE_GLESHIM`, report the first `what` call per thread.
+fn trace_thread_once(what: &'static str) {
+    thread_local!(static SEEN: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) });
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_none() {
+        return;
+    }
+    if SEEN.with(|s| {
+        let mut s = s.borrow_mut();
+        let new = !s.contains(&what);
+        if new {
+            s.push(what);
+        }
+        new
+    }) {
+        eprintln!("[gleshim] first {what} on thread {}", thread_label());
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn eglGetCurrentContext() -> EGLContext {
+    trace_thread_once("eglGetCurrentContext");
     if let Some(get_current_context) = host().ok().and_then(|h| h.get_current_context) {
         // SAFETY: plain entry point.
         return get_current_context();
@@ -2645,6 +2707,18 @@ pub unsafe extern "C" fn glBindFramebuffer(target: u32, framebuffer: u32) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn display_extension_list_gains_shim_extensions_once() {
+        let out = extend_extension_list("EGL_KHR_fence_sync EGL_KHR_swap_buffers_with_damage");
+        let out = out.to_str().unwrap();
+        assert!(out.starts_with("EGL_KHR_fence_sync "));
+        assert_eq!(out.matches("EGL_KHR_swap_buffers_with_damage").count(), 1);
+        assert!(out.contains("EGL_ANDROID_image_native_buffer"));
+        assert_eq!(extend_extension_list("").to_str().unwrap().split(' ').next(), Some("EGL_KHR_swap_buffers_with_damage"));
+    }
+
     use super::*;
 
     #[test]
