@@ -1278,12 +1278,17 @@ pub unsafe extern "C" fn eglQueryString(dpy: EGLDisplay, name: c_int) -> *const 
             static EXTENSIONS: OnceLock<CString> = OnceLock::new();
             let s = EXTENSIONS.get_or_init(|| {
                 let base = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();
-                if base.contains("EGL_KHR_swap_buffers_with_damage") {
-                    CString::new(base).unwrap_or_default()
-                } else {
-                    CString::new(format!("{base} EGL_KHR_swap_buffers_with_damage"))
-                        .unwrap_or_default()
+                let mut all = base.clone();
+                // Implemented below on top of the host's KHR_image_base.
+                for extension in ["EGL_KHR_swap_buffers_with_damage",
+                                  "EGL_ANDROID_get_native_client_buffer",
+                                  "EGL_ANDROID_image_native_buffer"] {
+                    if !base.split(' ').any(|e| e == extension) {
+                        all.push(' ');
+                        all.push_str(extension);
+                    }
                 }
+                CString::new(all).unwrap_or_default()
             });
             s.as_ptr()
         }
@@ -1613,6 +1618,156 @@ pub unsafe extern "C" fn eglSwapInterval(dpy: EGLDisplay, interval: c_int) -> u3
     }
 }
 
+// ---------------------------------------------------------------------------
+// EGL_ANDROID_image_native_buffer on a host EGL that has never heard of it
+// ---------------------------------------------------------------------------
+
+const EGL_NATIVE_BUFFER_ANDROID: u32 = 0x3140;
+const EGL_GL_TEXTURE_2D_KHR_TARGET: u32 = 0x30B1;
+
+/// `AHardwareBuffer_Desc`'s leading fields (android/hardware_buffer.h).
+#[repr(C)]
+#[derive(Default)]
+struct AhbDesc { width: u32, height: u32, layers: u32, format: u32, usage: u64, stride: u32, rfu0: u32, rfu1: u64 }
+
+/// One GPU image per AHardwareBuffer, shared by every `eglCreateImage` on it,
+/// so that all contexts (a WebGL producer and the compositor that samples it)
+/// see the same storage. Each create returns the same EGLImage and takes a
+/// reference; the last destroy releases it.
+struct NativeImage { image: usize, references: usize }
+fn native_images() -> &'static Mutex<std::collections::HashMap<usize, NativeImage>> {
+    static IMAGES: OnceLock<Mutex<std::collections::HashMap<usize, NativeImage>>> = OnceLock::new();
+    IMAGES.get_or_init(Default::default)
+}
+
+/// GL internal format, format and type for an AHardwareBuffer format.
+fn gl_format_for_ahb(format: u32) -> Option<(c_int, u32, u32)> {
+    const GL_RGB: u32 = 0x1907;
+    const GL_RED: u32 = 0x1903;
+    match format {
+        1 | 2 => Some((GL_RGBA8, GL_RGBA as u32, GL_UNSIGNED_BYTE)),     // R8G8B8A8 / R8G8B8X8
+        3 => Some((0x8051, GL_RGB, GL_UNSIGNED_BYTE)),                   // R8G8B8 -> GL_RGB8
+        4 => Some((0x8D62, GL_RGB, 0x8363)),                             // R5G6B5 -> GL_RGB565
+        0x16 => Some((0x881A, GL_RGBA as u32, 0x140B)),                  // R16G16B16A16_FLOAT
+        0x2b => Some((0x8059, GL_RGBA as u32, 0x8368)),                  // R10G10B10A2 (2_10_10_10_REV)
+        0x38 => Some((0x8229, GL_RED, GL_UNSIGNED_BYTE)),                // R8_UNORM -> GL_R8
+        _ => None,
+    }
+}
+
+/// `eglGetNativeClientBufferANDROID(buffer)`: the AHardwareBuffer itself is the
+/// client buffer; `eglCreateImageKHR` below knows how to read it.
+#[no_mangle]
+pub extern "C" fn eglGetNativeClientBufferANDROID(buffer: *const c_void) -> EGLClientBuffer {
+    buffer as EGLClientBuffer
+}
+
+unsafe fn create_native_buffer_image(host: &Host, dpy: EGLDisplay, buffer: EGLClientBuffer) -> EGLImageKHR {
+    let key = buffer as usize;
+    if let Some(entry) = native_images().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&key) {
+        entry.references += 1;
+        return entry.image as EGLImageKHR;
+    }
+    type Describe = unsafe extern "C" fn(*const c_void, *mut AhbDesc);
+    let describe = libc::dlsym(libc::RTLD_DEFAULT, c"AHardwareBuffer_describe".as_ptr());
+    let context = host.get_current_context.map(|f| f()).unwrap_or(std::ptr::null_mut());
+    let (Some(create), Some(gen), Some(bind), Some(upload), Some(parameter), false, false) = (
+        host.create_image_khr, host.gl_gen_textures, host.gl_bind_texture, host.gl_tex_image_2d,
+        host.gl_tex_parameter_i, describe.is_null(), context.is_null(),
+    ) else {
+        log_once(format_args!("EGL_NATIVE_BUFFER_ANDROID: no AHardwareBuffer_describe or no current context"));
+        return std::ptr::null_mut();
+    };
+    let mut desc = AhbDesc::default();
+    (std::mem::transmute::<*mut c_void, Describe>(describe))(buffer, &mut desc);
+    let Some((internal, format, kind)) = gl_format_for_ahb(desc.format) else {
+        log_once(format_args!("EGL_NATIVE_BUFFER_ANDROID: unsupported AHardwareBuffer format {:#x}", desc.format));
+        return std::ptr::null_mut();
+    };
+    if desc.width == 0 || desc.height == 0 || desc.width > 16384 || desc.height > 16384 {
+        return std::ptr::null_mut();
+    }
+    // The texture only seeds the image: the image keeps the storage alive,
+    // so the name can go at once and nothing is tied to this context.
+    let mut texture = 0u32;
+    gen(1, &mut texture);
+    bind(GL_TEXTURE_2D, texture);
+    upload(GL_TEXTURE_2D, 0, internal, desc.width as c_int, desc.height as c_int, 0, format, kind, std::ptr::null());
+    parameter(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    let image = create(dpy, context, EGL_GL_TEXTURE_2D_KHR_TARGET, texture as usize as EGLClientBuffer, std::ptr::null());
+    type Delete = unsafe extern "C" fn(c_int, *const u32);
+    let delete = eglGetProcAddress(c"glDeleteTextures".as_ptr());
+    if !delete.is_null() { (std::mem::transmute::<*mut c_void, Delete>(delete))(1, &texture); }
+    if image.is_null() {
+        log_once(format_args!("EGL_NATIVE_BUFFER_ANDROID: host eglCreateImageKHR(texture) failed"));
+        return image;
+    }
+    native_images().lock().unwrap_or_else(|e| e.into_inner())
+        .insert(key, NativeImage { image: image as usize, references: 1 });
+    image
+}
+
+/// `eglCreateImageKHR`, with `EGL_NATIVE_BUFFER_ANDROID` served here.
+#[no_mangle]
+pub unsafe extern "C" fn eglCreateImageKHR(dpy: EGLDisplay, ctx: EGLContext, target: u32,
+    buffer: EGLClientBuffer, attribs: *const c_int) -> EGLImageKHR {
+    let Ok(host) = host() else { return std::ptr::null_mut() };
+    let dpy = resolve_display(dpy);
+    if target == EGL_NATIVE_BUFFER_ANDROID {
+        return create_native_buffer_image(host, dpy, buffer);
+    }
+    match host.create_image_khr {
+        Some(create) => create(dpy, ctx, target, buffer, attribs),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `eglDestroyImageKHR`: images made from an AHardwareBuffer are reference counted.
+#[no_mangle]
+pub unsafe extern "C" fn eglDestroyImageKHR(dpy: EGLDisplay, image: EGLImageKHR) -> u32 {
+    let Ok(host) = host() else { return EGL_FALSE };
+    let dpy = resolve_display(dpy);
+    {
+        let mut images = native_images().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((&key, entry)) = images.iter_mut().find(|(_, e)| e.image == image as usize) {
+            entry.references -= 1;
+            if entry.references > 0 { return EGL_TRUE; }
+            images.remove(&key);
+        }
+    }
+    match host.destroy_image_khr {
+        Some(destroy) => destroy(dpy, image),
+        None => EGL_FALSE,
+    }
+}
+
+/// EGL 1.5 `eglCreateImage`: same as the KHR entry point, with `EGLAttrib`s.
+#[no_mangle]
+pub unsafe extern "C" fn eglCreateImage(dpy: EGLDisplay, ctx: EGLContext, target: u32,
+    buffer: EGLClientBuffer, attribs: *const isize) -> EGLImageKHR {
+    if target == EGL_NATIVE_BUFFER_ANDROID {
+        let Ok(host) = host() else { return std::ptr::null_mut() };
+        return create_native_buffer_image(host, resolve_display(dpy), buffer);
+    }
+    // Narrow the EGLAttrib list to the KHR entry point's EGLint list.
+    let mut narrowed = Vec::new();
+    if !attribs.is_null() {
+        for index in 0..64 {
+            let key = *attribs.add(index * 2);
+            narrowed.push(key as c_int);
+            if key as c_int == EGL_NONE { break; }
+            narrowed.push(*attribs.add(index * 2 + 1) as c_int);
+        }
+    }
+    eglCreateImageKHR(dpy, ctx, target, buffer, if attribs.is_null() { std::ptr::null() } else { narrowed.as_ptr() })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglDestroyImage(dpy: EGLDisplay, image: EGLImageKHR) -> u32 {
+    eglDestroyImageKHR(dpy, image)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *mut c_void {
     if name.is_null() {
@@ -1631,6 +1786,11 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *mut c_void {
         (b"eglDestroySurface", eglDestroySurface as *mut c_void),
         (b"eglSwapBuffers", eglSwapBuffers as *mut c_void),
         (b"glBindFramebuffer", glBindFramebuffer as *mut c_void),
+        (b"eglGetNativeClientBufferANDROID", eglGetNativeClientBufferANDROID as *mut c_void),
+        (b"eglCreateImageKHR", eglCreateImageKHR as *mut c_void),
+        (b"eglDestroyImageKHR", eglDestroyImageKHR as *mut c_void),
+        (b"eglCreateImage", eglCreateImage as *mut c_void),
+        (b"eglDestroyImage", eglDestroyImage as *mut c_void),
     ];
     for (symbol, ptr) in ours {
         if requested == *symbol {
@@ -1946,39 +2106,6 @@ pub unsafe extern "C" fn eglDupNativeFenceFDANDROID(
     _sync: *mut c_void,
 ) -> c_int {
     -1
-}
-
-/// `eglGetNativeClientBufferANDROID(buffer)` — `AHardwareBuffer` is already the
-/// native client buffer, so this is the identity.
-#[no_mangle]
-pub unsafe extern "C" fn eglGetNativeClientBufferANDROID(buffer: *mut c_void) -> EGLClientBuffer {
-    buffer
-}
-
-/// `eglCreateImageKHR(dpy, ctx, target, buffer, attrib_list)`.
-#[no_mangle]
-pub unsafe extern "C" fn eglCreateImageKHR(
-    dpy: EGLDisplay,
-    ctx: EGLContext,
-    target: u32,
-    buffer: EGLClientBuffer,
-    attrib_list: *const c_int,
-) -> EGLImageKHR {
-    match host().ok().and_then(|h| h.create_image_khr) {
-        // SAFETY: forwarded verbatim; the host owns the argument contract.
-        Some(create) => create(resolve_display(dpy), ctx, target, buffer, attrib_list),
-        None => std::ptr::null_mut(),
-    }
-}
-
-/// `eglDestroyImageKHR(dpy, image)`.
-#[no_mangle]
-pub unsafe extern "C" fn eglDestroyImageKHR(dpy: EGLDisplay, image: EGLImageKHR) -> u32 {
-    match host().ok().and_then(|h| h.destroy_image_khr) {
-        // SAFETY: forwarded verbatim.
-        Some(destroy) => destroy(resolve_display(dpy), image),
-        None => EGL_FALSE,
-    }
 }
 
 /// `eglPresentationTimeANDROID(dpy, surface, time)`.

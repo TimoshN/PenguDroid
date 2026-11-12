@@ -100,7 +100,9 @@ pub(super) fn probe_tick(env: &JniEnv) {
         let title = env.call_object(view as JObject, get, &[])?;
         env.get_string(title)
     })();
-    if title.as_deref() == Some("PenguDroid JS OK") {
+    // A custom probe page may append its own measurements after the marker.
+    if let Some(title) = title.as_deref().filter(|t| t.starts_with("PenguDroid JS OK")) {
+        if title.len() > "PenguDroid JS OK".len() { println!("webview: probe page reports: {title}"); }
         println!("webview: HTML and JavaScript page probe passed");
     } else if started.elapsed().as_secs() < 15 {
         return;

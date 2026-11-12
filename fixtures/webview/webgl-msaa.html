@@ -1,13 +1,23 @@
 <!doctype html>
 <title>Loading</title>
-<!-- WebView probe page: an antialiased WebGL2 and WebGL1 canvas, the kind
-     captcha/verification pages draw. Antialiasing makes Chromium query the
-     renderbuffer sample counts (glGetInternalformativ). -->
-<canvas id="a" width="256" height="256"></canvas>
-<canvas id="b" width="256" height="256"></canvas>
+<!-- WebView probe page: a 2D canvas and antialiased WebGL2/WebGL1 canvases,
+     the kind captcha/verification pages draw. Antialiasing makes Chromium
+     query the renderbuffer sample counts (glGetInternalformativ and
+     glGetInternalformatSampleivNV). The title reports what each canvas read
+     back; the frame dump shows what reached the screen. -->
+<style>canvas { display: block; margin: 4px; }</style>
+<canvas id="c2d" width="200" height="120"></canvas>
+<canvas id="a" width="200" height="120"></canvas>
+<canvas id="b" width="200" height="120"></canvas>
 <script>
-function draw(id, kind) {
-  const gl = document.getElementById(id).getContext(kind, {antialias: true});
+function draw2d() {
+  const c = document.getElementById('c2d').getContext('2d');
+  c.fillStyle = 'rgb(230, 40, 40)';
+  c.fillRect(0, 0, 200, 120);
+  return '2d:' + Array.from(c.getImageData(5, 5, 1, 1).data).join(',');
+}
+function drawgl(id, kind) {
+  const gl = document.getElementById(id).getContext(kind, {antialias: true, preserveDrawingBuffer: true});
   if (!gl) return kind + ':none';
   gl.clearColor(0.2, 0.6, 0.9, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
@@ -15,7 +25,6 @@ function draw(id, kind) {
   gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
   return kind + ':' + px.join(',');
 }
-let result = [draw('a', 'webgl2'), draw('b', 'webgl')];
-console.log('webgl probe ' + result.join(' '));
-document.title = 'PenguDroid JS OK';
+const result = [draw2d(), drawgl('a', 'webgl2'), drawgl('b', 'webgl')];
+document.title = 'PenguDroid JS OK ' + result.join(' ');
 </script>
