@@ -70,13 +70,67 @@ Two extraction details matter for anyone reproducing this:
   `framework/x86_64/boot.art`; passing `framework/x86_64/boot.art` makes ART look
   for `framework/x86_64/x86_64/boot.art` and miss.
 
-**Open at this checkpoint:** the boot image does not load — ART reports
-`ValidateOatFile found read barrier state mismatch (oat file: false, runtime:
-true)` and falls back to imageless running. All 154 `-X`/`-XX` options exported
-by this `libart.so` were enumerated and none controls read barriers, so this is
-not currently configurable. Imageless mode works (NewPipe runs) but costs
-startup time and boot-image sharing. See [STATUS.md](STATUS.md) for the measured
-gaps.
+**Boot image state (latest):** the image now *validates and loads*, but the
+guest then dies in the userfaultfd garbage collector, so imageless running is
+still what ships. The full chain, all confirmed empirically:
+
+1. This `libart.so` computes `gUseReadBarrier = !gUseUserfaultfd` from a single
+   store (`0x5873be`). The shipped artifacts were built with read barriers
+   **off**, so `true` on our side rejects the image with
+   `ValidateOatFile found read barrier state mismatch (oat file: false, runtime:
+   true)`. No `-X`/`-XX` option controls it — it is derived state, not a flag.
+2. `KernelSupportsUffd()` probes `syscall(323)` with flags
+   `O_CLOEXEC|UFFD_USER_MODE_ONLY` (`0x80001`), which is allowed even when
+   `vm.unprivileged_userfaultfd=0`. It succeeds here, so ART does run its
+   uffd-GC build.
+3. Setting `PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true` flips that path,
+   which clears the read-barrier rejection and lets the image load.
+4. The boot classpath must then match the image's OAT header byte for byte
+   (14 entries, `core-icu4j.jar` last — see `Layout::detect`). With that fixed,
+   ART decompresses and adopts all 14 components and `ICU4J` registers.
+
+**5. The remaining blocker is signal delivery into translated code.** With
+`UFFD_FEATURE_SIGBUS`, userfaultfd has no file descriptor to read: the kernel
+sends `SIGBUS`/`BUS_ADRERR` to the faulting thread by design, ART's handler
+copies the missing page in, and the faulting instruction re-executes. `strace`
+shows the GC thread doing `UFFDIO_API(features=UFFD_FEATURE_SIGBUS)` then
+`UFFDIO_REGISTER [0x2000000, round_up(post_compact_end))`, while a *mutator*
+thread faults inside that range but outside the copying plan (filler space above
+`post_compact_end`) before the matching `UFFDIO_COPY` calls are issued. ART
+cannot map that address to a plan entry, declares the fault fatal, and a second
+fault during the fatal report yields
+`HandleUnexpectedSignal reenter` (`runtime_common.cc:466`).
+
+That resolution path needs the kernel to deliver a signal *into guest code* and
+then resume the faulting instruction. The guest code here is ARM64 running under
+the prebuilt translation bridge (`libberis_arm64.so`, no source in this
+repository), which cannot resume translated execution after a delivered signal.
+This is why the shim cannot paper over it:
+
+* clearing `UFFD_FEATURE_MOVE` (new in host kernel 6.8+, advertised by 7.0.0)
+  makes ART use the older `UFFDIO_COPY` path — `strace` then shows zero
+  `UFFDIO_MOVE` calls — but the fault is unchanged;
+* clearing `UFFD_FEATURE_SIGBUS` instead returns ART to the read-barrier
+  configuration (`oat file: false, runtime: true`) and the image is rejected;
+* pinning a different collector is not an escape: `-Xgc:MS` and `-Xgc:SS` abort
+  with `Check failed: foreground_collector_type_ == kCollectorTypeCMC`, i.e. this
+  runtime is a uffd-GC-only build;
+* the fault is not a kernel bug: replaying ART's exact sequence
+  (`mmap` → `mremap(MREMAP_MAYMOVE|MREMAP_DONTUNMAP|MREMAP_FIXED)` →
+  `UFFDIO_REGISTER` MISSING → `madvise(DONTNEED)` → `UFFDIO_COPY` back →
+  `UFFDIO_UNREGISTER` → write past the copy-back end) succeeds at every offset.
+
+Sizing the heap so that startup never compacts sidesteps the uffd dance and shows
+how far the image gets: with `-Xms512m -Xmx1g` there is no fatal signal and the
+guest reaches `ACRA`, `WorkManager`/`SystemJobService`, `DisplayManager` and a
+string of binder lookups. The first collection that compacts still kills it, so
+that is a diagnostic, not a shipping configuration.
+
+So the property toggle and the classpath order are both solved; what separates
+imageless mode from full image sharing is now signal-resume support in the
+translator, not anything in ART's configuration. Imageless mode is therefore
+still the default and remains fully functional. See [STATUS.md](STATUS.md) for
+the measured startup gap and reproduce commands.
 
 An earlier checkpoint recorded real API-37 bringup using the official x86_64
 GSI `CP2A.260605.012`, SHA-256

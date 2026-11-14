@@ -2019,9 +2019,13 @@ def main():
                         # The host-accessor pthread_attr overlay; its first form
                         # discarded the result, the current one checks it.
                         artifact.get("destination") == "sources/native_bridge_support"
-                        and any(marker in (path / "android_api/libc/proxy/pthread_translation.cc").read_text()
-                                for marker in ("pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size);",
-                                               "pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size) != 0"))
+                        and (any(marker in (path / "android_api/libc/proxy/pthread_translation.cc").read_text()
+                                 for marker in ("pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size);",
+                                                "pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size) != 0"))
+                             or ("// Guest pthread_attr_* calls are served by the host libc" in
+                                 (path / "android_api/libc/proxy/pthread_translation.cc").read_text()
+                                 and "pthread_attr_getguardsize(&attr, &guest_guard_size)" in
+                                 (path / "android_api/libc/proxy/pthread_translation.cc").read_text()))
                     )
                     if not digest_matches and not is_known_compatibility_overlay:
                         raise BuildError(f"modified dependency: {path}")

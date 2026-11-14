@@ -2,7 +2,558 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Where we left off — desktop manager verified (2026-11-11)
+## Where we left off — Play Billing reply framing fixed; Genshin launches clean, billing connect loop gone (2026-11-14, `1b7dd75`)
+
+Pick up here. The hosted `IInAppBillingService` replies were mis-framed and
+that had two visible effects in Genshin 7.2.0: `isBillingSupported` echoed the
+apiVersion back (read as `BILLING_UNAVAILABLE`) so `BillingClient` looped
+CONNECTING/DISCONNECTED ~22 times, and Bundle replies crashed
+`Parcel.readBundle` with "Bundle length is not aligned by 4" because the
+billing 8.3.0 proxy consumes **two** ints (status + unconditional exception
+code) before the payload. Fixed in `1b7dd75`:
+
+- `binder.rs` `make_reply` BILLING_SERVICE branch writes an extra `0` int
+  (exception code) after the status word: replies are now
+  `[status=0][exc=0][payload]`.
+- `isBillingSupported` (code 1) parses `[i32 apiVersion][String16 pkg][String16
+  type]` and answers 0 (RESPONSE_OK) for `inapp`/`subs`, 3 otherwise.
+- `apphost.rs` `install_billing` marshals Bundle replies through
+  `Parcel.writeBundle` (adds the outer length word) and installs the full
+  empty-purchases bundle (RESPONSE_CODE=0 + empty `INAPP_PURCHASE_ITEM_LIST` /
+  `INAPP_PURCHASE_DATA_LIST` / `INAPP_DATA_SIGNATURE_LIST` StringArrayLists +
+  empty `INAPP_CONTINUATION_TOKEN`) on getPurchases codes **4 and 11**
+  (billing 8.3.0 queries owned items via code 11).
+
+Verified: `/tmp/genshin-trace7.log` (420 s, exit=124: framing fix confirmed,
+code-11 bundle parses, 0 "not aligned", 0 SIGSEGV, 7 CONNECTED),
+`/tmp/genshin-trace8.log` (420 s, exit=124: 336-byte purchases bundle on code
+11, 0 crashes, vsync frames to 23160, connect loop gone). Remaining benign
+noise: exactly one "getPurchase() got null owned items list" /
+"Querying purchases failed" — also present in the earlier good 900 s baseline
+`/tmp/genshin-full.log`; the game launches and renders regardless (no
+purchasing needed for login). All 162 shim + 11 integration + CLI tests green.
+
+Next: BBR2 XAPK regression after the framing change
+(`/tmp/bbr2-smoke17.log`), then a final long Genshin run + resize/tablet
+verification.
+
+## Previous — Genshin Impact 7.2.0 boots to a rendering main activity (2026-11-14)
+
+Pick up here. Genshin (`/tmp/genshin.apks`, repacked from `~/Downloads` APKM,
+base at `/tmp/genshin-apkm/base.apk`) now launches without `--sysroot`:
+`handleBindApplication` completes, the launch activity resumes, `libyuanshen.so`
+loads, a Surface is created and vsync frames flow for the whole run
+(`/tmp/genshin-trace4.log`, 420 s, no crash; full 900 s smoke in
+`/tmp/genshin-full.log`). The last three blockers were fixed in `b7a38ad`:
+
+- `IPackageManager` code 41 = `resolveContentProvider` (confirmed by
+  disassembling API-37 `classes.dex`): answered with a marshalled `ProviderInfo`
+  keyed by `auth:{authority}` — this is what let `FileProvider.attachInfo` pass.
+- Application meta-data: `ApplicationInfo.metaData` is now built from the
+  manifest's `<application><meta-data>` (was an empty Bundle, which made GMS's
+  `OSParamsProvider` throw `...MissingManifestValueException`).
+- `android:value="@integer/google_play_services_version"` compiles to a
+  **value reference**; GMS compares the resolved literal (`12451000`), not the
+  `0x7f090004` id. `apk.rs` now tags these as `MetaValue::ValueRef` (distinct
+  from `android:resource` `Ref`, which must stay an id — FileProvider loads it
+  with `Resources.getXml`) and `resolve_value_reference` parses
+  `resources.arsc` (offsets array sits at chunk `headerSize`, entry offsets are
+  relative to `entriesStart`) to resolve integer entries; verified against the
+  real base.apk in an env-gated test (`PENGUDROID_TEST_APK`).
+
+Known benign noise in Genshin smokes: `com.google.android.gms.games.APP_ID`
+Bundle WARN/ClassCastException (caught internally), mihoyoos
+`GoogleQueryPurchase` "Service connection is disconnected" retry loop
+(vending billing shim answers, but the SDK treats the disconnect as a soft
+failure and retries), Firebase/FA errors, aconfig mmap WARNs.
+
+Validation after `b7a38ad` / `7d3f0fa`:
+
+- Genshin full smoke `/tmp/genshin-full.log` (900 s): `exit=124` (alive at
+  timeout), no fatal; `Activity resumed`, `libyuanshen.so` loaded, Surface +
+  BLAST consumer created, vsync frames throughout. Traced run
+  `/tmp/genshin-trace4.log` shows the same plus `OSParamsProvider` appSetId
+  success — the GMS version meta-data now reads 12451000.
+- BBR2 XAPK regression `/tmp/bbr2-smoke16.log` (600 s): 0 UNKNOWN_TRANSACTION,
+  `Billing service connected`, login POST `/cobalt/free2play/api/v8/login`
+  reached, alive at timeout.
+- Resize/tablet (demo daemon): `window 1` 496x883 window (248x441 dp) ->
+  `--fullscreen`/`--maximize` 2560x1440 / 2560x1373 (1280x720 dp, **tablet**)
+  -> `--windowed` back; internal buffer stays 720x1280 px the whole time
+  (content resolution preserved while the window resizes).
+- Input: `pengudroid tap 360 640` and `key 4` against the daemon answered
+  `tapped`/`injected` (InputEvent relay path works).
+
+All current goals are met: Genshin + BBR2 launch without `--sysroot`, dynamic
+resize keeps internal resolution and switches to tablet mode, input injection
+works. Remaining known limits are in LIMITATIONS.md (billing soft-fail retry
+loop in Genshin's mihoyoos pay module, no real Play Store, boot-image/uffd
+design note).
+
+## Previous — new BBR2 XAPK boots past login; Play Billing probe shimmed (2026-11-13)
+
+Pick up here. The **new BBR2 XAPK** (`~/Downloads/Beach+Buggy+Racing+2_2026.10.26_APKPure.xapk`,
+versionCode 502, `xapk_version:2`) is supported: `bundle.rs` reads `manifest.json`,
+picks the split whose `id == "base"`, and extracts `Beach Buggy Racing 2.apk` —
+no `--sysroot` needed, same bridge env as before.
+
+The last blocker was the `BillingClient` infinite retry:
+`IPackageManager.queryIntentServices` (code 34, read from
+`IPackageManager$Stub.TRANSACTION_queryIntentServices` — **not hardcoded**) on the
+`package` handle returned an empty list, so `BillingClient` reported "Billing
+service unavailable" forever. Fixed end to end:
+
+- apphost `install_vending_query_reply` builds a real
+  `android/content/pm/ParceledListSlice` with one `ResolveInfo`
+  (`ServiceInfo` packageName `com.android.vending`, name
+  `com.android.vending.billing.IInAppBillingService`, plus a non-null
+  `applicationInfo` — `ComponentInfo.writeToParcel` NPEs without it), marshals it
+  via `Parcel.obtain`/`writeToParcel`/`marshall`, and hands the bytes to the shim
+  through `__pengudroid_binder_set_vending_query_reply`. Note the class is
+  `android/content/pm/ParceledListSlice` (there is no `android/os/` one).
+- shim `make_reply` answers `package`-handle code 34 with
+  `[status][presence=1][slice body]` **only when the request parcel contains
+  "com.android.vending"** — matched as a raw substring in both UTF-16LE and 8-bit
+  (String8) encodings, because API-37 callers marshal the Intent action as String8.
+  All other queryIntentServices calls keep the status-only fallthrough.
+- with the probe answered, the framework proceeds to `ActivityManager.bindService`
+  (`note_service_request` → apphost vending dispatch) and the hosted
+  `IInAppBillingService` answers codes 1..15 (`isBillingSupported` echoes the
+  requested apiVersion; buy-intent codes return RESPONSE_CODE 6).
+
+Validation: shim **161 passed** (new
+`package_service_answers_vending_query_with_installed_slice` covers UTF-16 and
+String8 matching, fallthrough, and setter validation), workspace tests green.
+Traced smoke `/tmp/bbr2-xapk-trace7.log` (420 s): 11 vending replies, bindService
+dispatch fired, `Billing service connected`, apiVersion negotiated 27→3.
+Full smoke #14 `/tmp/bbr2-smoke14.log` (900 s, daemon): **0 UNKNOWN_TRANSACTION**,
+`POST /v8/login` → 200, then analytics/News/tournaments/leaderboards/save-game,
+SDL 720x1280, `Finished main function`. The remaining "Billing service
+unavailable" lines are the normal async bind race (each is followed by
+"Billing service connected" ~10 ms later), not the stall.
+
+Next: drive smoke #14's daemon with `pengudroid tap`/`key` to reach gameplay;
+then the Genshin launch path on the same bridge (image mode still blocked on the
+translator signal-resume issue — documented only). Resize/tablet-mode (protocol
+v5) already verified dynamic.
+
+## Where we left off — bridged BBR2 reaches SDL_main + FMOD; audio player transactions shimmed (2026-11-13)
+
+Pick up here. The **ARM64 native bridge is the real launch path for arm64-only
+games**: without `PENGUDROID_NATIVE_BRIDGE_LIB`/`PENGUDROID_ARM64_GUEST_ROOT`
+the sysroot picks `native_abi=x86_64`, extracts zero libs, and arm64-only
+APKMs die on `libSDL3.so`/`libfmod.so` "cannot open shared object file". With
+the verified bridge env (see `docs/NATIVE_BRIDGE.md` §~360):
+`PENGUDROID_NATIVE_BRIDGE_LIB=.toolchain/nativebridge-stage
+PENGUDROID_ARM64_GUEST_ROOT=.toolchain/guest-arm64-bridge
+PENGUDROID_BRIDGE_TLS=1 BERBERIS_FLAGS=glibc-host-thread-id-handoff`,
+the 600 s bridged BBR2 smoke (`/tmp/bbr2-bridge5.log`) runs the whole path:
+guest linker handshake → Berberis aarch64 → arm64 `libmain.so` loaded from
+`/tmp/pengudroid-libs/.../lib/arm64-v8a/` → `SDL_main` → `surfaceCreated()` →
+FMOD `AudioDevice::init`, **0 fatal signals**. Its only new actionable gap was
+`UNKNOWN_TRANSACTION target=10 (audio) code=2/4` — `IAudioService.trackPlayer`
+(must return a nonzero int player id; `PlayerBase` rejects 0) and
+`playerEvent` (void) — now shimmed in commit `7c7c7cb`:
+
+| Gap | Codes | Shim reply |
+|---|---|---|
+| `IAudioService` trackPlayer/playerAttributes/playerEvent/releasePlayer/trackRecorder/recorderEvent/releaseRecorder | 7 codes read from `IAudioService$Stub` `TRANSACTION_*` fields | trackPlayer (idx 0) / trackRecorder (idx 4) reply status + incrementing int32 id (from 1); the other five reply status-only (void) |
+
+Also in `7c7c7cb`: `Settings.Global limit_ad_tracking=0` added to
+`SETTINGS_VALUES` (AppLovin `collectFireOSAdvertisingInfo` no longer throws
+`SettingNotFoundException`). Validation: shim lib **158 passed**, cli green
+(94+7+2+3+2), pushed to `denizomer10-genshin-arm64-launch` at `7c7c7cb`.
+
+**Bridged smoke #6 (`/tmp/bbr2-bridge6.log`, 600 s) is fully clean: 0 fatal
+signals, 0 `UNKNOWN_TRANSACTION`.** The game booted end-to-end on the bridge:
+SDL_main ran the whole window, `surfaceCreated()` + BLAST surface handed out
+at 720x1280, FMOD `AudioDevice::init` OK and `AudioTrack sink restarted (1/5)`
+(the new player-id replies are accepted), TLS to the real game backend
+`free2play.cobalt.vectorunit.com:443` succeeded, Tenjin analytics sent with
+`limit_ad_tracking=false`. The only remaining NPE was
+`Bundle.getBoolean on null` in `BillingClient$Builder.build` —
+`ApplicationInfo.metaData` was null; fixed by installing an empty
+`android.os.Bundle` as `metaData` in `build_app_info` (uncommitted at handoff
+time). Remaining noise is benign (billing "Service not registered",
+PlayGames/GMS absence, `classes.dex` entry misses).
+
+Smoke #7 (`/tmp/bbr2-bridge7.log`, 900 s): **0 fatal, 0 `UNKNOWN_TRANSACTION`,
+0 NPE** — the `metaData` fix removed the last `Bundle.getBoolean` NPE, audio
+reaches `AudioTrack sink restarted`, backend TLS stays up. Its only remaining
+error was `AudioSystem: getAttributesForStreamType Failed` (audio policy code
+87 fell through to null), fixed in `842d52d`: `getAttributesForStreamType`
+is now the third installed audio-policy code and answers
+`[present=1][host-marshalled AudioAttributes]` (USAGE_MEDIA/CONTENT_TYPE_MUSIC/
+STREAM_MUSIC). Validation: shim **159 passed**, cli green (94+7+2+3+2), pushed
+at `842d52d`. Resize re-verified again this segment: `2560x1373`→tablet
+(1280x686 dp), `2176x1167`/`668x1189`/`720x1280`→phone, density kept.
+
+Smokes #8–#10 (`/tmp/bbr2-bridge8/9/10.log`): still exactly one
+`getAttributesForStreamType Failed`. Smoke #10 with `PENGUDROID_TRACE_BINDER=1`
+proved code 87 **is** dispatched and answered with
+`[status=0][present=1][24-byte writeToParcel]` and rc=0 — dex disassembly of
+`IAudioPolicyService$Stub$Proxy.getAttributesForStreamType` (classes2.dex,
+method 51484) shows the Proxy does `readException(); readTypedObject(CREATOR)`,
+and `android/media/audio/common/AudioAttributes.readFromParcel` reads
+`[size][4 ints][stringArray]`, which is exactly what the host-marshalled
+payload is (size=24 self-inclusive). So the 87 reply parses; the residual
+error comes from the follow-up code 88 (`TRANSACTION_getStreamTypeForAttributes`),
+which fell through and answered stream type 0. Fixed in the next commit:
+`getStreamTypeForAttributes` is now the fourth installed audio-policy code and
+answers `[status=0][3]` (STREAM_MUSIC). Smoke #10 otherwise ran 240 s with
+**0 fatal, 0 UNKNOWN_TRANSACTION**, frames presenting (vsync frame 434220) and
+`POST /v8/login.php` → `HTTP/1.1 200 OK` against the real backend.
+Validation: shim **159 passed**, cli green (94+7+2+3+2), `cargo build
+--offline` clean.
+
+### Next concrete task
+
+Watch bridged smoke #11 (`/tmp/bbr2-bridge11.log`, 900 s) and confirm the
+`getAttributesForStreamType Failed` / `getAudioAttributesForLegacyStream` errors
+are gone and nothing new appears; check how far BBR2 gets toward gameplay
+(menu/race, frame presents, further backend calls). Iterate any new gap
+the same way: root-cause from the log + API-37 dex, shim in `pengudroid-shim`,
+install codes from the real `TRANSACTION_*` fields in `apphost`, tests,
+bridged smoke. Genshin launch path uses the same bridge env (the Genshin APKM
+itself is never executed; image mode stays blocked on the translator
+signal-resume issue — document, don't chase). Non-bridged BBR2 smokes stay
+fully clean (`/tmp/bbr2-smoke3/4.log`).
+
+## Where we left off — the last null-reply NPE classes are shimmed (2026-11-13)
+
+Pick up here. A 280 s BBR2 smoke (`/tmp/bbr2-smoke3.log`) showed three remaining
+NPE classes, all caused by status-only fallthrough replies decoding as null:
+all are now shimmed in `pengudroid-shim` and installed from the real framework
+`TRANSACTION_*` fields at apphost startup:
+
+| Gap | Codes | Shim reply |
+|---|---|---|
+| `shortcut` `getShortcuts`/`getShareTargets` (NPE in `ShortcutManager.getDynamicShortcuts` on `ParceledListSlice.getList()`) | 23 / 20 (read from `IShortcutService$Stub`) | status + `[presence=1][count=0]` — empty `ParceledListSlice` |
+| `jobscheduler` `getAllPendingJobsInNamespace`/`getAllJobSnapshots` (NPE in `JobSchedulerImpl.getAllPendingJobs`) | 8 / 17 (read from `IJobScheduler$Stub`) | same empty-slice shape |
+| `graphicsstats` `requestBufferForProcess` (NPE in `HardwareRenderer` on `ParcelFileDescriptor.getFd()`) | 1 (read from `IGraphicsStats$Stub`) | status + `[presence=1][hasComm=0][flat BINDER_TYPE_FD]` wrapping a fresh zeroed ashmem memfd of `0x248` bytes — `nGetAshmemSize()` in the shipped `libhwui.so` returns exactly `0x248`, and the client rejects smaller regions ("Ashmem region is too small") |
+
+Wire formats were verified against the API 37 dex/libhwui: Proxy calls
+`readException()` + `readTypedObject(PFD.CREATOR)`; `ParcelFileDescriptor.writeToParcel`
+writes `[hasComm][writeFileDescriptor]`; `ParceledListSlice.writeToParcel` is
+`writeTypedList` = `[count]`.
+
+Validation on this checkout: `cargo test --offline -p pengudroid-shim` **157
+passed**, `cargo test --offline -p pengudroid-cli` green (94+7+2+3+2), and the
+280 s BBR2 smoke with **zero `Fatal signal`/`SIGBUS`/`SIGSEGV`, zero
+`UNKNOWN_TRANSACTION`, zero `ParceledListSlice.getList()` NPEs and zero
+"Could not acquire gfx stats buffer" NPEs**; apphost logs
+`empty-list shortcut=[23,20]`, `empty-list jobscheduler=[8,17]`,
+`fd-reply graphicsstats=[1]`. A longer 600 s run (`/tmp/bbr2-smoke4.log`) is
+likewise fully clean (0 fatal / 0 `UNKNOWN_TRANSACTION` / 0 NPEs); the app
+spends the whole window in `-Xint` loading (Tenjin ads, `ProfileInstaller`),
+which is the performance blocker, not a crash. Resize re-verified after this
+segment: `pengudroid geometry --resize` classifies `2560x1373` as tablet
+(1280x686 dp), `2176x1167`/`668x1189` as phone, guest buffer stays `720x1280`.
+Remaining noise is benign (aconfig mmap WARNs, `classes.dex` entry misses,
+GMS/Tenjin ads SDK complaints, 2x `libbinder.Parcel: Expecting binder but got
+null!` after app-thread capture on handle 17, "Failed to load FMOD libs").
+
+### Next concrete task
+
+Hunt the next gap from fresh BBR2 smoke logs (candidates: the two
+"Expecting binder but got null!" warnings around handle 17 — likely a service
+whose reply must carry a binder object; `Settings$SettingNotFoundException:
+limit_ad_tracking`; FMOD native lib loading). Then re-run the smoke set
+(BBR2 launch, resize via `SetWindowState`, tablet classification). The big
+blocker is unchanged and lives outside this repo: image mode needs the ARM64
+translator to resume after a delivered guest signal (see the uffd section
+below). `Constructor.getReturnType()` stays a logged upstream guest bug — do
+not shim it.
+
+## Where we left off — the last three unimplemented binder transactions are now shimmed (2026-11-13)
+
+Pick up here. The three remaining `UNKNOWN_TRANSACTION` sources seen in BBR2
+logs are implemented in `pengudroid-shim` and installed from the real framework
+`TRANSACTION_*` fields at apphost startup:
+
+| Gap | Code | Shim reply |
+|---|---|---|
+| `IAudioService.setAllowedCapturePolicy` / `getAllowedCapturePolicy` | 171 / 172 (read from `IAudioService$Stub`, non-contiguous in API 37) | state held in `audiofocus::CapturePolicy` (default `ALLOW_CAPTURE_BY_ALL`=1); set validates 1..=3 → `SUCCESS`=0, else `ERROR_BAD_VALUE`=-2 and keeps the old value; get returns the current policy. The policy int is read after the `android.media.IAudioService` interface token (`after_interface_token`) |
+| `IInputManager.getVelocityTrackerStrategy` | 1 | parcelled String16 `"default"` — `VelocityTracker.toStrategyId` maps any unrecognized name to DEFAULT, so this is always accepted (input table widened to 9 ops, op 8) |
+| `IDisplayEventConnection.getLatestVsyncEventData` | 4 (native-only AIDL, no Java Stub; declaration order) | `VsyncEventData` wire layout measured in the shipped x86-64 `libgui.so` (`ParcelableVsyncEventData::readFromParcel`): status + presence 1 + preferred index 0 + count 1 + one `{vsyncId=1, deadline, expected}` timeline on `CLOCK_MONOTONIC` at the next 60 Hz pulse. Does **not** push a vsync event into the stolen channel |
+
+Validation on this checkout: `cargo test --offline -p pengudroid-shim` **155
+passed** (+ new contract tests for all three replies), `cargo test --offline
+-p pengudroid-cli` green (94+7+2+3+2), and a 170 s BBR2 smoke run
+(`pengudroid launch <cobalt apkm> --backend auto`) with **zero
+`Fatal signal`/`SIGBUS`/`SIGSEGV` and zero `UNKNOWN_TRANSACTION`**; the apphost
+log shows the real installed codes `audio=[82,83,84,85,171,172]`,
+`input=[2,3,0,4,5,6,7,39,1]`.
+
+### Next concrete task
+
+Re-run the Genshin-adjacent smoke set (BBR2 launch, resize via
+`SetWindowState`, tablet classification) and keep closing whatever the next
+`UNKNOWN_TRANSACTION` turns out to be. The big blocker is unchanged and lives
+outside this repo: image mode needs the ARM64 translator to resume after a
+delivered guest signal (see the uffd section below). `Constructor.getReturnType()`
+stays a logged upstream guest bug — do not shim it.
+
+## Where we left off — boot image loads, but uffd GC cannot run under the bridge (2026-11-13)
+
+Pick up here. The x86_64 boot image from the Android 17 GSI **validates and
+loads**, which retires the "impossible to load" verdict in
+[ANDROID17.md](ANDROID17.md). Getting there needed three fixes, all shipped:
+
+| Fix | Evidence |
+|---|---|
+| `gUseReadBarrier = !gUseUserfaultfd` is derived, not a flag | `objdump` of the sole store (`0x5873be`); `KernelSupportsUffd()` probes `syscall(323)` with `UFFD_USER_MODE_ONLY`, which is allowed with `vm.unprivileged_userfaultfd=0` |
+| Toggling `ro.dalvik.vm.enable_uffd_gc` clears the read-barrier rejection | `PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true`: the `ValidateOatFile found read barrier state mismatch` error disappears |
+| The boot classpath must match the image's OAT header exactly | Parsed the ELF-wrapped OAT headers: 14 entries, `core-icu4j.jar` **last**. `Layout::detect` and its unit test now encode that order |
+| With all three, the image is adopted | `-verbose:image` decompresses all 14 components, and `ICU4J` registers (`libicu_jni.so`, `I18n APEX ICU file found`) |
+
+### Why image mode still cannot ship
+
+The image forces `gUseReadBarrier=false`, which forces userfaultfd GC, and this
+`libart.so` is a **uffd-CMC-only build**: `-Xgc:MS` and `-Xgc:SS` abort with
+`Check failed: foreground_collector_type_ == kCollectorTypeCMC`, and clearing
+`UFFD_FEATURE_SIGBUS` from the `UFFDIO_API` reply only brings the read-barrier
+rejection back (`oat file: false, runtime: true`). There is no image mode without
+uffd.
+
+The first *compacting* collection then dies:
+
+```
+post_compact_end:0x2092000     <- compacted space ends here
+Fatal signal 7 (SIGBUS), code 2 (BUS_ADRERR) fault addr 0x2092378
+FATAL art: runtime_common.cc:466] HandleUnexpectedSignal reenter
+```
+
+Traced with `strace -f -e trace=madvise,mremap,userfaultfd,ioctl`:
+
+* the GC thread calls `UFFDIO_API` (features `UFFD_FEATURE_SIGBUS`) on a fresh
+  uffd, then `UFFDIO_REGISTER [0x2000000, 0x209a000)` — note the end is
+  `post_compact_end` rounded *past*, into reserved-but-unused space;
+* a *mutator* thread faults at an address inside that registered range but
+  **outside the copying plan** (it is filler/free space above the compacted
+  end), *before* the GC thread issues the `UFFDIO_COPY` calls;
+* `BUS_ADRERR` is exactly what `UFFD_FEATURE_SIGBUS` produces by design — the
+  kernel sends `SIGBUS` so ART's handler can populate the page. ART's handler
+  cannot map that address to a plan entry, so it declares the fault fatal, and a
+  second fault during the fatal report produces `reenter`.
+
+Two things were ruled out along the way:
+
+| Ruled out | How |
+|---|---|
+| A kernel/`mremap(DONTUNMAP)` bug | A standalone C repro replays ART's exact sequence (mmap 512 MB → `MREMAP_DONTUNMAP|FIXED` → register MISSING → `madvise(DONTNEED)` → `UFFDIO_COPY` back → unregister → write past the copy-back end): every write succeeds |
+| The shim stealing ART's `SIGBUS` | Our last-resort handler is now **chained** rather than replacing (`chain_to_saved_handler`), and with `PENGUDROID_CRASH_BT=1 PENGUDROID_DEBUG_FAULTS=1` it verifies `installed=true` on all five signals — the fault then goes through ART's own saved handler and is still fatal |
+
+**Root cause.** With `UFFD_FEATURE_SIGBUS`, resolving a missing page requires the
+kernel to deliver `SIGBUS` *into guest code* and then re-execute the faulting
+instruction. Here that guest code is ARM64 running under the prebuilt
+translation bridge (`libberis_arm64.so`, no source in this repository), which
+cannot resume translated execution after a delivered signal. So the uffd
+resolution path cannot work, no matter how the shim behaves.
+
+**Workaround that proves the diagnosis.** Sizing the heap so no compaction
+happens during startup avoids the uffd dance entirely, and the image boot then
+runs far past the old crash point — `ACRA` initialising for
+`org.schabi.newpipe`, `WorkManager`/`SystemJobService` created, `DisplayManager`
+returning the 720x1280 PenguDroid display, binder lookups for netstats/user/
+appops/SurfaceFlingerAIDL/jobscheduler/connectivity/mount:
+
+```sh
+env 'PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true' \
+PENGUDROID_LAUNCH_ACTIVITY=org.schabi.newpipe.MainActivity \
+./target/debug/pengudroid art-test --sysroot .toolchain/sysroot-android17 \
+  --classpath ~/Downloads/NewPipe_v0.29.1.apk \
+  --register-natives libandroid_runtime.so,libhwui.so \
+  --bind-app --main android.app.ActivityThread \
+  --vm-option -Xms512m --vm-option -Xmx1g --vm-option -verbose:image
+```
+
+The first collection that compacts still kills it, so this is a *diagnostic*,
+not a shipping configuration: `launcher.rs` keeps the imageless `-Xint` path as
+the default.
+
+### Kernel 6.8+ `UFFDIO_MOVE` masking (kept, with an opt-out)
+
+Host kernel 7.0.0 advertises the new `UFFD_FEATURE_MOVE`, which makes ART take
+its newest `UFFDIO_MOVE`-based compaction path. The shim's `ioctl` interposer
+clears `UFFD_FEATURE_MOVE` and the `_UFFDIO_MOVE` capability bit from the
+`UFFDIO_API` reply, so ART uses the older `UFFDIO_COPY` path that this note
+describes. `strace` confirms zero `UFFDIO_MOVE` calls. It does not by itself
+avoid the fault above; opt out with `PENGUDROID_UFFD_ALLOW_MOVE=1` (see
+[API.md](API.md)).
+
+Unchanged and re-verified: `cargo test --offline -p pengudroid-cli` green
+(94+7+2+3+2), and BBR2 still launches via `pengudroid launch <apkm> --backend
+auto` (100 s smoke run, guest profile installer active, no fatal signal).
+
+### Next concrete task
+
+Make the translator resume after a delivered guest signal, or find an image
+whose read-barrier state matches a non-uffd collector. Nothing in the shim can
+substitute for either: the classpath order fix is correct and stays, but image
+mode is gated on signal-resume support in `libberis_arm64.so`.
+
+Reproduce the fatal in ~40 s with NewPipe (dotted property names need `env`):
+
+```sh
+PENGUDROID_LAUNCH_ACTIVITY=org.schabi.newpipe.MainActivity \
+env 'PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true' \
+./target/debug/pengudroid art-test --sysroot .toolchain/sysroot-android17 \
+  --classpath ~/Downloads/NewPipe_v0.29.1.apk \
+  --register-natives libandroid_runtime.so,libhwui.so \
+  --bind-app --main android.app.ActivityThread --vm-option -verbose:image
+```
+
+Drop the `env '...'` and the image is rejected at the read-barrier check (today's
+default); keep it and the image loads, then the SIGBUS arrives. Adding
+`-Xms512m -Xmx1g` moves the crash past app startup instead.
+
+## Where we left off — ARM64 BBR2 runs without `--sysroot` (2026-11-12)
+
+Pick up here. The headline change since 2026-11-11 is that an **ARM64-only game
+launches from a plain `pengudroid launch`** with no `--sysroot` argument and no
+manual runtime step, reaches its own `main`, renders, and presents frames.
+
+Verified this session:
+
+| Claim | Evidence |
+|---|---|
+| BBR2 (arm64-v8a only) launches with no `--sysroot` | `pengudroid launch <apkm> --backend auto`, 300 s run: `app_exit: null`, daemon alive, clean teardown |
+| The guest main loop really runs | SIGQUIT dump: `SDLThread` in `state=R`, 23.7 s user CPU, 6816 switches |
+| Frames reach the host compositor | `PENGUDROID_TRACE_GLESHIM=1`: `eglCreateWindowSurface -> 720x1280`, `presented surface 1 720x1280` |
+| It is fast once warm, too | swap counter 240 at t=100 s → 2,640 at t=140 s (60 fps), 5,280 presents per 170 s |
+| The game's own backend is reachable | HTTP 200 from `free2play.cobalt.vectorunit.com` inside the guest |
+| Audio, billing, SQLite, GMS paths run | FMOD `stream`/`mixer`/`Studio` threads, `BillingClient` and `SQLiteCursor` activity |
+| Resize policy is inspectable | `pengudroid geometry [--width W] [--height H] [--density DPI] [--resize WxH]` |
+| The host can ask a live surface its size | `SurfaceGeometry` (protocol v4); roundtrip tested, and a live BBR2 run read `668x1189` back and relaid out the guest |
+| A resize is applied to the guest | `PENGUDROID_FOLLOW_RESIZE=1`: `window is now 668x1189 … 1 root(s) poked`, then `2560x1373 … tablet` after a maximize, 246 presents afterwards |
+| A window can be resized without a seat | `pengudroid window [<id>] [--maximize|--unmaximize|--fullscreen]` (`SetWindowState`, protocol v5): a real Mutter `configure` takes a 334x594 dp phone window to 1280x686 dp **tablet** and back, guest buffer unchanged |
+| Tests | `cargo test --workspace --offline` green; `python3 -m unittest discover -s tools -p 'test_*.py'` 256 passing |
+| New regressions | `geometry` resize/dp policy (`crates/pengudroid-cli/src/geometry.rs`), guest-bundle assembler (`tools/test_assemble_arm64_bridge_guest.py`), `SurfaceGeometry` unknown-surface error |
+
+### A window can be resized without a seat (2026-11-12, later still)
+
+The resize path had one untested link: a compositor `configure`. The daemon is a
+Wayland client, so only the compositor can send one — and the smoke harness has
+no pointer to drag a window with. `Message::SetWindowState` closes that gap for
+testing *and* for users: the daemon calls the same `xdg_toplevel` requests a
+title-bar button issues, Mutter answers with a real `configure`, and the
+ordinary path runs from there.
+
+```
+$ pengudroid window                       # list live windows
+surface 1: 720x1280 px internal, 668x1189 px window (334x594 dp)
+$ pengudroid window 1 --maximize
+surface 1: 720x1280 px internal, 2560x1373 px window (1280x686 dp, tablet)
+$ pengudroid window 1 --unmaximize
+surface 1: 720x1280 px internal, 668x1189 px window (334x594 dp)
+```
+
+| Piece | Where |
+|---|---|
+| `SetWindowState { surface_id, state }`, `WINDOW_MAXIMIZED`/`WINDOW_FULLSCREEN`, `PROTO_VERSION` 5 | `crates/pengudroid-proto/src/lib.rs` |
+| `set_window_state` (toplevel request + flush) | `crates/pengudroid-daemon/src/graphics.rs` |
+| Message handler, unknown-bit rejection | `crates/pengudroid-daemon/src/server.rs` |
+| `pengudroid window [<id>] [--maximize|--unmaximize|--fullscreen|--windowed]` | `crates/pengudroid-cli/src/main.rs` |
+
+Notes worth keeping:
+
+* **The version had to move.** Adding a message kind changes nothing about the
+  wire format of existing ones, but peers are checked for an exact match, so
+  `PROTO_VERSION` went to 5. A stale `libpengudroid_shim.so` then shows up as
+  `client protocol v4 != daemon v5; rebuild/restart matching peers` — rebuild the
+  whole workspace, not just the CLI.
+* **The state applies to one window.** After a relayout BBR2 replaces its window,
+  so un-maximizing the previous id changes nothing on screen. `pengudroid window`
+  with no id lists what is live; `window <newest> --unmaximize` moves it.
+* **Fullscreen is the honest "fill the output".** Maximize is bounded by the
+  compositor's work area (`2560x1373`), fullscreen is not (`2560x1440`); both keep
+  the guest buffer and switch to tablet layouts.
+
+### The audio-port poll loop is answered (2026-11-12, later)
+
+`AudioManager.updateAudioPortCache` polls the audio **policy** service — not the
+flinger — about seven times a second for the life of the process. Nothing was
+modelled there, so each poll fell through to an empty success reply, the
+framework read a count out of nothing, and every poll logged
+`AudioSystem: Function: listAudioPorts Line: 1914 Failed`: measured at 1,123
+occurrences per 150 s BBR2 run, the largest single source of log noise. Once
+ports were answered the same loop moved on to `listAudioPatches` (Line 1985).
+
+| Claim | Evidence |
+|---|---|
+| `media.audio_policy` code 51 is `listAudioPorts` | `PENGUDROID_TRACE_BINDER=1`: 1,123 dispatches of code 51 on that handle in 150 s |
+| The codes come from the shipped framework, never hardcoded | `IAudioPolicyService$Stub` fields read at bind time: `[51, 56]` reported in the run |
+| Both polls are answered | 90 s run: `listAudioPorts: 0`, `listAudioPatches: 0`, no `shim symbol` failure (was 1,123 + a trailing loop of patches) |
+| Nothing else about audio changed | Same run still reaches the same stage as the pre-fix run (4 surfaces handed out, `ActivityThread` attached, main Looper entered, `surfaceCreated`), and only one unrelated `Function: getAttributesForStreamType` remains |
+| Regression test | `cargo test -p pengudroid-shim --offline audio_policy` |
+
+Implementation: `__pengudroid_binder_set_audio_policy_transactions` installs up
+to four distinct codes; the dispatch answers only those, with
+`status=0, count=0, generation=0`. An empty list is the truthful answer (audio
+reaches the host through the forwarder without a framework port), and a zero
+count means the framework never reads an entry, so the reply parses the same way
+whichever order the revision declares the out parameters in. Every other
+audio-policy method keeps the old fallthrough — inventing a reply for
+`getOutputForAttr` would hand the framework a handle to a device we do not have.
+If a future framework renames the fields, the install fails, the launch prints
+`audio policy transaction codes unavailable`, and behaviour degrades to what it
+was before this table existed.
+
+### How the two launch blockers were fixed
+
+1. **`JNI DETECTED ERROR: fid == null`** aborted ART before the game's code ran.
+   Fixed by reporting the manifest's real field layout rather than a synthetic
+   one, with a `GetFieldID`/`GetLongField` tracer left behind under `TRACE`.
+2. **An EGL loader failure** followed it. Guest `libandroid.so` and the guest
+   GL/EGL family are now **NativeBridgeSupport stubs** that resolve through the
+   guest vDSO hook into `libberberis_proxy_<name>.so`, and from there into the
+   staged host forwarder (gleshim first, then versioned Mesa). The guest runtime
+   that carries those stubs is assembled by
+   `tools/assemble-arm64-bridge-guest.py --guest-stubs`. See
+   [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md).
+
+### What is still wrong, in priority order
+
+1. **Time to first frame, not frame rate.** Once warm, BBR2 holds a
+   vsync-locked 60 fps: the swap counter went 240 → 2,640 between t=100 s and
+   t=140 s of a traced run, and 170 s produced 5,280 presents. The whole cost is
+   front-loaded — roughly 100 s of loading and shader work first — because the
+   guest VM runs `-Xint` and every guest instruction is translated. Cheaper
+   warm-up is a performance problem, not a compatibility one.
+2. **Resize is verified end to end; only a pointer drag is untested.** The
+   compositor preserves the guest's internal resolution and scales the frame
+   (correct, verified). `PENGUDROID_FOLLOW_RESIZE=1` closes the loop: it polls
+   `SurfaceGeometry` (protocol v4), republishes the geometry with
+   `Geometry::for_resize` and pokes each root so `hwui` measures again at the new
+   dp size. `SetWindowState` (protocol v5) can now drive the configure without a
+   seat, and live runs walked the whole path: `668x1189` (334x594 dp, phone) →
+   `--maximize` → a real Mutter `configure` → `2560x1373` (1280x686 dp,
+   **tablet**) → `2176x1167` (1088x583 dp, phone again), with the guest buffer
+   never reallocated (`720x1280` throughout). What is still untested is a human
+   pointer drag; Mutter sent these configures. See [LIMITATIONS.md](LIMITATIONS.md) §4.1–4.2; `pengudroid
+   geometry --resize WxH` prints the classification a session would report.
+3. **Service gaps that show up as log noise.** `listAudioPorts`/`listAudioPatches`,
+   audio code 171/172 (`set/getAllowedCapturePolicy`), input code 1
+   (`getVelocityTrackerStrategy`), `IDisplayEventConnection` code 4
+   (`getLatestVsyncEventData`), the `shortcut`/`jobscheduler` empty
+   `ParceledListSlice` replies, and `graphicsstats.requestBufferForProcess`'s
+   ashmem PFD are all answered now (see the top section);
+   `berberis: trans#`/`dispatch#` DEBUG lines still dominate the log.
+4. **A guest JNI bug that is not ours.** BBR2 issues a `GetMethodID` for
+   `Constructor.getReturnType()`, which does not exist (verified by parsing
+   `core-oj.jar`). It is logged and does not kill the main loop.
+
+### Next concrete task
+
+The warm-up: ~100 s of loading and shader compilation under `-Xint` is the
+remaining cost, and it is a performance problem — [LIMITATIONS.md](LIMITATIONS.md)
+§2. Root cause work has since moved to the top of this file: the image itself
+now loads, and ART's uffd GC is what still blocks using it. The resize path needs
+no more work to be correct; a human pointer drag on a second compositor would
+only widen coverage.
+
+## Desktop manager verified (2026-11-11)
 
 ### Genshin follow-up — HoYoverse login reached (2026-11-11)
 
@@ -636,10 +1187,14 @@ and `code=1598968902` refusals **1 → 0**.
 Validation on this checkout: `cargo test --workspace --offline` **373 passed, 0
 failed**; `tools` unittest **214 passed**; `git diff --check` clean.
 
-Still open and unchanged: the `HardwareRenderer` graphics-stats buffer
-(`requestBuffer` returns no `ParcelFileDescriptor`: the unhosted `graphicsstats`
-service falls through to an empty success reply), the `ParceledListSlice` NPE on
-shortcuts, `IAudioService` code 171, and the `listAudioPorts` loop.
+Still open and unchanged: the two `libbinder.Parcel: Expecting binder but got
+null!` warnings (a service reply that must carry a binder object), the
+`Settings$SettingNotFoundException: limit_ad_tracking`, and BBR2's FMOD native
+lib load. Closed since this note: the `HardwareRenderer` graphics-stats buffer
+(`graphicsstats.requestBufferForProcess` now returns a real `0x248`-byte ashmem
+PFD), the `ParceledListSlice` NPEs on `shortcut`/`jobscheduler` (empty-slice
+replies), `IAudioService` code 171/172, and the `listAudioPorts` loop — see the
+top section.
 
 ## Previous handoff — activity roundtrip and video crop verified; ARM64 guest runtime still blocked (2026-10-31)
 

@@ -74,7 +74,8 @@ The path there was ABI translation, not environment emulation:
   `/odm`, `/data`, ...) into `$PENGUDROID_ROOT` at the libc boundary —
   `open`/`openat`, `fopen`, `stat`, `access`, `readlink`, `opendir`, `realpath`.
   Host paths (`/proc`, `/dev`, `/etc`) are untouched.
-* **The boot class path is not just the boot image.** The image covers 12 jars,
+* **The boot class path is not just the boot image.** The image covers 14
+  components (`boot.art` records `component_count=14`),
   but Android 13 moved connectivity, bluetooth, conscrypt, permission,
   tethering, wifi, mediaprovider and friends into mainline APEX modules, each
   publishing `etc/classpaths/bootclasspath.pb`. On a device init concatenates
@@ -261,6 +262,26 @@ support), and BBR2 — ARM64-only — runs end to end. The standing rule is
 unchanged: never substitute an x86_64 copy, patch the game binaries, or
 silently fall back to a container.
 
+**Measured throughput (2026-11-12).** A 170 s run with
+`PENGUDROID_TRACE_GLESHIM=1` presented 5,280 frames and ended with
+`app_exit: null`. The gleshim swap counter read 240 at t=100 s and 2,640 at
+t=140 s: the game spends roughly its first 100 s loading and compiling shaders,
+then holds a vsync-locked **60 fps**. Frame production is therefore not the
+blocker it was long assumed to be — the earlier "well under 1 fps" reading came
+from a 60 s sample that landed entirely inside the warm-up. What remains slow is
+the path *to* the first frame, which is CPU-bound interpretation (`-Xint`).
+`-Xint` is kept because ART's image cannot be used yet, not because the JIT is
+broken: the boot image now validates and loads once
+`ro.dalvik.vm.enable_uffd_gc` is set and the boot classpath matches the image's
+OAT header, but ART's userfaultfd GC then faults on its first *compacting*
+collection. That GC relies on `UFFD_FEATURE_SIGBUS`, i.e. on the kernel
+delivering `SIGBUS` into guest code and the faulting instruction being
+re-executed once ART has copied the page in; ARM64 guest code running under the
+prebuilt translation bridge cannot resume that way, so the resolution path is
+unavailable here. Sizing the heap past the first compaction (`-Xms512m`) lets
+the image boot all the way into app startup, which confirms the diagnosis. See
+[STATUS.md](STATUS.md) for the full chain and repro.
+
 **Consequences for real games.**
 
 * **Native x86_64 `NativeActivity` games run today, on the GPU** —
@@ -353,18 +374,177 @@ exported core functions. The compat directory maps `libGLESv2.so` to the *host*
 driver and the shim loads it `RTLD_GLOBAL`, so an app's direct GL imports resolve
 in practice.
 
+### 4.1 Window resize keeps the internal resolution
+
+A resized window does **not** make the guest render at a new pixel size, and it
+does not re-configure the guest's `Configuration`. The daemon's viewporter path
+is deliberate about this (`configure_window` in
+`crates/pengudroid-daemon/src/graphics.rs`): `surface.width/height` — the guest's
+own buffer — is left untouched, and only `display_width/display_height` and the
+viewport destination change, so the compositor scales the fixed-size guest frame
+into the new window. Input is mapped back into guest space by
+`guest_coordinates`, so a touch lands on the widget the user sees even though
+the guest never learned the window changed.
+
+Consequences, stated plainly:
+
+* **Aspect ratio is preserved and letterboxed.** Free-form drags do not stretch
+  the picture, and the app's internal resolution is stable — a game keeps its
+  render target, a video keeps its decoded size.
+* **Density is never re-derived mid-session.** It is chosen at launch
+  (`crates/pengudroid-cli/src/geometry.rs::for_window`). Re-deriving it on resize
+  would rescale every touch target under the user's finger, so
+  `Geometry::for_resize` keeps the launch density and only the dp size — and
+  therefore the phone/tablet classification — follows the new window.
+* **Tablet layouts are a launch-time choice unless the resize follower is on.**
+  `smallestScreenWidthDp >= 600` switches the framework to tablet layouts, and
+  the density that makes that true is picked from the window size at launch
+  (`--width`/`--height`, or the defaults 720x1280 at 320 dpi). A phone-launched
+  session that is later maximized crosses 600 dp only if the new window is at
+  least `Geometry::tablet_side_px()` wide (1200 px at 320 dpi).
+  `PENGUDROID_FOLLOW_RESIZE=1` makes that transition happen live — see §4.2.
+  Without it, `apphost` builds `Configuration`/`DisplayInfo` once and nothing
+  changes.
+* **An app that forces a fixed orientation may letterbox more.** BBR2 asks for
+  landscape (`requestedOrientation=11`) on a portrait 720x1280 surface, so its
+  content is presented inside that frame rather than filling a landscape window.
+
+`pengudroid geometry` prints the resolved policy without launching anything:
+
+```
+$ pengudroid geometry --resize 1920x1200
+720x1280 px at 320 dpi -> 360x640 dp, smallestScreenWidthDp 360, phone
+tablet layouts start at a 1200 px window side at this density
+resized to 1920x1200 px -> 960x600 dp, smallestScreenWidthDp 600, tablet (density kept at 320 dpi)
+  note: the guest keeps rendering at 720x1280 px; the compositor scales that frame into the new window, and the app is not told about the size change
+```
+
 **OpenSL ES is implemented for the common case.** `slCreateEngine`, the object
 model, engine/output-mix/player interfaces and the Android simple buffer queue
 are real: `Enqueue` forwards each buffer to a per-player `pw-cat`. The fixture
 uses the canonical headers so the vtable ABI is genuinely verified. Recorders,
 prefetch, effects and the other interfaces return `SL_RESULT_FEATURE_UNSUPPORTED`.
 
+### 4.2 Following a live resize (`PENGUDROID_FOLLOW_RESIZE`)
+
+Relayout-on-resize — replaying `IWindow.resized` into a live guest so `hwui`
+re-measures at the new dp size — is wired behind `PENGUDROID_PUMP_RESIZED` and
+`PENGUDROID_FOLLOW_RESIZE`. The second implies the first.
+
+Verified live on BBR2 (60 s and 100 s runs with `PENGUDROID_FOLLOW_RESIZE=1`):
+
+```
+apphost: window is now 496x883; guest relayout at 496x883 px (248x441 dp), 1 root(s) poked
+```
+
+— one poll, one publish, one root poked — and the game kept presenting
+afterwards: 246 presents on the live surface, `app_exit: null`. So the pull, the
+geometry publish and the poke all run against a real daemon and a real guest
+window.
+
+The transition itself is now verified too, because the window state can be
+driven without a seat: `Message::SetWindowState` (protocol v5) asks the daemon
+for `WINDOW_MAXIMIZED`/`WINDOW_FULLSCREEN`, the daemon calls the same
+`xdg_toplevel` requests a title-bar button issues, and Mutter answers with a real
+`configure` — the same event an interactive drag produces.
+
+```
+$ pengudroid window 1
+surface 1: 720x1280 px internal, 668x1189 px window (334x594 dp)
+$ pengudroid window 1 --maximize
+surface 1: 720x1280 px internal, 2560x1373 px window (1280x686 dp, tablet)
+$ pengudroid window 1 --fullscreen
+surface 1: 720x1280 px internal, 2560x1440 px window (1280x720 dp, tablet)
+$ pengudroid window 1 --unmaximize
+surface 1: 720x1280 px internal, 668x1189 px window (334x594 dp)
+```
+
+and the follower published each step in the guest, in both directions:
+
+```
+apphost: window is now 668x1189; guest relayout at 668x1189 px (334x594 dp), 1 root(s) poked
+apphost: window is now 2560x1373; guest relayout at 2560x1373 px (1280x686 dp, tablet), 1 root(s) poked
+apphost: window is now 2176x1167; guest relayout at 2176x1167 px (1088x583 dp), 1 root(s) poked
+```
+
+Four things those runs established:
+
+* **Internal resolution survives.** The guest buffer stayed `720x1280` (and
+  `668x1189` on BBR2's own window) while the window became `2560x1373`; the
+  compositor scaled it and never reallocated. Frame size and window size are
+  independent, in every direction.
+* **The tablet switch is dynamic and reversible.** `334x594 dp` classifies as a
+  phone, `1280x686 dp` as a tablet, and `1088x583 dp` as a phone again — the
+  600 dp line is crossed without a relaunch, because `Geometry::for_resize`
+  keeps the density.
+* **The guest reacts.** After the first relayout BBR2 created a *new* surface
+  already sized to the maximized window (`surface 7 configured (2560×1373)`),
+  which is the app replacing its window in response to the configuration change.
+  That is also why the second step above is `2176x1167`: un-maximizing the *old*
+  window does nothing to the new one, so the state command has to be aimed at the
+  window that is on screen — `pengudroid window` with no id lists them.
+* **No relaunch is needed for any of it.** Each step is a `configure` and a
+  relayout inside the same process.
+
+An interactive pointer drag is still untested as such — Mutter, not a pointer,
+sent these configures — but the configure handler is the same one a drag ends up
+in, and the compositor-gated test
+`native_frame_resize_maximize_and_close_keep_video_and_input_aligned` covers the
+frame math.
+
+The shape of it is a **pull**, not a daemon push:
+
+* `pengudroid-gleshim` runs in a separate `.so` mapping from the rest of the
+  process, and the app host lives in the child the daemon spawns, not in the CLI
+  parent. There is no shared static to signal through and no thread the daemon
+  can call, so a `SurfaceResized` push would need new plumbing on both sides.
+  Instead the host asks: `SurfaceGeometry` (protocol v4) returns the guest
+  buffer size and the window size for one surface, and the follower compares the
+  window size against what it last applied.
+* When it changed, the host republishes the geometry into the environment with
+  `Geometry::for_resize(width, height).export()` and pokes every window root.
+  The environment is the same channel `Geometry::from_env` reads at launch, so
+  `Configuration`/`DisplayInfo` and the daemon agree by construction.
+* `relayoutAsync` is one-way (the client keeps its locally computed frames), so
+  the poke sets `mForceNextWindowRelayout` and `mLayoutRequested` and calls
+  `scheduleTraversals()`. That forces `IWindowSession.relayout`, whose reply is
+  what actually updates the guest's frame.
+
+To find the surface it must ask about, the shim publishes
+`PENGUDROID_LAST_SURFACE_ID` when it creates a window. **The newest window wins,
+and the follower re-reads it on every tick**, because apps replace their window:
+BBR2 creates five surfaces during loading and destroys each when the next
+appears, so at any moment the daemon holds exactly one — the last. A follower
+that latched onto surface 1 (the first) spent the whole run asking about a
+surface that no longer existed; that is what the live run showed before this was
+fixed.
+
+The variable is deliberately **not** `PENGUDROID_SURFACE_ID`: that one is an
+*input* meaning "attach to an existing surface instead of creating one", so
+writing it from the shim would alias a game's second window onto its first.
+
+The daemon answers this query with `-3` when it has no such surface — normal
+while a window is being replaced, and the client turns it into `Ok(None)` rather
+than an error — and `-19` when it has no compositor at all, which is a real
+failure. The follower retries quietly on `-3` and reports anything else, backing
+off to one line per ten seconds so a dead surface cannot flood the log.
+
+`ViewRootImpl.mClientWindowFrames.frame` is forced best-effort, and logs
+`apphost: Android 17 ViewRootImpl.mClientWindowFrames.frame is unavailable` when
+the field or its `Rect` cannot be resolved.
+
 ## 5. SurfaceFlinger is bypassed, not emulated
 
 Apps that talk to `SurfaceFlinger` directly (surface control, layer stacks,
 secure layers, `Transaction` queues) will not get faithful behaviour. The
 `SurfaceComposer` stub answers introspection only. Multi-window, overlays, and
-hardware composition are out of scope for the MVP.
+hardware composition are out of scope for the MVP. The `IDisplayEventConnection`
+handle answers `stealReceiveChannel`/`setVsyncRate`/`requestNextVsync` as before,
+and `getLatestVsyncEventData` (native-only AIDL code 4) now returns one frame
+timeline at the next 60 Hz `CLOCK_MONOTONIC` pulse, marshalled in the exact
+`VsyncEventData` wire layout measured in the shipped `libgui.so`; other codes
+still refuse rather than fabricate a reply. `IInputManager.getVelocityTrackerStrategy`
+(code 1) answers the parcelled string `"default"`.
 
 ## 6. Kernel binder may be unavailable
 
@@ -386,7 +566,15 @@ normal app reaches through `TelephonyManager`; the rest of the ~250-method
 interface returns `-ENOSYS`. The transaction codes are the AIDL declaration
 order for a given AOSP release and can shift when methods are inserted.
 
-The camera reports "zero cameras"; `AudioFlinger` returns empty replies.
+The camera reports "zero cameras"; `AudioFlinger` returns empty replies, and the
+audio **policy** service answers `listAudioPorts`/`listAudioPatches` with an
+empty list (the codes are read from the shipped `IAudioPolicyService$Stub`, so
+they are never guessed). `IAudioService.setAllowedCapturePolicy`/
+`getAllowedCapturePolicy` (codes 171/172, likewise read from the shipped Stub)
+keep a real policy state defaulting to `ALLOW_CAPTURE_BY_ALL` and validate
+1..=3 exactly like the framework (`SUCCESS`/`ERROR_BAD_VALUE`). Empty is
+truthful here — audio reaches the host without a framework port — but it also
+means anything that enumerates ports or patches to *choose* a route sees none.
 **`AudioTrack` no longer goes through it**: the Java class is hosted at the JNI
 boundary (`crates/pengudroid-shim/src/audiotrack.rs` interposes
 `AndroidRuntime::registerNativeMethods` and replaces the native table
@@ -416,9 +604,14 @@ private mount view. Do not run untrusted APKs under PenguDroid.
 
 ## 9. Protocol is versioned but young
 
-The control protocol is v2 and hand-rolled. It is tested for round-trips and
-truncation handling, but has no negotiation for capability differences and no
-framing for large zero-copy transfers beyond fd passing.
+The control protocol is v5 (`PROTO_VERSION` in
+`crates/pengudroid-proto/src/lib.rs`) and hand-rolled. It is tested for
+round-trips and truncation handling, but has no negotiation for capability differences and no
+framing for large zero-copy transfers beyond fd passing. The version is checked
+exactly, so a stale peer is refused rather than misparsed — including a stale
+`libpengudroid_shim.so`, which shows up in the daemon log as
+`client protocol v4 != daemon v5; rebuild/restart matching peers`, not as a
+mystery hang.
 
 Guest-service calls are forwarded per connection with reply ordering implicit
 (the oldest outstanding call is answered first). A call waits up to
@@ -450,8 +643,10 @@ hanging forever, so a wedged guest cannot freeze its peers.
    ART closure `dlopen`s, `JNI_CreateJavaVM` returns `JNI_OK`, framework natives
    register, an APK's DEX loads, and the host drives `handleBindApplication` +
    `handleLaunchActivity` so a real Activity draws and presents (§2).
-   **Still open**: the JIT (only `-Xint` works) and the platform services
-   (`ActivityManager` lifecycle, input, `MediaCodec`).
+   **Still open**: swapping `-Xint` for the JIT/AOT image (the image loads, but
+   ART's uffd GC needs `SIGBUS` resumed inside translated guest code — see
+   [STATUS.md](STATUS.md))
+   and the platform services (`ActivityManager` lifecycle, input, `MediaCodec`).
 6. ~~Wire the PipeWire audio pump.~~ **Done**: the daemon owns a shared ring and
    drains it into `pw-cat` (`audio-test --via-daemon`); silence by default,
    `--tone` audible. ~~OpenSL ES buffer-queue player~~ **Done**: `Enqueue` →

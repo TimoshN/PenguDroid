@@ -745,6 +745,41 @@ fn handle(
             }
         }
 
+        Message::SurfaceGeometry { surface_id, .. } => {
+            let mut guard = daemon.graphics.lock().unwrap();
+            let reply = match guard.as_mut() {
+                None => Message::Error { code: -19, message: "graphics unavailable".into() },
+                Some(gfx) => match gfx.surface_geometry(surface_id) {
+                    Some((width, height, display_width, display_height)) => {
+                        Message::SurfaceGeometry { surface_id, width, height, display_width, display_height }
+                    }
+                    // A caller polling a window that is being replaced sees this
+                    // between surfaces; it is not an error worth reporting.
+                    None => Message::Error {
+                        code: -3,
+                        message: format!("no surface {surface_id}"),
+                    },
+                },
+            };
+            (Some(reply), vec![], false)
+        }
+
+        Message::SetWindowState { surface_id, state } => {
+            // A window state is not a per-process secret the way pixels are: the
+            // host asks for it from its own connection, exactly like input.
+            if state & !pengudroid_proto::WINDOW_STATE_KNOWN != 0 {
+                return (Some(Message::Error {
+                    code: -22,
+                    message: format!("unknown window state bits {state:#x}"),
+                }), vec![], false);
+            }
+            let mut guard = daemon.graphics.lock().unwrap();
+            let ok = guard.as_mut().is_some_and(|gfx| gfx.set_window_state(surface_id, state));
+            if ok { (Some(Message::Ack), vec![], false) } else {
+                (Some(Message::Error { code: -3, message: format!("no surface {surface_id}") }), vec![], false)
+            }
+        }
+
         Message::SetSubsurfacePosition { surface_id, x, y } => {
             let mut guard = daemon.graphics.lock().unwrap();
             let ok = match guard.as_mut() {
@@ -1324,6 +1359,17 @@ mod tests {
         let (p, _tx) = peer(pengudroid_proto::Role::Cli);
         let (reply, _, _) = call(&d, &p, Message::QueryRun { pid: 999_999 });
         assert!(matches!(reply, Some(Message::Error { code: -3, .. })));
+    }
+
+    #[test]
+    fn surface_geometry_without_graphics_is_an_error() {
+        // The test daemon runs without a compositor, so the distinct failure is
+        // worth pinning: a caller polling a live session must be able to tell
+        // "graphics are gone" from "that window is being replaced" (-3).
+        let d = test_daemon();
+        let (p, _tx) = peer(pengudroid_proto::Role::Cli);
+        let (reply, _, _) = call(&d, &p, Message::query_surface_geometry(999));
+        assert!(matches!(reply, Some(Message::Error { code: -19, .. })));
     }
 
     #[test]

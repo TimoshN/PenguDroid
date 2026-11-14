@@ -29,9 +29,13 @@ use std::fmt;
 /// unregistration and detached launches (`QueryRun`).
 /// v3 adds a mandatory per-frame source crop to `PresentShm`; v2 peers must
 /// reconnect with matching binaries rather than interpreting allocation padding.
-/// v4 adds held hardware decoding (`VideoHeld*`): frames the guest's own
+/// v4 adds `SurfaceGeometry`, so a host can ask what a surface is actually
+/// showing instead of assuming the size it asked for at creation.
+/// v5 adds `SetWindowState`, so the host can maximize or fullscreen a window
+/// instead of only passing input to it.
+/// v6 adds held hardware decoding (`VideoHeld*`): frames the guest's own
 /// pipeline presents by id.
-pub const PROTO_VERSION: u16 = 4;
+pub const PROTO_VERSION: u16 = 6;
 
 /// Marker used by the daemon's pid/heartbeat file.
 pub const PROTO_MAGIC: u32 = 0x5044_5247; // "PDRG"
@@ -80,6 +84,9 @@ pub enum MsgKind {
     DestroySurface = 67,
     PresentShm = 68,
     SetSurfaceOptions = 69,
+    SurfaceGeometry = 99,
+    /// Ask the compositor to change a window's state (maximize/fullscreen).
+    SetWindowState = 100,
 
     GetProp = 70,
     PropValue = 71,
@@ -115,10 +122,10 @@ pub enum MsgKind {
     VideoDecoderFlush = 96,
     VideoDecoderClose = 97,
     VideoDecoderPoll = 98,
-    VideoHeldOpen = 99,
-    VideoHeldDecode = 100,
-    VideoHeldFrame = 101,
-    VideoHeldPresent = 102,
+    VideoHeldOpen = 101,
+    VideoHeldDecode = 102,
+    VideoHeldFrame = 103,
+    VideoHeldPresent = 104,
 }
 
 impl MsgKind {
@@ -151,6 +158,8 @@ impl MsgKind {
             67 => DestroySurface,
             68 => PresentShm,
             69 => SetSurfaceOptions,
+            99 => SurfaceGeometry,
+            100 => SetWindowState,
             70 => GetProp,
             71 => PropValue,
             72 => SetProp,
@@ -178,10 +187,10 @@ impl MsgKind {
             96 => VideoDecoderFlush,
             97 => VideoDecoderClose,
             98 => VideoDecoderPoll,
-            99 => VideoHeldOpen,
-            100 => VideoHeldDecode,
-            101 => VideoHeldFrame,
-            102 => VideoHeldPresent,
+            101 => VideoHeldOpen,
+            102 => VideoHeldDecode,
+            103 => VideoHeldFrame,
+            104 => VideoHeldPresent,
             other => return Err(ProtoError::BadKind(other)),
         })
     }
@@ -280,6 +289,14 @@ impl BufferCrop {
     }
 }
 
+/// `SetWindowState` bits: the window is a normal, resizable window when none
+/// are set.
+pub const WINDOW_MAXIMIZED: u32 = 1 << 0;
+/// Fill the output; the compositor hides decorations and expands the surface.
+pub const WINDOW_FULLSCREEN: u32 = 1 << 1;
+/// Every bit [`Message::SetWindowState`] understands.
+pub const WINDOW_STATE_KNOWN: u32 = WINDOW_MAXIMIZED | WINDOW_FULLSCREEN;
+
 /// Every control-plane message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -325,6 +342,14 @@ pub enum Message {
     SetSubsurfacePosition { surface_id: u32, x: i32, y: i32 },
     DestroySurface { surface_id: u32 },
     SetSurfaceOptions { surface_id: u32, fps_meter: bool },
+    /// Ask what a surface is showing. `width`/`height` are the guest's own
+    /// buffer (its internal resolution); `display_*` is the size the compositor
+    /// currently scales that buffer into, which is what a window resize changes.
+    SurfaceGeometry { surface_id: u32, width: u32, height: u32, display_width: u32, display_height: u32 },
+    /// Change the window's state. The compositor answers with a `configure`,
+    /// which is what actually moves `display_*` in a resize — the guest buffer
+    /// keeps its internal resolution either way.
+    SetWindowState { surface_id: u32, state: u32 },
     /// Snapshot a CPU buffer (memfd passed out-of-band), never a GPU dma-buf.
     /// `width`/`height` describe the allocation, `stride` is bytes per row, and
     /// `format` is an Android HAL pixel format. Only `crop` is displayed; even
@@ -422,6 +447,19 @@ pub enum Message {
 }
 
 impl Message {
+    /// The request form of [`Message::SurfaceGeometry`].
+    ///
+    /// Request and reply share one variant, so the reply-shaped fields are zero.
+    pub fn query_surface_geometry(surface_id: u32) -> Message {
+        Message::SurfaceGeometry {
+            surface_id,
+            width: 0,
+            height: 0,
+            display_width: 0,
+            display_height: 0,
+        }
+    }
+
     pub fn kind(&self) -> MsgKind {
         use Message::*;
         match self {
@@ -449,6 +487,8 @@ impl Message {
             SetSubsurfacePosition { .. } => MsgKind::SetSubsurfacePosition,
             DestroySurface { .. } => MsgKind::DestroySurface,
             SetSurfaceOptions { .. } => MsgKind::SetSurfaceOptions,
+            SurfaceGeometry { .. } => MsgKind::SurfaceGeometry,
+            SetWindowState { .. } => MsgKind::SetWindowState,
             PresentDmabuf { .. } => MsgKind::PresentDmabuf,
             PresentShm { .. } => MsgKind::PresentShm,
             VideoDecoderOpen { .. } => MsgKind::VideoDecoderOpen,
@@ -591,6 +631,14 @@ impl Message {
             }
             DestroySurface { surface_id } => e.u32(*surface_id),
             SetSurfaceOptions { surface_id, fps_meter } => { e.u32(*surface_id); e.u8(u8::from(*fps_meter)); }
+            SurfaceGeometry { surface_id, width, height, display_width, display_height } => {
+                e.u32(*surface_id);
+                e.u32(*width);
+                e.u32(*height);
+                e.u32(*display_width);
+                e.u32(*display_height);
+            }
+            SetWindowState { surface_id, state } => { e.u32(*surface_id); e.u32(*state); }
             PresentShm { surface_id, width, height, stride, format, crop } => {
                 e.u32(*surface_id);
                 e.u32(*width);
@@ -806,6 +854,14 @@ impl Message {
             },
             K::DestroySurface => DestroySurface { surface_id: d.u32()? },
             K::SetSurfaceOptions => SetSurfaceOptions { surface_id: d.u32()?, fps_meter: d.u8()? != 0 },
+            K::SurfaceGeometry => SurfaceGeometry {
+                surface_id: d.u32()?,
+                width: d.u32()?,
+                height: d.u32()?,
+                display_width: d.u32()?,
+                display_height: d.u32()?,
+            },
+            K::SetWindowState => SetWindowState { surface_id: d.u32()?, state: d.u32()? },
             K::PresentShm => PresentShm {
                 surface_id: d.u32()?, width: d.u32()?, height: d.u32()?,
                 stride: d.u32()?, format: d.u32()?,
@@ -1273,6 +1329,16 @@ mod tests {
             crop: BufferCrop::full(426, 240) });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: true });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: false });
+        roundtrip(Message::SurfaceGeometry {
+            surface_id: 4,
+            width: 720,
+            height: 1280,
+            display_width: 1600,
+            display_height: 900,
+        });
+        for state in [0, WINDOW_MAXIMIZED, WINDOW_FULLSCREEN, WINDOW_STATE_KNOWN] {
+            roundtrip(Message::SetWindowState { surface_id: 9, state });
+        }
         roundtrip(Message::RunApk {
             path: "/tmp/app.apk".into(),
             component: Some("com.x/.Main".into()),

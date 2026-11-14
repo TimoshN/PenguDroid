@@ -250,15 +250,16 @@ impl Layout {
             }
         }
 
-        // Preserve the ART/ICU prefix used to build the boot image. Framework
-        // jars, including Android 17's split jars, must come from its fragment.
+        // The ART APEX's own jars lead, then the framework fragment's jars, then
+        // the remaining APEX fragments (ICU last). This is the order recorded in
+        // the shipped boot image's OAT header; `OatFile::ValidateBootClassPath`
+        // compares it verbatim, so any reordering rejects the whole image.
         let mut boot_locations: Vec<String> = [
             "/apex/com.android.art/javalib/core-oj.jar",
             "/apex/com.android.art/javalib/core-libart.jar",
             "/apex/com.android.art/javalib/okhttp.jar",
             "/apex/com.android.art/javalib/bouncycastle.jar",
             "/apex/com.android.art/javalib/apache-xml.jar",
-            "/apex/com.android.i18n/javalib/core-icu4j.jar",
         ].into_iter().map(String::from).collect();
         let fragment = system.join("etc/classpaths/bootclasspath.pb");
         let data = std::fs::read(&fragment)
@@ -277,6 +278,15 @@ impl Layout {
             if !boot_locations.contains(&location) {
                 boot_locations.push(location);
             }
+        }
+
+        // ICU4J sits between the framework fragment's jars and the module
+        // fragments. The order is not alphabetical: the boot image's OAT header
+        // records it as entry 14, so inserting it anywhere else rejects the image
+        // and dropping it leaves `com.android.icu.*` unregistered.
+        let icu4j = "/apex/com.android.i18n/javalib/core-icu4j.jar".to_string();
+        if !boot_locations.contains(&icu4j) {
+            boot_locations.push(icu4j);
         }
 
         // Module fragments extend the boot classpath beyond the image's jars.
@@ -734,18 +744,53 @@ fn require_bridge_success(operation: &str, success: bool) -> Result<(), String> 
     if success { Ok(()) } else { Err(format!("native bridge {operation} failed")) }
 }
 
+/// Resolve the guest geometry for a launch.
+///
+/// Explicit `--width`/`--height` (either one) win over the inherited
+/// environment for the pixel size; `--density` overrides the density on its own.
+/// With nothing requested the environment decides, and an empty environment is
+/// the default phone surface.
+fn geometry_for_launch(
+    width: Option<u32>,
+    height: Option<u32>,
+    density: Option<i32>,
+) -> crate::geometry::Geometry {
+    let inherited = crate::geometry::Geometry::from_env();
+    let px = |requested: Option<u32>, fallback: i32| requested.unwrap_or(fallback as u32);
+    if width.is_some() || height.is_some() {
+        crate::geometry::Geometry::for_window(
+            px(width, inherited.width),
+            px(height, inherited.height),
+            density,
+        )
+    } else if density.is_some() {
+        crate::geometry::Geometry::for_window(inherited.width as u32, inherited.height as u32, density)
+    } else {
+        inherited
+    }
+}
+
 /// `pengudroid art-test --sysroot <dir>`
 pub fn art_test(args: &[String]) -> i32 {
     let mut root: Option<PathBuf> = None;
     let mut passthrough: Vec<String> = Vec::new();
     let mut native_bridge: Option<String> = None;
     let mut bridge_lib: Option<String> = None;
+    let mut width: Option<u32> = None;
+    let mut height: Option<u32> = None;
+    let mut density: Option<i32> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--sysroot" => {
                 root = it.next().map(PathBuf::from);
             }
+            // Guest window geometry. These are consumed here rather than
+            // forwarded: the whole tree (shim `ANativeWindow` size, gleshim FBO,
+            // apphost `DisplayInfo`/`Configuration`) must see one answer.
+            "--width" => width = it.next().and_then(|v| v.parse().ok()),
+            "--height" => height = it.next().and_then(|v| v.parse().ok()),
+            "--density" => density = it.next().and_then(|v| v.parse().ok()),
             "--native-bridge" => {
                 let Some(name) = it.next() else {
                     eprintln!("pengudroid: --native-bridge requires a library name");
@@ -865,6 +910,14 @@ pub fn art_test(args: &[String]) -> i32 {
         compat.display(),
         layout.ld_library_path()
     );
+    // The shim's asset manager reads `assets/` straight out of the archive, so
+    // the guest's `AAssetManager_*` calls -- which the ARM64 bridge routes
+    // through the host `libandroid` proxy -- need the APK the class path names.
+    // ART's Java-side AssetManager would normally provide this, but the native
+    // side has no link to it on this host.
+    if let Some(apk) = classpath_apks(&passthrough).first() {
+        cmd.env("PENGUDROID_APK", apk);
+    }
     let mut native_lib_dirs = Vec::new();
     // `System.loadLibrary` ends up in `dlopen`, and glibc does not know about
     // the class loader's native library directories (that is an Android linker
@@ -989,12 +1042,17 @@ pub fn art_test(args: &[String]) -> i32 {
             "PENGUDROID_ROOT",
             std::fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone()),
         )
-        .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1")
-        // One surface geometry for the whole tree: the shim reports these through
-        // `ANativeWindow_getWidth`/`_getHeight`, the gleshim sizes its FBO from
-        // them, and the host lays the window frame out against the same numbers.
-        .env("PENGUDROID_SURFACE_W", "720")
-        .env("PENGUDROID_SURFACE_H", "1280");
+        .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1");
+    // One surface geometry for the whole tree: the shim reports these through
+    // `ANativeWindow_getWidth`/`_getHeight`, the gleshim sizes its FBO from them,
+    // apphost derives `DisplayInfo`/`Configuration` from them, and the host lays
+    // the window frame out against the same numbers. `--width`/`--height`/
+    // `--density` override whatever the environment already carried, so a caller
+    // that sets them (the guest launcher, or a wrapper) stays authoritative.
+    let geometry = geometry_for_launch(width, height, density);
+    for (key, value) in geometry.export() {
+        cmd.env(key, value);
+    }
     if !native_lib_dirs.is_empty() {
         let dirs = std::env::join_paths(&native_lib_dirs)
             .map_err(|e| format!("cannot encode native library directories: {e}"))
@@ -1399,8 +1457,9 @@ pub fn art_main(args: &[String]) -> i32 {
                 }
             }
             if std::env::var_os("PENGUDROID_CRASH_BT").is_some() {
-                // Take the fault handler slot away from ART, which otherwise
-                // reports `HandleUnexpectedSignal reenter` and nothing else.
+                // Install a last-resort native backtrace dump. It chains to
+                // ART's own handler, which owns `SIGBUS` while a userfaultfd
+                // compaction runs, instead of displacing it.
                 if let Ok(name) = CString::new("__pengudroid_install_crash_handler") {
                     let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
                     if f.is_null() {
@@ -2830,10 +2889,13 @@ mod tests {
             "/system/framework/framework-location.jar",
         ]);
         let layout = Layout::detect(&fixture.0).unwrap();
-        assert_eq!(&layout.boot_locations[6..], &[
+        // The framework fragment's jars follow the ART APEX jars directly, and
+        // ICU4J trails them, exactly as the shipped boot image records it.
+        assert_eq!(&layout.boot_locations[5..], &[
             "/system/framework/framework-location.jar", "/system/framework/framework.jar",
+            "/apex/com.android.i18n/javalib/core-icu4j.jar",
         ]);
-        assert_eq!(layout.boot_jars[6], layout.framework.join("framework-location.jar"));
+        assert_eq!(layout.boot_jars[5], layout.framework.join("framework-location.jar"));
     }
 
     #[test]

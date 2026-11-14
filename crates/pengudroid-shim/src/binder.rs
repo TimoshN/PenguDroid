@@ -22,6 +22,8 @@ use std::sync::Mutex;
 
 use libc::{c_int, c_ulong, c_void};
 
+use crate::mediasession::Operation;
+
 /// Protocol version `libbinder` expects from Android 10 onward.
 const BINDER_CURRENT_PROTOCOL_VERSION: c_int = 8;
 
@@ -553,6 +555,19 @@ const IPM_GET_ACTIVITY_INFO: u32 = 11;
 /// with the entry the host marshalled for that class.
 const IPM_GET_PROVIDER_INFO: u32 = 15;
 
+/// `IPackageManager` transaction code for `resolveContentProvider`.
+///
+/// `androidx.core.content.FileProvider` resolves its authority through
+/// `PackageManager.resolveContentProvider(authority, GET_META_DATA)` while
+/// attaching, and reads `metaData["android.support.FILE_PROVIDER_PATHS"]` off
+/// the result. The request is `[token][authority][flags:long][userId]`, so the
+/// authority is matched as a substring; the reply is a single `ProviderInfo`
+/// read with `readTypedObject` (presence word + marshalled body). Confirmed by
+/// disassembling `ApplicationPackageManager.resolveContentProviderAsUser` in
+/// the API-37 framework: it invokes `IPackageManager.resolveContentProvider`
+/// as code 41.
+const IPM_RESOLVE_CONTENT_PROVIDER: u32 = 41;
+
 /// `IActivityTaskManager` transaction code for `getActivityClientController`.
 ///
 /// `ActivityClient.getDisplayId` calls it through a `Singleton`; with no system
@@ -761,6 +776,29 @@ pub unsafe extern "C" fn __pengudroid_binder_set_media_transactions(
     true
 }
 
+static MEDIA_SESSION: crate::mediasession::Session = crate::mediasession::Session::new();
+static MEDIA_SESSION_TRANSACTIONS: Mutex<Option<crate::mediasession::Transactions>> =
+    Mutex::new(None);
+
+/// Install the `ISession` setter codes read from the loaded API-37 Stub, in
+/// [`crate::mediasession::OPERATIONS`] order. Zero marks a method that revision
+/// does not declare; false preserves the previous table.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_media_session_transactions(
+    codes: *const u32,
+    len: usize,
+) -> bool {
+    let count = crate::mediasession::OPERATIONS.len();
+    if codes.is_null() || len != count { return false; }
+    let codes: [u32; crate::mediasession::OPERATIONS.len()] =
+        std::slice::from_raw_parts(codes, len).try_into().unwrap();
+    let Some(table) = crate::mediasession::Transactions::new(codes) else {
+        return false;
+    };
+    *MEDIA_SESSION_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(table);
+    true
+}
+
 /// API-37 IUserManager unlock queries, unknown until installed from its Stub.
 static USER_TRANSACTION_CODES: Mutex<Option<[u32; 2]>> = Mutex::new(None);
 
@@ -785,6 +823,79 @@ pub unsafe extern "C" fn __pengudroid_binder_set_user_transactions(
     }
     *USER_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
     true
+}
+
+/// API-37 `IAudioPolicyService` list queries that are answered with an empty
+/// list, unknown until installed from its Stub.
+///
+/// `AudioSystem::listAudioPorts`/`listAudioPatches` live on the audio *policy*
+/// service (they moved there from `IAudioFlinger`), and
+/// `AudioManager.updateAudioPortCache` polls them roughly every 40 ms for the
+/// lifetime of the process. Without an answer the framework reads a count out
+/// of an empty parcel and reports `AudioSystem: Function: listAudioPorts Line:
+/// 1914 Failed` on every poll — the single largest source of log noise in a
+/// BBR2 run (1,123 calls in 150 s), and the failure that replaced it once ports
+/// were answered.
+static AUDIO_POLICY_EMPTY_LISTS: Mutex<([u32; 4], usize)> = Mutex::new(([0; 4], 0));
+
+/// A serialized `AudioAttributes` for the legacy-stream query
+/// (`getAttributesForStreamType`), marshalled by the host with the framework's
+/// own `AudioAttributes.writeToParcel`. `AudioSystem.getAttributesForStreamType`
+/// logs an ERROR and hands out no attributes when this is empty, which makes
+/// every `AudioTrack` construction fall back noisily (seen in BBR2).
+static AUDIO_ATTRIBUTES: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn audio_policy_empty_lists() -> ([u32; 4], usize) {
+    *AUDIO_POLICY_EMPTY_LISTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Install `IAudioPolicyService$Stub.TRANSACTION_list*` codes that we answer
+/// with an unmodelled-but-truthful empty list.
+///
+/// `len` must be 1..=4 and every code must be distinct and in 1..0x00ff_fffe.
+/// The table is copied and replaced atomically; false preserves the previous
+/// value. No audio-policy method dispatches before a successful installation,
+/// so a framework revision that renames a field keeps today's fallthrough
+/// rather than receiving a reply shaped for the wrong method.
+///
+/// # Safety
+/// For a non-null pointer and `len` in 1..=4, `codes` must point to `len`
+/// aligned, readable u32s for the duration of this call. Not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_audio_policy_transactions(
+    codes: *const u32,
+    len: usize,
+) -> bool {
+    if codes.is_null() || len == 0 || len > 4 { return false; }
+    let codes: [u32; 4] = {
+        let slice = std::slice::from_raw_parts(codes, len);
+        let mut table = [0u32; 4];
+        table[..len].copy_from_slice(slice);
+        table
+    };
+    for (i, &code) in codes[..len].iter().enumerate() {
+        if code == 0 || code >= 0x00ff_fffe || codes[..i].contains(&code) { return false; }
+    }
+    *AUDIO_POLICY_EMPTY_LISTS.lock().unwrap_or_else(|e| e.into_inner()) = (codes, len);
+    true
+}
+
+/// `void __pengudroid_binder_set_audio_attributes(const uint8_t *bytes, size_t len)`
+///
+/// Installs the marshalled `AudioAttributes` that
+/// `IAudioPolicyService.getAttributesForStreamType` (the third installed
+/// code) answers with.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_audio_attributes(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `IContentProvider` transaction codes, read out of this framework.jar with
@@ -969,6 +1080,12 @@ const IDEC_SET_VSYNC_RATE: u32 = 2;
 /// `IDisplayEventConnection` transaction code for `requestNextVsync` (oneway).
 const IDEC_REQUEST_NEXT_VSYNC: u32 = 3;
 
+/// `IDisplayEventConnection` transaction code for `getLatestVsyncEventData`.
+/// The interface is native-only AIDL (no Java Stub), so the code is the AIDL
+/// declaration order: stealReceiveChannel=1, setVsyncRate=2,
+/// requestNextVsync=3, getLatestVsyncEventData=4.
+const IDEC_GET_LATEST_VSYNC_EVENT_DATA: u32 = 4;
+
 /// Measured API-37 x86_64 DisplayEventReceiver::Event: a 24-byte header and
 /// 200-byte VSync union, including frameTimelinesLength/numberQueuedBuffers.
 const DISPLAY_EVENT_SIZE: usize = 224;
@@ -1048,23 +1165,24 @@ const IDM_GET_DISPLAY_INFO: u32 = 1;
 /// Framework-marshalled virtual keyboard InputDevice, including its native map.
 static VIRTUAL_INPUT_DEVICE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 // Internal virtual_input::reply semantic IDs, never default wire codes.
-const INPUT_OPERATIONS: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 22];
-static INPUT_TRANSACTION_CODES: Mutex<Option<[u32; 8]>> = Mutex::new(None);
+const INPUT_OPERATIONS: [u32; 9] = [1, 2, 3, 4, 5, 6, 7, 22, 8];
+static INPUT_TRANSACTION_CODES: Mutex<Option<[u32; 9]>> = Mutex::new(None);
 
 /// Install IInputManager$Stub codes in getInputDevice, getInputDeviceIds,
 /// isInputDeviceEnabled, enableInputDevice, disableInputDevice, hasKeys,
-/// getKeyCodeForKeyLocation, registerInputDevicesChangedListener order.
-/// `len` must be 8 u32 elements. Only isInputDeviceEnabled may be zero (absent
+/// getKeyCodeForKeyLocation, registerInputDevicesChangedListener,
+/// getVelocityTrackerStrategy order.
+/// `len` must be 9 u32 elements. Only isInputDeviceEnabled may be zero (absent
 /// on API 37); zero never dispatches. Other codes must be distinct and in
 /// 1..0x00ff_fffe. False preserves the previous table; there is no default.
 ///
 /// # Safety
-/// For a non-null pointer and len == 8, `codes` must point to eight aligned,
+/// For a non-null pointer and len == 9, `codes` must point to nine aligned,
 /// readable u32s for this call. The contents are copied, not retained.
 #[no_mangle]
 pub unsafe extern "C" fn __pengudroid_binder_set_input_transactions(codes: *const u32, len: usize) -> bool {
-    if codes.is_null() || len != 8 { return false; }
-    let codes: [u32; 8] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
+    if codes.is_null() || len != 9 { return false; }
+    let codes: [u32; 9] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
     if codes.iter().enumerate().any(|(i, &c)| (c == 0 && i != 2) || c >= 0x00ff_fffe)
         || codes.iter().enumerate().any(|(i, c)| *c != 0 && codes[..i].contains(c)) { return false; }
     *INPUT_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
@@ -1073,20 +1191,227 @@ pub unsafe extern "C" fn __pengudroid_binder_set_input_transactions(codes: *cons
 
 
 static AUDIO_FOCUS: crate::audiofocus::AudioFocus = crate::audiofocus::AudioFocus::new();
+static CAPTURE_POLICY: crate::audiofocus::CapturePolicy = crate::audiofocus::CapturePolicy::new();
 static AUDIO_FOCUS_TRANSACTIONS: Mutex<Option<crate::audiofocus::Transactions>> =
     Mutex::new(None);
 
-/// Install request/abandon/unregister/current focus codes from the loaded Stub.
-/// All must be nonzero, distinct user codes; false preserves the previous table.
+/// `IAudioService` player/recorder lifecycle codes in Stub order:
+/// trackPlayer, playerAttributes, playerEvent, releasePlayer, trackRecorder,
+/// recorderEvent, releaseRecorder. `AudioTrack`/`AudioRecord` call
+/// `trackPlayer`/`trackRecorder` when a stream is opened and get an int
+/// player id back; the remaining methods are void. A status-only fallthrough
+/// decodes the id as 0, which `PlayerBase` rejects, so the two track methods
+/// must answer a real id.
+static AUDIO_PLAYER_TRANSACTIONS: Mutex<Option<[u32; 7]>> = Mutex::new(None);
+
+/// Player/recorder ids handed out by the track methods, starting at 1.
+static AUDIO_PLAYER_NEXT_ID: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(1);
+
+/// Per-service tables of transaction codes that answer with an empty
+/// `ParceledListSlice` (`shortcut` and `jobscheduler`). A status-only
+/// fallthrough decodes as presence 0 = null slice, and the caller then NPEs
+/// on `ParceledListSlice.getList()` (seen for `ShortcutManager.getDynamicShortcuts`
+/// and `JobSchedulerImpl.getAllPendingJobs`).
+static EMPTY_LIST_SERVICES: Mutex<std::collections::BTreeMap<u32, Vec<u32>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Install `service`'s empty-`ParceledListSlice` codes from the loaded Stub.
+/// Codes must be nonzero, distinct user transaction codes; false preserves
+/// the previous table. Until installation the service keeps falling through.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_empty_list_transactions(
+    service: *const std::ffi::c_char, codes: *const u32, len: usize,
+) -> bool {
+    if service.is_null() || codes.is_null() || len == 0 { return false; }
+    let Ok(name) = (unsafe { std::ffi::CStr::from_ptr(service) }).to_str() else { return false };
+    let slice = unsafe { std::slice::from_raw_parts(codes, len) };
+    if slice.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
+        || slice.iter().enumerate().any(|(i, c)| slice[..i].contains(c))
+    { return false; }
+    EMPTY_LIST_SERVICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle_for(name), slice.to_vec());
+    true
+}
+
+/// Per-service tables of transaction codes that answer with a
+/// `ParcelFileDescriptor` wrapping a fresh zeroed ashmem region
+/// (`graphicsstats`' `requestBufferForProcess`). A status-only fallthrough
+/// decodes as presence 0 = null PFD, and the caller then NPEs on
+/// `ParcelFileDescriptor.getFd()` (seen for `HardwareRenderer`'s gfx stats
+/// buffer).
+static FD_SERVICES: Mutex<std::collections::BTreeMap<u32, Vec<u32>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// FDs handed out through `FD_SERVICES` replies, kept open for process
+/// lifetime: the client mmaps them after the transaction completes.
+static FD_REPLY_FDS: Mutex<Vec<RawFd>> = Mutex::new(Vec::new());
+
+/// `nGetAshmemSize()` in the shipped `libhwui.so` (API 37) returns `0x248`;
+/// the client rejects smaller regions with "Ashmem region is too small".
+const GFXSTATS_ASHMEM_SIZE: usize = 0x248;
+
+/// Install `service`'s ParcelFileDescriptor-returning codes from the loaded
+/// Stub. Codes must be nonzero, distinct user transaction codes; false
+/// preserves the previous table. Until installation the service keeps
+/// falling through.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_fd_transactions(
+    service: *const std::ffi::c_char, codes: *const u32, len: usize,
+) -> bool {
+    if service.is_null() || codes.is_null() || len == 0 { return false; }
+    let Ok(name) = (unsafe { std::ffi::CStr::from_ptr(service) }).to_str() else { return false };
+    let slice = unsafe { std::slice::from_raw_parts(codes, len) };
+    if slice.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
+        || slice.iter().enumerate().any(|(i, c)| slice[..i].contains(c))
+    { return false; }
+    FD_SERVICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle_for(name), slice.to_vec());
+    true
+}
+
+/// Install request/abandon/unregister/current/setAllowedCapturePolicy/
+/// getAllowedCapturePolicy codes from the loaded Stub. All must be nonzero,
+/// distinct user codes; false preserves the previous table.
 /// Until installation, no focus operation dispatches.
+/// The Play Billing service name games bind to (`com.android.vending`). There
+/// is no vending process here, so the broker hosts the classic
+/// `IInAppBillingService` interface itself and answers from installed tables.
+const BILLING_SERVICE: &str = "com.android.vending.billing.IInAppBillingService";
+
+/// One installed reply for a hosted billing transaction code.
+enum BillingReply {
+    /// An int-returning method (isBillingSupported, consumePurchase, …).
+    Int(i32),
+    /// A Bundle-returning method (getSkuDetails, getBuyIntent, getPurchases,
+    /// …). The payload is the framework-marshalled `Bundle.writeToParcel`
+    /// bytes *without* the leading status word: Java AIDL reads a Bundle
+    /// return with `Parcel.readBundle()`, which consumes exactly those bytes
+    /// after the status word `make_reply` already wrote.
+    Bundle(Vec<u8>),
+}
+
+/// Per-code replies for the hosted billing interface. Codes arrive from the
+/// host, which knows the bundled Play Billing library's AIDL order (the
+/// interface's transaction codes are sequential from 1 in declaration order).
+static BILLING_REPLIES: Mutex<std::collections::BTreeMap<u32, BillingReply>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The `isBillingSupported` code; its reply echoes the requested apiVersion,
+/// which the shim reads out of the request parcel. Zero means not installed.
+static BILLING_IS_SUPPORTED: Mutex<u32> = Mutex::new(0);
+
+/// Install the `isBillingSupported` transaction code. The reply is the
+/// request's own apiVersion (clamped to what this host supports), matching
+/// what vending returns for a supported `inapp`/`subs` query.
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_billing_is_supported(code: u32) -> bool {
+    if code == 0 || code >= 0x00ff_fffe {
+        return false;
+    }
+    *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner()) = code;
+    true
+}
+
+/// Install an int reply for a billing transaction code.
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_billing_int(code: u32, value: i32) -> bool {
+    if code == 0 || code >= 0x00ff_fffe {
+        return false;
+    }
+    BILLING_REPLIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(code, BillingReply::Int(value));
+    true
+}
+
+/// Install a marshalled-`Bundle` reply for a billing transaction code.
+///
+/// # Safety
+/// For a non-null `bytes`, it must point to `len` readable bytes; they are
+/// copied and the pointer is not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_billing_bundle(
+    code: u32,
+    bytes: *const u8,
+    len: usize,
+) -> bool {
+    if code == 0 || code >= 0x00ff_fffe || bytes.is_null() {
+        return false;
+    }
+    let data = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    BILLING_REPLIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(code, BillingReply::Bundle(data));
+    true
+}
+
+/// The `IPackageManager.queryIntentServices` code (read from the loaded
+/// framework Stub by the host) plus the marshalled `ParceledListSlice` body
+/// (presence word *not* included) that answers it when the request's Intent
+/// targets `com.android.vending`. Play Billing probes the billing service
+/// with `PackageManager.queryIntentServices` before binding; an empty answer
+/// is what makes `BillingClient` report "Billing service unavailable" and
+/// retry forever.
+static VENDING_QUERY: Mutex<Option<(u32, Vec<u8>)>> = Mutex::new(None);
+
+/// Install the `queryIntentServices` reply for vending-targeted requests.
+///
+/// # Safety
+/// For a non-null `bytes`, it must point to `len` readable bytes; they are
+/// copied and the pointer is not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_vending_query_reply(
+    code: u32,
+    bytes: *const u8,
+    len: usize,
+) -> bool {
+    if code == 0 || code >= 0x00ff_fffe || bytes.is_null() || len == 0 {
+        return false;
+    }
+    let data = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    *VENDING_QUERY.lock().unwrap_or_else(|e| e.into_inner()) = Some((code, data));
+    true
+}
+
 #[no_mangle]
 pub extern "C" fn __pengudroid_binder_set_audio_focus_transactions(
     request: u32, abandon: u32, unregister: u32, current: u32,
+    set_capture_policy: u32, get_capture_policy: u32,
 ) -> bool {
-    let Some(table) = crate::audiofocus::Transactions::new([request, abandon, unregister, current]) else {
+    let Some(table) = crate::audiofocus::Transactions::new(
+        [request, abandon, unregister, current, set_capture_policy, get_capture_policy],
+    ) else {
         return false;
     };
     *AUDIO_FOCUS_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(table);
+    true
+}
+
+/// Install trackPlayer/playerAttributes/playerEvent/releasePlayer/
+/// trackRecorder/recorderEvent/releaseRecorder codes from the loaded Stub.
+/// All must be nonzero, distinct user codes; false preserves the previous
+/// table. Until installation none of these methods dispatch.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_audio_player_transactions(
+    track_player: u32, player_attributes: u32, player_event: u32, release_player: u32,
+    track_recorder: u32, recorder_event: u32, release_recorder: u32,
+) -> bool {
+    let codes = [
+        track_player, player_attributes, player_event, release_player,
+        track_recorder, recorder_event, release_recorder,
+    ];
+    if codes.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
+        || codes.iter().enumerate().any(|(i, c)| codes[..i].contains(c)) {
+        return false;
+    }
+    *AUDIO_PLAYER_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
     true
 }
 
@@ -1127,7 +1452,8 @@ struct WebViewReplies {
 static WEBVIEW_REPLIES: std::sync::LazyLock<Mutex<WebViewReplies>> =
     std::sync::LazyLock::new(|| Mutex::new(WebViewReplies::default()));
 
-/// Marshalled `ProviderInfo`s, keyed by class name.
+/// Marshalled `ProviderInfo`s, keyed by class name, plus `auth:`-prefixed
+/// entries keyed by authority for `resolveContentProvider` (code 41).
 static PROVIDER_ENTRIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -1197,6 +1523,15 @@ pub(crate) fn monotonic_ms() -> u128 {
     // SAFETY: `ts` is a valid `timespec`.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128 / 1_000_000
+}
+
+/// Nanoseconds on `CLOCK_MONOTONIC` — the same clock `System.nanoTime()` reads,
+/// which is what vsync timestamps must be on.
+pub(crate) fn monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid `timespec`.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }
 
 unsafe fn diag(line: &str) {
@@ -2008,6 +2343,16 @@ fn parcel_contains_utf16(data: &[u8], s: &str) -> bool {
     !needle.is_empty() && data.windows(needle.len()).any(|w| w == needle.as_slice())
 }
 
+/// Substring match in either Parcel string encoding: String16 (UTF-16LE) or
+/// String8 (8-bit ASCII). API-37 callers may marshal either, so keyed lookups
+/// have to check both (same reason as the vending `queryIntentServices` branch).
+fn parcel_contains_either(data: &[u8], s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    parcel_contains_utf16(data, s) || data.windows(s.len()).any(|w| w == s.as_bytes())
+}
+
 /// Match a whole, aligned Parcel String16 field, not a substring of a key.
 fn parcel_contains_string16(data: &[u8], value: &str) -> bool {
     let units: Vec<u16> = value.encode_utf16().collect();
@@ -2052,6 +2397,7 @@ fn hosted_interface_descriptor(handle: u32) -> Option<&'static str> {
         "surface_composer_client" => Some("android.gui.ISurfaceComposerClient"),
         "display_event_connection" => Some("android.gui.IDisplayEventConnection"),
         "pengudroid.activity_host" => Some(ACTIVITY_HOST_DESCRIPTOR),
+        BILLING_SERVICE => Some("com.android.vending.billing.IInAppBillingService"),
         _ => None,
     }
 }
@@ -2364,6 +2710,25 @@ fn first_string16(data: &[u8]) -> Option<String> {
     Some(decode_utf16le(data.get(16..end)?))
 }
 
+/// Argument bytes after a Java `writeInterfaceToken` header for `descriptor`.
+///
+/// The token is a `u32` char count, UTF-16LE code units, a NUL, padded to 4
+/// bytes; libbinder prefixes it with a 12-byte header (`[u32][i32 -1]["TSYS"]`),
+/// so the string may start at offset 12 or 0.
+fn after_interface_token<'a>(data: &'a [u8], descriptor: &str) -> Option<&'a [u8]> {
+    let token: Vec<u16> = descriptor.encode_utf16().collect();
+    for start in [12usize, 0] {
+        let n = u32::from_le_bytes(data.get(start..start + 4)?.try_into().ok()?) as usize;
+        if n != token.len() { continue; }
+        let text = data.get(start + 4..start + 4 + n * 2)?;
+        if !text.chunks_exact(2).zip(&token).all(|(b, c)| u16::from_le_bytes([b[0], b[1]]) == *c) { continue; }
+        if data.get(start + 4 + n * 2..start + 6 + n * 2)? != [0, 0] { continue; }
+        let end = (start + 6 + n * 2 + 3) & !3;
+        return data.get(end..);
+    }
+    None
+}
+
 /// Whether a reply starts with an AIDL `Status` word. SurfaceComposer and its
 /// client are API-37 generated AIDL; neither has a handwritten reply variant.
 fn reply_has_status(handle: u32, code: u32) -> bool {
@@ -2568,6 +2933,174 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     }
     if reply_has_status(tr.target_handle, tr.code) {
         parcel.extend_from_slice(&0u32.to_ne_bytes());
+    }
+    if tr.target_handle == handle_for("media.audio_policy") {
+        let (codes, len) = audio_policy_empty_lists();
+        if len > 2 && tr.code == codes[2] {
+            // `getAttributesForStreamType(int)` returns an `AudioAttributes`
+            // typed object. Serve the host-marshalled attributes; without an
+            // installed payload the status-only fallthrough decodes as null,
+            // which is what produced `AudioSystem: getAttributesForStreamType
+            // Failed` in the bridged BBR2 run.
+            let attrs = AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !attrs.is_empty() {
+                parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+                parcel.extend_from_slice(&attrs);
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> AudioAttributes ({} bytes)\n", attrs.len()));
+                }
+            }
+        } else if len > 3 && tr.code == codes[3] {
+            // `getStreamTypeForAttributes(AudioAttributes)` returns the legacy
+            // stream type as a bare int. The only attributes we ever serve are
+            // media/music, whose legacy stream is STREAM_MUSIC (3); answering 0
+            // (STREAM_VOICE_CALL) made `getAudioAttributesForLegacyStream`
+            // reject the round trip.
+            parcel.extend_from_slice(&3u32.to_ne_bytes()); // STREAM_MUSIC
+            if trace_enabled() {
+                diag("[binder]   -> stream type 3 (STREAM_MUSIC)\n");
+            }
+        } else if codes[..len].contains(&tr.code) {
+            // `listAudioPorts(role, type, out int num_ports, out AudioPort[],
+            // out int generation)` and `listAudioPatches(out int num_patches,
+            // out AudioPatch[], out int generation)`. No ports or patches are
+            // modelled: `AudioTrack`/`AAudio` reach the host through the
+            // forwarder without a framework port, so the truthful answer is an
+            // empty list. Both out parameters are counts, and both are zero, so
+            // the reply parses the same way whichever order this revision
+            // declares them in — and a zero count means the framework never
+            // reads an entry.
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // no ports/patches
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // generation 0
+            if trace_enabled() {
+                diag("[binder]   -> audio policy list: nothing modelled\n");
+            }
+        }
+        // Any other audio-policy method keeps the fallthrough it had before
+        // this table existed; inventing a reply for e.g. getOutputForAttr would
+        // hand the framework a handle to a device we do not have.
+    }
+    if name_for_handle(tr.target_handle).as_deref() == Some(BILLING_SERVICE) {
+        // Hosted Play Billing: the status word was already written above, so
+        // the body is an int or a marshalled Bundle depending on the code.
+        // Play Billing proxies (zzau.zza in billing 8.3.0) consume TWO ints
+        // before the payload — `readInt()` status plus `readException()`'s
+        // unconditional code read — so an extra 0 (no exception) word must
+        // sit between the status and the int/Bundle payload. Without it the
+        // first payload word is eaten as the exception code and a Bundle
+        // reply's "BNDL" magic lands on `readBundle`'s length read
+        // ("Bundle length is not aligned by 4").
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // exception code: none
+        let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+            unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) }
+        } else {
+            &[]
+        };
+        let descriptor = hosted_interface_descriptor(tr.target_handle).unwrap_or("");
+        let body = after_interface_token(data, descriptor).unwrap_or(&[]);
+        let is_supported_code = *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        if tr.code == is_supported_code && is_supported_code != 0 {
+            // isBillingSupported(apiVersion, packageName, type) returns a
+            // RESPONSE_* code: 0 (RESPONSE_OK) when vending supports the
+            // requested item type, 3 (BILLING_UNAVAILABLE) otherwise. The
+            // body is [i32 apiVersion][String packageName][String type];
+            // echoing apiVersion back made every probe look like
+            // BILLING_UNAVAILABLE, so BillingClient disconnected and retried
+            // forever. Answer OK for the standard "inapp"/"subs" types.
+            const RESPONSE_OK: i32 = 0;
+            const BILLING_UNAVAILABLE: i32 = 3;
+            let api_version = body
+                .get(..4)
+                .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+                .unwrap_or(3);
+            let item_type = body
+                .get(4..)
+                .and_then(|rest| {
+                    read_string16(rest, 0)
+                        .or_else(|| read_string8(rest, 0))
+                        .and_then(|(_pkg, next)| {
+                            read_string16(rest, next)
+                                .or_else(|| read_string8(rest, next))
+                                .map(|(t, _)| t)
+                        })
+                })
+                .flatten();
+            let response = match item_type.as_deref() {
+                Some("inapp") | Some("subs") => RESPONSE_OK,
+                _ => BILLING_UNAVAILABLE,
+            };
+            parcel.extend_from_slice(&response.to_ne_bytes());
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   -> billing isBillingSupported code={} apiVersion={api_version} type={item_type:?} response={response}\n",
+                    tr.code
+                ));
+            }
+        } else if let Some(reply) = BILLING_REPLIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&tr.code)
+        {
+            match reply {
+                BillingReply::Int(value) => parcel.extend_from_slice(&value.to_ne_bytes()),
+                BillingReply::Bundle(bytes) => parcel.extend_from_slice(bytes),
+            }
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   -> billing code={} reply={} total={} bytes\n",
+                    tr.code,
+                    match reply { BillingReply::Int(_) => "int", BillingReply::Bundle(_) => "bundle" },
+                    parcel.len()
+                ));
+            }
+        } else if trace_enabled() {
+            diag(&format!(
+                "[binder]   -> billing code={} has no installed reply (status-only fallthrough)\n",
+                tr.code
+            ));
+        }
+    }
+    if tr.target_handle == handle_for("package") {
+        let installed = VENDING_QUERY.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some((code, body)) = installed {
+            if tr.code == code {
+                let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+                    unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) }
+                } else {
+                    &[]
+                };
+                // Substring search on the raw payload in both string
+                // encodings: some callers marshal String16 (UTF-16LE), API-37
+                // can marshal String8 (ASCII) — the action string itself
+                // embeds the package name either way.
+                let needle16: Vec<u8> = "com.android.vending"
+                    .encode_utf16()
+                    .flat_map(|u| u.to_ne_bytes())
+                    .collect();
+                let needle8 = b"com.android.vending".to_vec();
+                let targets_vending = (data.len() >= needle16.len()
+                    && data.windows(needle16.len()).any(|w| w == needle16.as_slice()))
+                    || (data.len() >= needle8.len()
+                        && data.windows(needle8.len()).any(|w| w == needle8.as_slice()));
+                if targets_vending {
+                    // `queryIntentServices` returns a `ParceledListSlice`
+                    // read with `readTypedObject`: presence word, then the
+                    // marshalled slice body the host installed. The status
+                    // word was already written above. The reply only applies
+                    // to vending-targeted probes; every other
+                    // queryIntentServices call keeps its fallthrough.
+                    parcel.extend_from_slice(&1u32.to_ne_bytes());
+                    parcel.extend_from_slice(&body);
+                    if trace_enabled() {
+                        diag(&format!(
+                            "[binder]   -> queryIntentServices code={} vending ResolveInfo list ({} bytes)\n",
+                            tr.code,
+                            body.len()
+                        ));
+                    }
+                }
+            }
+        }
     }
     // Any transaction that carries a local binder object is a client handing us
     // a node it wants called back on. `attachApplication` is the one that
@@ -2875,7 +3408,45 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
                 )));
             }
-            _ => return Reply::unknown_transaction(tr, "unimplemented media method (including session setters, controller and queue transfer)"),
+            (Some("media_session_session"), code) => {
+                // The queue arms above answer ISession's two handle getters;
+                // every other ISession method that reached the framework from
+                // here is a setter the hosted session records locally.
+                let Some(op) = MEDIA_SESSION_TRANSACTIONS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .and_then(|table| table.operation(code))
+                else {
+                    return Reply::unknown_transaction(
+                        tr,
+                        "unimplemented ISession method: setters need \
+                         __pengudroid_binder_set_media_session_transactions",
+                    );
+                };
+                let data = if tr.data_size != 0 && tr.data_ptr != 0 {
+                    std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+                } else { &[] };
+                // SetFlags(int) and SetCurrentVolume(int) carry their value as
+                // the first parcel word; no other recorded setter reads one.
+                let word = data
+                    .get(0..4)
+                    .map(|word| i32::from_ne_bytes(word.try_into().unwrap()))
+                    .unwrap_or(0);
+                if op == Operation::IsPlaybackActive {
+                    parcel.extend_from_slice(
+                        &i32::from(MEDIA_SESSION.playback_active()).to_ne_bytes(),
+                    );
+                } else {
+                    MEDIA_SESSION.apply(op, word, word);
+                    if op == Operation::Disconnect {
+                        MEDIA_SESSION.reset();
+                    }
+                }
+                if trace_enabled() {
+                    unsafe { diag(&format!("[binder]   -> ISession {op:?}\n")); }
+                }
+            }
+            _ => return Reply::unknown_transaction(tr, "unimplemented media method (including controller and queue transfer)"),
         }
     }
     if tr.target_handle == handle_for("media.resource_manager") {
@@ -2953,7 +3524,46 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             Some(crate::audiofocus::Operation::Abandon) => parcel.extend_from_slice(&AUDIO_FOCUS.abandon().to_ne_bytes()),
             Some(crate::audiofocus::Operation::Unregister) => { AUDIO_FOCUS.abandon(); }
             Some(crate::audiofocus::Operation::Current) => parcel.extend_from_slice(&AUDIO_FOCUS.current().to_ne_bytes()),
-            None => return Reply::unknown_transaction(tr, "unimplemented IAudioService method"),
+            Some(crate::audiofocus::Operation::SetCapturePolicy) => {
+                // `setAllowedCapturePolicy(int capturePolicy)`: one int32 after
+                // the interface token; the reply is the AudioManager result code.
+                let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+                    std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+                } else { &[] };
+                let policy = after_interface_token(data, "android.media.IAudioService")
+                    .and_then(|args| args.get(..4))
+                    .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
+                let result = CAPTURE_POLICY.set(policy);
+                parcel.extend_from_slice(&result.to_ne_bytes());
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> setAllowedCapturePolicy policy={policy} result={result}\n"));
+                }
+            }
+            Some(crate::audiofocus::Operation::GetCapturePolicy) => {
+                let policy = CAPTURE_POLICY.get();
+                parcel.extend_from_slice(&policy.to_ne_bytes());
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> getAllowedCapturePolicy policy={policy}\n"));
+                }
+            }
+            None => {
+                // Player/recorder lifecycle: trackPlayer (index 0) and
+                // trackRecorder (index 4) return an int id; the rest are void
+                // and keep the status-only reply.
+                let players = *AUDIO_PLAYER_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner());
+                match players.and_then(|p| p.iter().position(|&c| c == tr.code)) {
+                    Some(0) | Some(4) => {
+                        let id = AUDIO_PLAYER_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        parcel.extend_from_slice(&id.to_ne_bytes());
+                        if trace_enabled() {
+                            diag(&format!("[binder]   -> audio player id={id}\n"));
+                        }
+                    }
+                    Some(_) => {}
+                    None => return Reply::unknown_transaction(tr, "unimplemented IAudioService method"),
+                }
+            }
         }
     }
     if tr.target_handle == handle_for("input") {
@@ -3045,8 +3655,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         if let Err(error) = require_api37() {
             return Reply::unknown_transaction(tr, &error);
         }
-        if !matches!(tr.code, IDEC_STEAL_RECEIVE_CHANNEL | IDEC_SET_VSYNC_RATE | IDEC_REQUEST_NEXT_VSYNC) {
-            return Reply::unknown_transaction(tr, "unimplemented IDisplayEventConnection method (getLatestVsyncEventData is unsupported)");
+        if !matches!(tr.code, IDEC_STEAL_RECEIVE_CHANNEL | IDEC_SET_VSYNC_RATE
+            | IDEC_REQUEST_NEXT_VSYNC | IDEC_GET_LATEST_VSYNC_EVENT_DATA)
+        {
+            return Reply::unknown_transaction(tr, "unimplemented IDisplayEventConnection method");
         }
     }
     if tr.target_handle == handle_for("display_event_connection")
@@ -3077,10 +3689,33 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
+    if tr.target_handle == handle_for("display_event_connection")
+        && tr.code == IDEC_GET_LATEST_VSYNC_EVENT_DATA
+    {
+        // `VsyncEventData` wire layout, from `ParcelableVsyncEventData::
+        // writeToParcel`/`readFromParcel` in the shipped libgui.so:
+        // `[presence int][int64][uint32][uint32 count][count x {int64,int64,int64}]`.
+        // The proxy reads it with `Parcel::readParcelable` (presence must be
+        // kNonNullParcelableFlag = 1) after the AIDL status word written above.
+        // Answer with one frame timeline whose deadline is the next 60 Hz pulse,
+        // so `Choreographer` sees a sane vsync instead of garbage.
+        let now = monotonic_ns();
+        let deadline = now + VSYNC_FRAME_INTERVAL_NS;
+        parcel.extend_from_slice(&1u32.to_ne_bytes()); // kNonNullParcelableFlag
+        parcel.extend_from_slice(&0i64.to_ne_bytes()); // preferredFrameTimelineIndex
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&1u32.to_ne_bytes()); // one frame timeline
+        parcel.extend_from_slice(&1i64.to_ne_bytes()); // vsyncId
+        parcel.extend_from_slice(&deadline.to_ne_bytes()); // deadlineTimestamp
+        parcel.extend_from_slice(&deadline.to_ne_bytes()); // expectedPresentationTime
+        if trace_enabled() {
+            diag(&format!("[binder]   -> VsyncEventData deadline={deadline}\n"));
+        }
+    }
     if tr.target_handle == handle_for("display_event_connection") {
         // Only the measured setVsyncRate/requestNextVsync operations are known.
         // Other methods must not receive a fabricated empty success reply.
-        if tr.code != IDEC_STEAL_RECEIVE_CHANNEL {
+        if tr.code != IDEC_STEAL_RECEIVE_CHANNEL && tr.code != IDEC_GET_LATEST_VSYNC_EVENT_DATA {
             parcel.extend_from_slice(&0u32.to_ne_bytes());
         }
         if matches!(tr.code, IDEC_REQUEST_NEXT_VSYNC | IDEC_SET_VSYNC_RATE) {
@@ -3314,10 +3949,67 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
-    if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PROVIDER_INFO {
-        // The request is `[interface token][ComponentName][flags][userId]`, so
-        // the class name is not the last thing in the parcel. Match the parcel
-        // against the names we installed instead of trying to parse it.
+    let mut provider_answered = false;
+    {
+        let empty_lists = EMPTY_LIST_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(codes) = empty_lists.get(&tr.target_handle) {
+            if !codes.contains(&tr.code) {
+                return Reply::unknown_transaction(tr, "unimplemented empty-list service method");
+            }
+            // AIDL Parcelable return: `[presence=1]` then
+            // `ParceledListSlice.writeToParcel` = `writeTypedList` =
+            // `[count=0]`. The status word is already in the reply.
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&0u32.to_ne_bytes());
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   -> empty ParceledListSlice for {} code {}\n",
+                    name_for_handle(tr.target_handle).unwrap_or_default(), tr.code
+                ));
+            }
+        }
+    }
+    {
+        let fd_services = FD_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(codes) = fd_services.get(&tr.target_handle) {
+            if !codes.contains(&tr.code) {
+                return Reply::unknown_transaction(tr, "unimplemented fd service method");
+            }
+            drop(fd_services);
+            // AIDL Parcelable return: `[presence=1]` then
+            // `ParcelFileDescriptor.writeToParcel` = `[hasComm=0]` +
+            // `Parcel::writeFileDescriptor` flat object. The status word is
+            // already in the reply.
+            let fd = match crate::create_ashmem("pengudroid-gfxstats", GFXSTATS_ASHMEM_SIZE) {
+                Ok(fd) => fd,
+                Err(_) => return Reply::unknown_transaction(tr, "ashmem alloc failed"),
+            };
+            FD_REPLY_FDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(fd);
+            parcel.extend_from_slice(&1u32.to_ne_bytes()); // presence
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // hasComm
+            push_flat_fd(&mut parcel, &mut objects, fd);
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   -> ParcelFileDescriptor fd={fd} for {} code {}\n",
+                    name_for_handle(tr.target_handle).unwrap_or_default(), tr.code
+                ));
+            }
+        }
+    }
+    if tr.target_handle == handle_for("package")
+        && (tr.code == IPM_GET_PROVIDER_INFO || tr.code == IPM_RESOLVE_CONTENT_PROVIDER)
+    {
+        // The request is `[interface token][ComponentName or authority][flags][userId]`,
+        // so the key is not the last thing in the parcel. Match the parcel
+        // against the keys we installed instead of trying to parse it. Keys are
+        // plain class names for `getProviderInfo` (code 15) and `auth:`-prefixed
+        // authorities for `resolveContentProvider` (code 41); the host installs
+        // both, and the prefix keeps a class name that happens to be a
+        // substring of an authority from matching the wrong transaction.
+        let want_authority = tr.code == IPM_RESOLVE_CONTENT_PROVIDER;
         let data = if tr.data_size > 0 && tr.data_ptr != 0 {
             Some(std::slice::from_raw_parts(
                 tr.data_ptr as *const u8,
@@ -3330,14 +4022,27 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             let entries = PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
             entries
                 .iter()
-                .find(|(name, _)| parcel_contains_utf16(data, name))
+                .find(|(name, _)| {
+                    if let Some(auth) = name.strip_prefix("auth:") {
+                        want_authority && parcel_contains_either(data, auth)
+                    } else {
+                        !want_authority && parcel_contains_either(data, name)
+                    }
+                })
                 .map(|(_, bytes)| bytes.clone())
         });
         if let Some(bytes) = entry {
+            provider_answered = true;
+            // `readTypedObject` on the caller side: presence word, then the
+            // marshalled `ProviderInfo` body.
             parcel.extend_from_slice(&1u32.to_ne_bytes());
             parcel.extend_from_slice(&bytes);
             if trace_enabled() {
-                diag(&format!("[binder]   -> ProviderInfo ({} bytes)\n", bytes.len()));
+                diag(&format!(
+                    "[binder]   -> ProviderInfo code={} ({} bytes)\n",
+                    tr.code,
+                    bytes.len()
+                ));
             }
         }
     }
@@ -3351,7 +4056,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     let resolve_code = *RESOLVE_CONTENT_PROVIDER_CODE.lock().unwrap_or_else(|e| e.into_inner());
-    if tr.target_handle == handle_for("package") && tr.code == resolve_code && tr.data_size > 0 && tr.data_ptr != 0 {
+    // The `auth:` entries above answer first; this authority map (installed
+    // with the code read from the API-37 Stub) covers the remaining case.
+    if !provider_answered && tr.target_handle == handle_for("package") && tr.code == resolve_code && tr.data_size > 0 && tr.data_ptr != 0 {
         let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
         let entry = provider_for_authority(data).and_then(|name| {
             PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).get(&name).cloned()
@@ -4032,6 +4739,9 @@ pub unsafe extern "C" fn __pengudroid_binder_set_application_info(ptr: *const u8
 
 /// `void __pengudroid_binder_set_provider_entry(const char *name, size_t name_len,
 ///                                            const uint8_t *bytes, size_t len)`
+///
+/// `name` is a class name, or an `auth:`-prefixed authority when the entry is
+/// meant for `resolveContentProvider` (IPM code 41).
 ///
 /// # Safety
 /// Both pointers must be readable for their stated lengths.
@@ -4827,6 +5537,42 @@ mod tests {
         }
     }
 
+    /// `getLatestVsyncEventData` (native-only AIDL code 4) answers the
+    /// `VsyncEventData` wire layout measured in the shipped libgui.so:
+    /// status, parcelable presence 1, preferred index 0, one frame timeline
+    /// whose deadline/expected time are the next 60 Hz pulse on
+    /// CLOCK_MONOTONIC. Unlike setVsyncRate/requestNextVsync it must not
+    /// push a vsync event into the stolen channel.
+    #[test]
+    fn display_event_connection_answers_vsync_event_data_without_sending() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("display_event_connection");
+        let data = service_request("android.gui.IDisplayEventConnection", "");
+        VSYNC_SEND_FDS.lock().unwrap().clear();
+        let before = monotonic_ns();
+        let reply = unsafe { make_reply(&transaction(target, IDEC_GET_LATEST_VSYNC_EVENT_DATA, &data), 1) };
+        let after = monotonic_ns();
+        assert_eq!(reply.flags, 0);
+        assert!(reply.objects.is_empty());
+        assert_eq!(reply.parcel.len(), 48);
+        assert_eq!(&reply.parcel[0..4], &0u32.to_ne_bytes()); // AIDL status OK
+        assert_eq!(&reply.parcel[4..8], &1u32.to_ne_bytes()); // parcelable presence
+        assert_eq!(&reply.parcel[8..16], &0i64.to_ne_bytes()); // preferred index
+        assert_eq!(&reply.parcel[16..20], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[20..24], &1u32.to_ne_bytes()); // one timeline
+        let vsync_id = i64::from_ne_bytes(reply.parcel[24..32].try_into().unwrap());
+        let deadline = i64::from_ne_bytes(reply.parcel[32..40].try_into().unwrap());
+        let expected = i64::from_ne_bytes(reply.parcel[40..48].try_into().unwrap());
+        assert_eq!(vsync_id, 1);
+        assert!(deadline >= before + VSYNC_FRAME_INTERVAL_NS && deadline <= after + VSYNC_FRAME_INTERVAL_NS);
+        assert_eq!(deadline, expected);
+        assert!(VSYNC_SEND_FDS.lock().unwrap().is_empty());
+        // Codes outside the measured set still refuse instead of inventing a reply.
+        for code in [0, 5, 6, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &data), 1) });
+        }
+    }
+
     /// The API-37 C++ `ISurfaceComposer` descriptor shares the SurfaceFlinger
     /// handle with the AIDL one. Its accepted tags answer with an empty body (the
     /// `status_t` travels in the reply header, not in a body status word), which
@@ -5214,6 +5960,430 @@ mod tests {
         }
     }
 
+    /// `shortcut`/`jobscheduler` methods returning `ParceledListSlice` must
+    /// answer `[presence=1][count=0]` once their codes are installed; before
+    /// installation, and for any other code, they refuse instead of letting a
+    /// status-only fallthrough decode as a null slice (the caller NPEs on
+    /// `getList()`).
+    #[test]
+    fn empty_list_services_answer_presence_one_count_zero_only_for_installed_codes() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("shortcut");
+        let jobsched = handle_for("jobscheduler");
+        {
+            let mut table = EMPTY_LIST_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&target);
+            table.remove(&jobsched);
+        }
+        let name = std::ffi::CString::new("shortcut").unwrap();
+        let codes = [23u32, 20];
+        // Uninstalled: the bare status-only fallthrough (presence decodes as
+        // 0 = null slice — the NPE the installation exists to prevent).
+        for code in codes {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel.len(), 8);
+            assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        }
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(std::ptr::null(), codes.as_ptr(), 2) });
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), std::ptr::null(), 2) });
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), codes.as_ptr(), 0) });
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), [0, 20].as_ptr(), 2) });
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), [23, 23].as_ptr(), 2) });
+        assert!(unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), codes.as_ptr(), 2) });
+        for code in codes {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            let mut expected: Vec<u8> = [0u32, 1, 0].into_iter().flat_map(u32::to_ne_bytes).collect();
+            expected.resize((expected.len() + 7) & !7, 0);
+            assert_eq!(reply.parcel, expected);
+            assert!(reply.objects.is_empty());
+        }
+        for code in [0, 1, 21, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        // The other service is untouched until its own installation.
+        let reply = unsafe { make_reply(&transaction(jobsched, 8, &[]), 1) };
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        let name = std::ffi::CString::new("jobscheduler").unwrap();
+        assert!(unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), [8, 17].as_ptr(), 2) });
+        let reply = unsafe { make_reply(&transaction(jobsched, 8, &[]), 1) };
+        let mut expected: Vec<u8> = [0u32, 1, 0].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        {
+            let mut table = EMPTY_LIST_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&target);
+            table.remove(&jobsched);
+        }
+    }
+
+    /// The hosted Play Billing interface answers installed codes with their
+    /// int or marshalled-Bundle body behind the status word, answers
+    /// `isBillingSupported` with RESPONSE_OK for `inapp`/`subs` and
+    /// BILLING_UNAVAILABLE otherwise (echoing apiVersion back made every
+    /// probe look unsupported, so BillingClient disconnected and retried
+    /// forever), and leaves unknown codes as a status-only fallthrough
+    /// (traced, never UNKNOWN_TRANSACTION: BillingClient retries forever on
+    /// a transport error).
+    #[test]
+    fn billing_service_answers_installed_codes_and_is_supported_by_type() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for(BILLING_SERVICE);
+        {
+            BILLING_REPLIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        }
+        // The interface descriptor answers the INTERFACE_TRANSACTION.
+        let reply = unsafe { make_reply(&transaction(target, IBINDER_INTERFACE_TRANSACTION, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        let descriptor = "com.android.vending.billing.IInAppBillingService";
+        let mut expected = (descriptor.len() as u32).to_ne_bytes().to_vec();
+        for unit in descriptor.encode_utf16() {
+            expected.extend_from_slice(&unit.to_ne_bytes());
+        }
+        expected.extend_from_slice(&[0, 0]);
+        expected.resize((expected.len() + 3) & !3, 0);
+        assert_eq!(reply.parcel, expected);
+        // Unknown code with nothing installed: status + exception-code
+        // fallthrough (proxies read the exception code unconditionally).
+        let reply = unsafe { make_reply(&transaction(target, 3, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+        // Install isBillingSupported (code 1) plus an int (5) and a Bundle (2).
+        assert!(__pengudroid_binder_set_billing_is_supported(1));
+        assert!(__pengudroid_binder_set_billing_int(5, 0));
+        let bundle: Vec<u8> = vec![0x0a, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
+        assert!(unsafe { __pengudroid_binder_set_billing_bundle(2, bundle.as_ptr(), bundle.len()) });
+        assert!(!__pengudroid_binder_set_billing_is_supported(0));
+        assert!(!__pengudroid_binder_set_billing_int(0, 0));
+        assert!(unsafe { !__pengudroid_binder_set_billing_bundle(2, std::ptr::null(), 4) });
+        // Build a request parcel: [len][token utf16][NUL][pad][apiVersion=3]
+        // [String16 packageName][String16 type].
+        let descriptor = "com.android.vending.billing.IInAppBillingService";
+        let write_string16 = |data: &mut Vec<u8>, s: &str| {
+            data.extend_from_slice(&(s.len() as u32).to_ne_bytes());
+            for unit in s.encode_utf16() {
+                data.extend_from_slice(&unit.to_ne_bytes());
+            }
+            data.extend_from_slice(&[0, 0]);
+            while data.len() % 4 != 0 {
+                data.push(0);
+            }
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&(descriptor.len() as u32).to_ne_bytes());
+        for unit in descriptor.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&3i32.to_ne_bytes());
+        write_string16(&mut data, "com.example.game");
+        let head = data.clone();
+        write_string16(&mut data, "inapp");
+        let reply = unsafe { make_reply(&transaction(target, 1, &data), 1) };
+        assert_eq!(reply.flags, 0);
+        // isBillingSupported("inapp") -> RESPONSE_OK (0) behind the
+        // status word and the exception-code word.
+        let mut expected: Vec<u8> = [0u32, 0u32, 0u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // "subs" is supported too; an unknown type is BILLING_UNAVAILABLE (3).
+        let mut sub_data = head.clone();
+        write_string16(&mut sub_data, "subs");
+        let reply = unsafe { make_reply(&transaction(target, 1, &sub_data), 1) };
+        let mut expected: Vec<u8> = [0u32, 0u32, 0u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        let mut other_data = head;
+        write_string16(&mut other_data, "other");
+        let reply = unsafe { make_reply(&transaction(target, 1, &other_data), 1) };
+        let mut expected: Vec<u8> = [0u32, 0u32, 3u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Int reply: status + exception-code words then the installed int.
+        let reply = unsafe { make_reply(&transaction(target, 5, &data), 1) };
+        let mut expected: Vec<u8> = [0u32, 0u32, 0u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Bundle reply: status + exception-code words then the marshalled
+        // bytes verbatim, so readBundle's length read lands on the real
+        // bundle length instead of the "BNDL" magic.
+        let reply = unsafe { make_reply(&transaction(target, 2, &data), 1) };
+        let mut expected: Vec<u8> = 0u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&0u32.to_ne_bytes());
+        expected.extend_from_slice(&bundle);
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // A code with no installed reply stays a status+exception fallthrough.
+        let reply = unsafe { make_reply(&transaction(target, 9, &data), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+        {
+            BILLING_REPLIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        }
+    }
+
+    /// `IPackageManager.queryIntentServices` answers vending-targeted probes
+    /// with the installed `ParceledListSlice` body behind `[status][presence]`,
+    /// but only when the request parcel names `com.android.vending`; other
+    /// queries on the same code keep the status-only fallthrough.
+    #[test]
+    fn package_service_answers_vending_query_with_installed_slice() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("package");
+        *VENDING_QUERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Setter validation: code 0 and null/empty payloads are rejected.
+        let body: Vec<u8> = vec![1, 0, 0, 0, 2, 3, 4, 5];
+        assert!(!unsafe { __pengudroid_binder_set_vending_query_reply(0, body.as_ptr(), body.len()) });
+        assert!(unsafe { !__pengudroid_binder_set_vending_query_reply(34, std::ptr::null(), 4) });
+        assert!(unsafe { !__pengudroid_binder_set_vending_query_reply(34, body.as_ptr(), 0) });
+        assert!(unsafe { __pengudroid_binder_set_vending_query_reply(34, body.as_ptr(), body.len()) });
+        // A request parcel whose Intent carries package com.android.vending.
+        let mut data = Vec::new();
+        data.extend_from_slice(&3i32.to_ne_bytes()); // interface token length placeholder
+        let action = "com.android.vending.billing.IInAppBillingService.BIND";
+        data.extend_from_slice(&(action.len() as u32).to_ne_bytes());
+        for unit in action.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        let pkg = "com.android.vending";
+        data.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+        for unit in pkg.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        let reply = unsafe { make_reply(&transaction(target, 34, &data), 1) };
+        assert_eq!(reply.flags, 0);
+        let mut expected: Vec<u8> = 0u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&1u32.to_ne_bytes());
+        expected.extend_from_slice(&body);
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Same code but a different package in the Intent: fallthrough only.
+        let other_action = "com.example.other.billing.IInAppBillingService.BIND";
+        let mut other = Vec::new();
+        other.extend_from_slice(&(other_action.len() as u32).to_ne_bytes());
+        for unit in other_action.encode_utf16() {
+            other.extend_from_slice(&unit.to_ne_bytes());
+        }
+        other.extend_from_slice(&[0, 0]);
+        while other.len() % 4 != 0 {
+            other.push(0);
+        }
+        let pkg = "com.example.other";
+        other.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+        for unit in pkg.encode_utf16() {
+            other.extend_from_slice(&unit.to_ne_bytes());
+        }
+        other.extend_from_slice(&[0, 0]);
+        while other.len() % 4 != 0 {
+            other.push(0);
+        }
+        let reply = unsafe { make_reply(&transaction(target, 34, &other), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        // The same probe marshalled with 8-bit strings also matches.
+        let mut data8 = Vec::new();
+        data8.extend_from_slice(&(action.len() as u32).to_ne_bytes());
+        data8.extend_from_slice(action.as_bytes());
+        data8.push(0);
+        while data8.len() % 4 != 0 {
+            data8.push(0);
+        }
+        data8.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+        data8.extend_from_slice(pkg.as_bytes());
+        data8.push(0);
+        while data8.len() % 4 != 0 {
+            data8.push(0);
+        }
+        assert!(unsafe { __pengudroid_binder_set_vending_query_reply(34, body.as_ptr(), body.len()) });
+        let reply = unsafe { make_reply(&transaction(target, 34, &data8), 1) };
+        assert_eq!(reply.parcel.len(), 8 + body.len().div_ceil(8) * 8);
+        // A different code on the package handle is untouched too.
+        let reply = unsafe { make_reply(&transaction(target, 36, &data), 1) };
+        assert_eq!(reply.parcel.len(), 8);
+        *VENDING_QUERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Without an installed reply the vending probe also falls through.
+        let reply = unsafe { make_reply(&transaction(target, 34, &data), 1) };
+        assert_eq!(reply.parcel.len(), 8);
+    }
+
+    /// `IPackageManager.resolveContentProvider` (code 41) answers with the
+    /// installed `ProviderInfo` behind `[status][presence]` when the request
+    /// parcel names an installed `auth:` authority, in either string encoding;
+    /// class-name keys must NOT match code 41 and authority keys must NOT
+    /// match `getProviderInfo` (code 15).
+    #[test]
+    fn package_service_answers_resolve_content_provider_by_authority() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("package");
+        PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let body: Vec<u8> = vec![9, 8, 7, 6, 5, 4, 3, 2, 1];
+        let class_key = "com.combosdk.module.share.sora.ShareProvider";
+        let auth_key = "auth:com.miHoYo.GenshinImpact.combosdk.ShareProvider";
+        unsafe {
+            __pengudroid_binder_set_provider_entry(
+                class_key.as_ptr(),
+                class_key.len(),
+                body.as_ptr(),
+                body.len(),
+            )
+        };
+        unsafe {
+            __pengudroid_binder_set_provider_entry(
+                auth_key.as_ptr(),
+                auth_key.len(),
+                body.as_ptr(),
+                body.len(),
+            )
+        };
+        // Request parcel: [token][authority String16][flags:long][userId].
+        let authority = "com.miHoYo.GenshinImpact.combosdk.ShareProvider";
+        let mut data = Vec::new();
+        data.extend_from_slice(&35u32.to_ne_bytes());
+        let token = "android.content.pm.IPackageManager";
+        for unit in token.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&(authority.len() as u32).to_ne_bytes());
+        for unit in authority.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&0x8000u64.to_ne_bytes()); // GET_META_DATA
+        data.extend_from_slice(&0u32.to_ne_bytes()); // userId
+        let reply = unsafe { make_reply(&transaction(target, 41, &data), 1) };
+        let mut expected: Vec<u8> = 0u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&1u32.to_ne_bytes());
+        expected.extend_from_slice(&body);
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Same authority marshalled as String8 (8-bit) also matches.
+        let mut data8 = Vec::new();
+        data8.extend_from_slice(&(authority.len() as u32).to_ne_bytes());
+        data8.extend_from_slice(authority.as_bytes());
+        data8.push(0);
+        while data8.len() % 4 != 0 {
+            data8.push(0);
+        }
+        data8.extend_from_slice(&0x8000u64.to_ne_bytes());
+        data8.extend_from_slice(&0u32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 41, &data8), 1) };
+        assert_eq!(reply.parcel, expected);
+        // getProviderInfo (code 15) with a ComponentName must NOT match the
+        // authority key, and code 41 must NOT match the class-name key.
+        let mut cn = Vec::new();
+        let pkg = "com.miHoYo.GenshinImpact";
+        cn.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+        for unit in pkg.encode_utf16() {
+            cn.extend_from_slice(&unit.to_ne_bytes());
+        }
+        cn.extend_from_slice(&[0, 0]);
+        while cn.len() % 4 != 0 {
+            cn.push(0);
+        }
+        cn.extend_from_slice(&(class_key.len() as u32).to_ne_bytes());
+        for unit in class_key.encode_utf16() {
+            cn.extend_from_slice(&unit.to_ne_bytes());
+        }
+        cn.extend_from_slice(&[0, 0]);
+        while cn.len() % 4 != 0 {
+            cn.push(0);
+        }
+        cn.extend_from_slice(&0x8000u64.to_ne_bytes());
+        cn.extend_from_slice(&0u32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 15, &cn), 1) };
+        assert_eq!(reply.parcel, expected); // class-name key still matches code 15
+        // Code 41 with a parcel that names only the class name (no authority
+        // key present) falls through: class keys are excluded for code 41.
+        let reply = unsafe { make_reply(&transaction(target, 41, &cn), 1) };
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// `graphicsstats.requestBufferForProcess` must answer with a present
+    /// `ParcelFileDescriptor` (`[presence=1][hasComm=0][flat fd]`) so
+    /// `HardwareRenderer` does not NPE on `getFd()`; the fd must name a real
+    /// ashmem-sized region because the client checks
+    /// "Ashmem region is too small".
+    #[test]
+    fn fd_services_answer_presence_one_hascomm_zero_flat_fd_only_for_installed_codes() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("graphicsstats");
+        {
+            let mut table = FD_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&target);
+        }
+        let fds_before = FD_REPLY_FDS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let name = std::ffi::CString::new("graphicsstats").unwrap();
+        let codes = [1u32];
+        // Uninstalled: bare status-only fallthrough (presence decodes as 0).
+        let reply = unsafe { make_reply(&transaction(target, 1, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert!(reply.objects.is_empty());
+        assert!(!unsafe { __pengudroid_binder_set_fd_transactions(std::ptr::null(), codes.as_ptr(), 1) });
+        assert!(!unsafe { __pengudroid_binder_set_fd_transactions(name.as_ptr(), std::ptr::null(), 1) });
+        assert!(!unsafe { __pengudroid_binder_set_fd_transactions(name.as_ptr(), codes.as_ptr(), 0) });
+        assert!(!unsafe { __pengudroid_binder_set_fd_transactions(name.as_ptr(), [0].as_ptr(), 1) });
+        assert!(unsafe { __pengudroid_binder_set_fd_transactions(name.as_ptr(), codes.as_ptr(), 1) });
+        let reply = unsafe { make_reply(&transaction(target, 1, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.objects.len(), 1);
+        let mut expected: Vec<u8> = [0u32, 1, 0].into_iter().flat_map(u32::to_ne_bytes).collect();
+        // status + presence + hasComm, then the flat fd object (24 bytes).
+        let flat_off = expected.len();
+        expected.extend_from_slice(&BINDER_TYPE_FD.to_ne_bytes());
+        expected.extend_from_slice(&0x7fu32.to_ne_bytes());
+        let fd = {
+            let fds = FD_REPLY_FDS.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(fds.len(), fds_before + 1);
+            *fds.last().unwrap()
+        };
+        expected.extend_from_slice(&(fd as u32).to_ne_bytes());
+        expected.extend_from_slice(&0u32.to_ne_bytes());
+        expected.extend_from_slice(&0u64.to_ne_bytes());
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        assert_eq!(reply.objects, vec![flat_off as u64]);
+        // The handed-out fd is a real region of nGetAshmemSize() bytes.
+        let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+        assert_eq!(size, GFXSTATS_ASHMEM_SIZE as i64);
+        for code in [0, 2, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        {
+            let mut table = FD_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&target);
+        }
+    }
+
     #[test]
     fn input_requires_installed_codes_and_rejects_unknown_or_malformed_requests() {
         fn request(args: &[i32]) -> Vec<u8> {
@@ -5228,18 +6398,18 @@ mod tests {
         let _device_restore = reset_table(&VIRTUAL_INPUT_DEVICE, 0x1234_5678u32.to_ne_bytes().to_vec());
         let target = handle_for("input");
         let data = request(&[-1]);
-        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 101, 203, 9999] {
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 8, 101, 203, 9999] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &data), 1) });
         }
         // API 37 has no isInputDeviceEnabled method; its zero slot is not a code.
-        let codes = [101, 203, 0, 409, 503, 607, 709, 809];
-        assert!(!unsafe { __pengudroid_binder_set_input_transactions(std::ptr::null(), 8) });
-        for len in [0, 7, 9] {
+        let codes = [101, 203, 0, 409, 503, 607, 709, 809, 909];
+        assert!(!unsafe { __pengudroid_binder_set_input_transactions(std::ptr::null(), 9) });
+        for len in [0, 8, 10] {
             assert!(!unsafe { __pengudroid_binder_set_input_transactions(codes.as_ptr(), len) });
         }
         assert_eq!(*INPUT_TRANSACTION_CODES.lock().unwrap(), None);
         assert!(unsafe { __pengudroid_binder_set_input_transactions(codes.as_ptr(), codes.len()) });
-        for i in 0..8 {
+        for i in 0..9 {
             for invalid in [0, 0x00ff_fffe, 0x00ff_ffff, 0x0100_0000] {
                 if i == 2 && invalid == 0 { continue; }
                 let mut bad = codes;
@@ -5271,7 +6441,14 @@ mod tests {
             assert_eq!(reply.parcel, expected);
             assert!(reply.objects.is_empty());
         }
-        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 9999] {
+        // Op 8 (getVelocityTrackerStrategy, code 909) answers a parcelled
+        // "default" string instead of an int; ops beyond the installed table
+        // still refuse.
+        let strategy = unsafe { make_reply(&transaction(target, 909, &request(&[-1])), 1) };
+        let slen = u32::from_le_bytes(strategy.parcel[4..8].try_into().unwrap()) as usize;
+        assert_eq!(slen, 7);
+        assert_eq!(&strategy.parcel[8..8 + slen * 2], b"d\0e\0f\0a\0u\0l\0t\0");
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 8, 9999] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &data), 1) });
         }
         for args in [vec![], vec![-1, 0, -1], vec![-1, 0, 769], vec![-1, 0, 1, 29]] {
@@ -5414,6 +6591,71 @@ mod tests {
         }
     }
 
+    /// The hosted session's setters have no `system_server` peer, so they
+    /// record what the app reported instead of being forwarded, and
+    /// `isPlaybackActive` answers from that record rather than inventing
+    /// playback. Codes come from the loaded `ISession$Stub`; 0 means "this
+    /// framework revision does not declare the method" and never dispatches.
+    #[test]
+    fn media_session_setters_record_reported_state_only() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&MEDIA_TRANSACTION_CODES, None);
+        let _session_restore = reset_table(&MEDIA_SESSION_TRANSACTIONS, None);
+        MEDIA_SESSION.reset();
+        let session = handle_for("media_session_session");
+        let setters = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+        assert!(!unsafe { __pengudroid_binder_set_media_session_transactions(std::ptr::null(), setters.len()) });
+        assert!(!unsafe { __pengudroid_binder_set_media_session_transactions(setters.as_ptr(), setters.len() - 1) });
+        let mut duplicate = setters;
+        duplicate[5] = setters[4];
+        assert!(!unsafe { __pengudroid_binder_set_media_session_transactions(duplicate.as_ptr(), duplicate.len()) });
+        let mut out_of_range = setters;
+        out_of_range[10] = 0x00ff_fffe;
+        assert!(!unsafe { __pengudroid_binder_set_media_session_transactions(out_of_range.as_ptr(), out_of_range.len()) });
+        assert_eq!(*MEDIA_SESSION_TRANSACTIONS.lock().unwrap(), None);
+        for code in setters {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(session, code, &[]), 1) });
+        }
+        // The host installs both tables; the media table must be present for
+        // the session block to be entered at all.
+        let media = [101, 102, 103, 104];
+        assert!(unsafe { __pengudroid_binder_set_media_transactions(media.as_ptr(), media.len()) });
+
+        assert!(unsafe { __pengudroid_binder_set_media_session_transactions(setters.as_ptr(), setters.len()) });
+        let word = 5i32.to_ne_bytes();
+        // A setter answers with a bare status word (padded to 8 bytes): AIDL void.
+        let void_reply = [0u8; 8];
+        for code in [11, 13, 15, 20] {
+            let reply = unsafe { make_reply(&transaction(session, code, &word), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel, void_reply);
+        }
+        assert!(MEDIA_SESSION.playback_active());
+        assert_eq!((MEDIA_SESSION.flags(), MEDIA_SESSION.volume()), (5, 5));
+        let reply = unsafe { make_reply(&transaction(session, 21, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel, [0i32, 1].into_iter().flat_map(i32::to_ne_bytes).collect::<Vec<u8>>());
+
+        // A disconnect ends the session, so a reused handle reports nothing.
+        let reply = unsafe { make_reply(&transaction(session, 12, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel, void_reply);
+        assert!(!MEDIA_SESSION.playback_active());
+        assert_eq!((MEDIA_SESSION.flags(), MEDIA_SESSION.volume()), (0, 0));
+        let reply = unsafe { make_reply(&transaction(session, 21, &[]), 1) };
+        assert_eq!(reply.parcel, [0i32, 0].into_iter().flat_map(i32::to_ne_bytes).collect::<Vec<u8>>());
+
+        // A method this framework revision omits is installed as 0 and refused.
+        let mut sparse = setters;
+        sparse[4] = 0;
+        assert!(unsafe { __pengudroid_binder_set_media_session_transactions(sparse.as_ptr(), sparse.len()) });
+        assert_unknown_transaction(unsafe { make_reply(&transaction(session, 15, &word), 1) });
+        let reply = unsafe { make_reply(&transaction(session, 20, &word), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel, void_reply);
+        assert_eq!(MEDIA_SESSION.volume(), 5);
+    }
+
     /// `MediaMetricsManager.createPlaybackSession` turns the reply to
     /// `getPlaybackSessionId` into a `PlaybackSession`, whose `@NonNull`
     /// validation throws an NPE on a null id — and ExoPlayer 2.18 builds such a
@@ -5460,12 +6702,13 @@ mod tests {
         let _restore = reset_table(&AUDIO_FOCUS_TRANSACTIONS, None);
         let target = handle_for("audio");
         AUDIO_FOCUS.abandon();
-        for code in [0, 66, 67, 68, 69, 101, 203, 307, 409] {
+        for code in [0, 66, 67, 68, 69, 101, 203, 307, 409, 511, 613] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
         }
-        assert!(__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409));
-        assert!(!__pengudroid_binder_set_audio_focus_transactions(0, 203, 307, 409));
-        assert!(!__pengudroid_binder_set_audio_focus_transactions(101, 101, 307, 409));
+        assert!(__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409, 511, 613));
+        assert!(!__pengudroid_binder_set_audio_focus_transactions(0, 203, 307, 409, 511, 613));
+        assert!(!__pengudroid_binder_set_audio_focus_transactions(101, 101, 307, 409, 511, 613));
+        assert!(!__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409, 101, 613));
         AUDIO_FOCUS.request(3);
         for code in [0, 66, 67, 68, 69, 9999] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
@@ -5487,6 +6730,177 @@ mod tests {
         let reply = unsafe { make_reply(&transaction(target, 101, &[]), 1) };
         assert_eq!(reply.flags, 0);
         assert_eq!(&reply.parcel[4..8], &0i32.to_ne_bytes());
+        // Capture policy: defaults to ALLOW_CAPTURE_BY_ALL (1); a valid
+        // 1..=3 is stored and returns SUCCESS (0), anything else is
+        // ERROR_BAD_VALUE (-2) and leaves the previous policy alone.
+        let restore_policy = CAPTURE_POLICY.set(1);
+        assert_eq!(restore_policy, 0);
+        let reply = unsafe { make_reply(&transaction(target, 613, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &1i32.to_ne_bytes());
+        // The policy argument sits after the `android.media.IAudioService`
+        // interface token; a bare-int parcel has no token and is rejected.
+        fn with_policy(policy: i32) -> Vec<u8> {
+            // Real parcels carry only the interface token, then the args.
+            let mut p = Vec::new();
+            p.extend_from_slice(&0x8000_0000u32.to_ne_bytes());
+            p.extend_from_slice(&u32::MAX.to_ne_bytes());
+            p.extend_from_slice(&0x5359_5354u32.to_ne_bytes());
+            p.extend_from_slice(&string16("android.media.IAudioService"));
+            p.extend_from_slice(&policy.to_ne_bytes());
+            p
+        }
+        let reply = unsafe { make_reply(&transaction(target, 511, &with_policy(3)), 1) };
+        assert_eq!(&reply.parcel[4..8], &0i32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 613, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &3i32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 511, &with_policy(7)), 1) };
+        assert_eq!(&reply.parcel[4..8], &(-2i32).to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 613, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &3i32.to_ne_bytes());
+        let bare_int = 1i32.to_ne_bytes().to_vec();
+        let reply = unsafe { make_reply(&transaction(target, 511, &bare_int), 1) };
+        assert_eq!(&reply.parcel[4..8], &(-2i32).to_ne_bytes());
+        CAPTURE_POLICY.set(1);
+    }
+
+    /// `AudioTrack` opens a stream through `trackPlayer` and reads an int
+    /// player id from the reply (0 is rejected by `PlayerBase`); the event and
+    /// release methods are void. Only the installed codes may answer, and the
+    /// track methods must return distinct positive ids.
+    #[test]
+    fn audio_player_track_methods_return_fresh_ids_only_for_installed_codes() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&AUDIO_PLAYER_TRANSACTIONS, None);
+        let target = handle_for("audio");
+        // Focus table must exist for the audio branch to run at all.
+        let _focus = reset_table(&AUDIO_FOCUS_TRANSACTIONS, None);
+        assert!(__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409, 511, 613));
+        for code in [0, 2, 3, 4, 5, 6, 7, 8, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        // trackPlayer=2, playerAttributes=3, playerEvent=4, releasePlayer=5,
+        // trackRecorder=6, recorderEvent=7, releaseRecorder=8.
+        assert!(unsafe { __pengudroid_binder_set_audio_player_transactions(2, 3, 4, 5, 6, 7, 8) });
+        assert!(!unsafe { __pengudroid_binder_set_audio_player_transactions(2, 2, 4, 5, 6, 7, 8) });
+        assert!(!unsafe { __pengudroid_binder_set_audio_player_transactions(0, 3, 4, 5, 6, 7, 8) });
+        let reply = unsafe { make_reply(&transaction(target, 2, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        let first: i32 = i32::from_ne_bytes(reply.parcel[4..8].try_into().unwrap());
+        assert!(first > 0, "trackPlayer must not answer id 0: {first}");
+        let reply = unsafe { make_reply(&transaction(target, 6, &[]), 1) };
+        let second: i32 = i32::from_ne_bytes(reply.parcel[4..8].try_into().unwrap());
+        assert!(second > 0 && second != first, "trackRecorder id {second} must differ from {first}");
+        // Void methods answer status-only (the reply is the 4-byte status plus
+        // 8-byte-alignment padding).
+        for code in [3, 4, 5, 7, 8] {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel.len(), 8, "code {code} must be void");
+            assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+        }
+        // Unknown codes still fall through.
+        assert_unknown_transaction(unsafe { make_reply(&transaction(target, 9, &[]), 1) });
+    }
+
+    /// `AudioManager.updateAudioPortCache` polls `listAudioPorts` and then
+    /// `listAudioPatches` on the audio policy service for the life of the
+    /// process. Until this table existed each transaction fell through to an
+    /// empty success: the framework read a count out of nothing and logged
+    /// `AudioSystem: listAudioPorts … Failed` 1,123 times in a 150 s BBR2 run,
+    /// then repeated the same failure for `listAudioPatches`. The reply must be
+    /// an empty list rather than a fabricated entry, and only the installed
+    /// codes may answer.
+    #[test]
+    fn audio_policy_lists_no_ports_only_for_the_installed_code() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&AUDIO_POLICY_EMPTY_LISTS, ([0; 4], 0));
+        let target = handle_for("media.audio_policy");
+        let (ports, patches) = (51u32, 52u32);
+        // Uninstalled: the fallthrough stays exactly as it was (status only),
+        // so a renamed field degrades to today's behaviour, not to a wrong reply.
+        let reply = unsafe { make_reply(&transaction(target, ports, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(reply.parcel.len(), 8); // status + padding, never a list
+        let set = |codes: &[u32]| unsafe {
+            __pengudroid_binder_set_audio_policy_transactions(codes.as_ptr(), codes.len())
+        };
+        assert!(!unsafe { __pengudroid_binder_set_audio_policy_transactions(std::ptr::null(), 1) });
+        assert!(!set(&[]));
+        assert!(!set(&[ports, patches, 1, 2, 3]));
+        assert!(!set(&[0]));
+        assert!(!set(&[0x00ff_fffe]));
+        assert!(!set(&[ports, ports])); // duplicates install nothing
+        assert_eq!(audio_policy_empty_lists().1, 0);
+        assert!(set(&[ports, patches]));
+        assert_eq!(audio_policy_empty_lists(), ([ports, patches, 0, 0], 2));
+        for code in [ports, patches] {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes()); // AIDL status OK
+            assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes()); // empty list
+            assert_eq!(&reply.parcel[8..12], &0u32.to_ne_bytes()); // generation 0
+        }
+        // Other audio-policy methods are untouched: `getOutputForAttr` must not
+        // be told "no ports" and then be handed a zero handle.
+        let reply = unsafe { make_reply(&transaction(target, 900, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        // The codes belong to this Stub only.
+        let reply = unsafe { make_reply(&transaction(handle_for("audio"), ports, &[]), 1) };
+        assert_unknown_transaction(reply);
+    }
+
+    /// `AudioSystem.getAttributesForStreamType` asks the audio policy service
+    /// (third installed code) for an `AudioAttributes` typed object; a
+    /// status-only reply decodes as null and logs `getAttributesForStreamType
+    /// Failed` on every AudioTrack setup in BBR2. The reply must be
+    /// `[present=1][marshalled AudioAttributes]` and only when the host
+    /// installed a payload — otherwise the fallthrough stays null.
+    #[test]
+    fn audio_policy_serves_installed_attributes_for_the_third_code() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&AUDIO_POLICY_EMPTY_LISTS, ([0; 4], 0));
+        let mut attrs = AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::take(&mut *attrs);
+        drop(attrs);
+        let target = handle_for("media.audio_policy");
+        let (ports, patches, attrs_code) = (51u32, 52u32, 87u32);
+        let set = |codes: &[u32]| unsafe {
+            __pengudroid_binder_set_audio_policy_transactions(codes.as_ptr(), codes.len())
+        };
+        assert!(set(&[ports, patches, attrs_code]));
+        // No payload installed: the attributes code falls through to null.
+        let reply = unsafe { make_reply(&transaction(target, attrs_code, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8); // status + padding, no typed object
+        // With a payload: status + presence + bytes.
+        let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        unsafe { __pengudroid_binder_set_audio_attributes(payload.as_ptr(), payload.len()) };
+        let reply = unsafe { make_reply(&transaction(target, attrs_code, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &1u32.to_ne_bytes()); // present
+        assert_eq!(&reply.parcel[8..8 + payload.len()], &payload[..]);
+        // The empty-list codes still answer the empty list, not the attributes.
+        let reply = unsafe { make_reply(&transaction(target, ports, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[8..12], &0u32.to_ne_bytes());
+        // The fourth installed code is getStreamTypeForAttributes: a bare int
+        // reply of STREAM_MUSIC (3), never the attributes payload.
+        let stream_code = 88u32;
+        assert!(set(&[ports, patches, attrs_code, stream_code]));
+        let reply = unsafe { make_reply(&transaction(target, stream_code, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &3u32.to_ne_bytes());
+        assert_eq!(reply.parcel.len(), 8);
+        // With only three codes installed the stream code keeps the fallthrough.
+        assert!(set(&[ports, patches, attrs_code]));
+        let reply = unsafe { make_reply(&transaction(target, stream_code, &[]), 1) };
+        assert_eq!(reply.parcel.len(), 8); // status + padding only
+        unsafe { __pengudroid_binder_set_audio_attributes(std::ptr::null(), 0) }; // ignored
+        *AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner()) = old;
     }
 
     /// `Settings.NameValueCache` reads `Bundle.getString("value")` from the

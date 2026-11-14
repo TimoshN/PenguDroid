@@ -22,30 +22,49 @@ mod webview;
 
 /// The PenguDroid surface geometry, in pixels.
 ///
-/// This is the one place the size is written down. Everything that has to agree
-/// about it reads these: the `DisplayInfo` the framework sees, the
-/// `SurfaceControl` handed to `ViewRootImpl`, the window frame, and (through
-/// `PENGUDROID_SURFACE_W`/`_H`, which `art_test` mirrors) the EGL surface the
-/// gleshim renders into. Before this existed the defaults disagreed — portrait in
-/// two places and landscape in two others — so hwui rendered 1280x720 into an
-/// FBO the window frame described as 720x1280.
-const SURFACE_W: i32 = 720;
-const SURFACE_H: i32 = 1280;
+/// The size is not a constant here: the launcher picks it from `--width`/
+/// `--height` (see [`crate::geometry`]) and exports
+/// `PENGUDROID_SURFACE_W`/`_H`/`_DENSITY_DPI`. Everything that has to agree
+/// about it reads these accessors: the `DisplayInfo` the framework sees, the
+/// `SurfaceControl` handed to `ViewRootImpl`, the window frame, and the EGL
+/// surface the gleshim renders into. Before this existed the defaults disagreed
+/// — portrait in two places and landscape in two others — so hwui rendered
+/// 1280x720 into an FBO the window frame described as 720x1280.
+///
+/// The density is part of the same policy. Everything the framework lays out is
+/// scaled by it (`dp = px * 160 / dpi`), so a 1024x768 window at 320 dpi would
+/// report only 512x384 dp and lay out like a phone in a big frame; the policy
+/// lowers the density until such a window reports at least 600 dp on its short
+/// side and the framework switches to tablet layouts.
+fn geometry() -> crate::geometry::Geometry {
+    crate::geometry::Geometry::from_env()
+}
+
+/// Surface width in pixels.
+fn surface_w() -> i32 {
+    geometry().width
+}
+
+/// Surface height in pixels.
+fn surface_h() -> i32 {
+    geometry().height
+}
 
 /// The display density, in dpi.
-///
-/// Everything the framework lays out is scaled by this: `dp = px * 160 / dpi`.
-/// At 320 dpi the surface is 360x640 dp, which is a conventional small phone.
-/// It used to be 420 dpi while the dp fields were still the *landscape* 1280x720
-/// values, so the app believed it had a 487x274 dp screen — and a Material
-/// `AlertDialog`, whose minimum width is 280 dp, came out wider than the 274 dp
-/// it thought it had and was clipped by the surface edge.
-const DENSITY_DPI: i32 = 320;
+fn density_dpi() -> i32 {
+    geometry().density_dpi
+}
 
-/// The surface width in dp.
-const SURFACE_W_DP: i32 = SURFACE_W * 160 / DENSITY_DPI;
+/// The surface width in dp (`Configuration.screenWidthDp`).
+fn surface_w_dp() -> i32 {
+    geometry().width_dp()
+}
+
 /// The surface height in dp.
-const SURFACE_H_DP: i32 = SURFACE_H * 160 / DENSITY_DPI;
+fn surface_h_dp() -> i32 {
+    geometry().height_dp()
+}
+
 use std::path::Path;
 
 use crate::jni::{JClass, JFieldId, JMethodId, JObject, JValue, JniEnv};
@@ -200,11 +219,38 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
     // ever drawn. `FLAG_HAS_CODE` (0x4) and `FLAG_SUPPORTS_SCREEN_DENSITIES`
     // (0x2000) are what a normal APK declares.
     set_int("flags", 0x1000_0000 | 0x2000 | 0x4);
-    // `<application>`'s own `<meta-data>`. Google Play services, Firebase and
-    // most SDK initializers read their configuration from here.
-    if let Some(bundle) = build_meta_bundle(env, spec.application_meta) {
-        if let Some(id) = env.field_id(class, "metaData", "Landroid/os/Bundle;") {
-            env.set_object_field(info, id, bundle);
+    // `BillingClient$Builder.build()` calls `metaData.getBoolean(...)` straight
+    // off ApplicationInfo; a null metaData NPEs there (seen in BBR2's
+    // VuBillingHelper). Fill it from the manifest's `<application>` meta-data:
+    // GMS reads `com.google.android.gms.version` out of it and throws when the
+    // tag is missing entirely (seen in Genshin's `OSParamsProvider.attachInfo`).
+    if let Some(id) = env.field_id(class, "metaData", "Landroid/os/Bundle;") {
+        // `android:value="@integer/..."` references must land in the Bundle as
+        // the resolved literal (GMS compares against 12451000, not the 0x7f id),
+        // while `android:resource` ids stay raw. Resolve value references
+        // through the APK's own resources.arsc here; provider meta-data is
+        // built separately and keeps its ids.
+        let arsc = crate::apk::extract_named(&spec.apk.display().to_string(), "resources.arsc").ok();
+        let resolved: Vec<(String, crate::apk::MetaValue)> = spec
+            .application_meta
+            .iter()
+            .map(|(k, v)| {
+                let v = match (v, &arsc) {
+                    (crate::apk::MetaValue::ValueRef(r), Some(data)) => {
+                        crate::apk::resolve_value_reference(data, *r)
+                            .map(crate::apk::MetaValue::Int)
+                            .unwrap_or(crate::apk::MetaValue::Ref(*r))
+                    }
+                    _ => v.clone(),
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        let bundle = build_meta_bundle(env, &resolved)
+            .or_else(|| new_instance(env, "android/os/Bundle").map(|(_, b)| b));
+        match bundle {
+            Some(bundle) => env.set_object_field(info, id, bundle),
+            None => eprintln!("apphost: could not instantiate metaData Bundle"),
         }
     }
     // Read back the fields `LoadedApk` depends on: a silently failed write here
@@ -267,11 +313,11 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
             env.set_int_field(config, id, value);
         }
     };
-    set_int("densityDpi", DENSITY_DPI);
+    set_int("densityDpi", density_dpi());
     // Derived from the surface so the two can never disagree again.
-    set_int("screenWidthDp", SURFACE_W_DP);
-    set_int("screenHeightDp", SURFACE_H_DP);
-    set_int("smallestScreenWidthDp", SURFACE_W_DP.min(SURFACE_H_DP));
+    set_int("screenWidthDp", surface_w_dp());
+    set_int("screenHeightDp", surface_h_dp());
+    set_int("smallestScreenWidthDp", surface_w_dp().min(surface_h_dp()));
     // WindowLayout.computeFrames uses Configuration.windowConfiguration bounds
     // for local relayout, not DisplayInfo or screenWidthDp. Empty bounds made a
     // later relayoutAsync collapse a previously valid activity window to 0x0.
@@ -282,7 +328,7 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
     if window.is_null() { return None; }
     let rect_class = env.find_class("android/graphics/Rect")?;
     let ctor = env.method_id(rect_class, "<init>", "(IIII)V")?;
-    let coords = [JValue { i: 0 }, JValue { i: 0 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H }];
+    let coords = [JValue { i: 0 }, JValue { i: 0 }, JValue { i: surface_w() }, JValue { i: surface_h() }];
     let bounds = env.new_object(rect_class, ctor, &coords)?;
     if bounds.is_null() { return None; }
     let set_bounds = env.method_id(window_class, "setBounds", "(Landroid/graphics/Rect;)V")?;
@@ -388,7 +434,7 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
         }
     }
     if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
-        env.set_int_field(cfg, id, DENSITY_DPI);
+        env.set_int_field(cfg, id, density_dpi());
     }
     // `ResourcesManager` builds every new `Resources` from its process-wide
     // configuration, and `Resources.getSystem()` exposes that same instance.
@@ -411,7 +457,7 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
                         }
                     }
                     if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
-                        env.set_int_field(sys_cfg, id, DENSITY_DPI);
+                        env.set_int_field(sys_cfg, id, density_dpi());
                     }
                     if let Some(get_locales) = env.method_id(
                         cfg_class,
@@ -823,6 +869,7 @@ pub fn probe_platform_state(env: &JniEnv) -> bool {
         let _frame = env.local_frame(32)?;
         install_system_features_cache(env)?;
         install_media_transactions(env)?;
+        install_media_session_transactions(env)?;
         install_user_thermal_transactions(env)?;
         let class = env.find_class("android/content/pm/SystemFeaturesCache")?;
         let get = env.static_method_id(class, "getInstance", "()Landroid/content/pm/SystemFeaturesCache;")?;
@@ -868,12 +915,35 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot resolve Android 17 user/thermal service transactions");
         return false;
     }
+    // Non-fatal: without it BillingClient retries its bind forever, but a
+    // framework revision without the broker symbols must not block the launch.
+    if install_billing(env).is_none() {
+        eprintln!("apphost: hosted Play Billing replies unavailable; billing binds will stall");
+    }
+    if install_vending_query_reply(env).is_none() {
+        eprintln!("apphost: vending queryIntentServices reply unavailable; the billing probe will stall");
+    }
     if install_audio_focus_transactions(env).is_none() {
         eprintln!("apphost: cannot resolve framework audio focus transactions");
         return false;
     }
+    if install_audio_player_transactions(env).is_none() {
+        eprintln!("apphost: cannot resolve framework audio player transactions");
+        return false;
+    }
+    // Non-fatal: an empty audio-port cache only costs log noise, so a
+    // framework revision that renames the field must not block the launch.
+    if install_audio_policy_transactions(env).is_none() {
+        eprintln!("apphost: audio policy transaction codes unavailable; the framework audio-port cache stays empty");
+    } else {
+        install_audio_attributes_reply(env);
+    }
     if install_media_transactions(env).is_none() {
         eprintln!("apphost: cannot resolve Android 17 media session/metrics transactions");
+        return false;
+    }
+    if install_media_session_transactions(env).is_none() {
+        eprintln!("apphost: cannot resolve Android 17 media session setter transactions");
         return false;
     }
     if install_virtual_keyboard(env).is_none() {
@@ -1972,7 +2042,9 @@ const MAX_NUDGES: u32 = 3;
 const MAX_FORCE_PASSES: u32 = 4;
 
 fn spawn_resized_pump(env: &JniEnv) {
-    if std::env::var_os("PENGUDROID_PUMP_RESIZED").is_none() {
+    let pump = std::env::var_os("PENGUDROID_PUMP_RESIZED").is_some();
+    let follow = std::env::var_os("PENGUDROID_FOLLOW_RESIZE").is_some();
+    if !pump && !follow {
         return;
     }
     let Some(vm) = env.get_java_vm() else { return };
@@ -1984,11 +2056,193 @@ fn spawn_resized_pump(env: &JniEnv) {
         };
         let mut seen: std::collections::HashMap<usize, (i32, u32)> =
             std::collections::HashMap::new();
+        let mut follow = FollowResize::new();
         loop {
-            pump_resized(&env, &mut seen);
+            if pump {
+                pump_resized(&env, &mut seen);
+            }
+            if follow_enabled() {
+                follow.poll(&env);
+            }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     });
+}
+
+fn follow_enabled() -> bool {
+    std::env::var_os("PENGUDROID_FOLLOW_RESIZE").is_some()
+}
+
+/// `PENGUDROID_FOLLOW_RESIZE=1`: let the guest relayout when the window changes
+/// size.
+///
+/// The compositor keeps the guest's own buffer and only scales it into the new
+/// window, which is what keeps a resized game or video at its internal
+/// resolution — but it also means nothing ever tells the guest that the window
+/// moved. This asks the daemon what the surface is actually showing and, when
+/// that differs from the geometry the session published, publishes the new one
+/// and asks the window roots for a synchronous relayout: the reply then carries
+/// frames of the new size, and a window that crosses 600 dp switches tablet
+/// layouts (`Geometry::for_resize` keeps the density, so text does not rescale).
+struct FollowResize {
+    client: Option<crate::client::Client>,
+    surface_id: Option<u32>,
+    /// Last `display_width`/`display_height` published to the environment.
+    applied: Option<(u32, u32)>,
+    /// Consecutive failed polls, so a surface that goes away reports once and
+    /// then every ten seconds instead of on every tick.
+    failures: u32,
+}
+
+impl FollowResize {
+    fn new() -> Self {
+        FollowResize { client: None, surface_id: None, applied: None, failures: 0 }
+    }
+
+    fn poll(&mut self, env: &JniEnv) {
+        // The GL shim publishes this each time it creates a window. It is re-read
+        // on every tick because an app replaces its window — a splash handing over
+        // to the game — and the daemon keeps only the live one.
+        self.surface_id = ["PENGUDROID_LAST_SURFACE_ID", "PENGUDROID_SURFACE_ID"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().and_then(|v| v.parse().ok()));
+        let Some(surface_id) = self.surface_id else { return };
+        if self.client.is_none() {
+            self.client = crate::client::Client::connect()
+                .and_then(|c| {
+                    c.handshake(pengudroid_proto::Role::Cli)?;
+                    Ok(c)
+                })
+                .ok();
+            if self.client.is_none() {
+                return;
+            }
+        }
+        let sizes = match self.client.as_ref() {
+            Some(client) => client.surface_geometry(surface_id),
+            None => return,
+        };
+        let (_, _, display_w, display_h) = match sizes {
+            Ok(Some(sizes)) => sizes,
+            // Between two windows there is nothing to size against yet.
+            Ok(None) => return,
+            Err(e) => {
+                // A daemon that went away must not wedge the pump: drop the
+                // connection and try again on the next tick.
+                self.failures += 1;
+                if self.failures == 1 || self.failures % 40 == 0 {
+                    println!(
+                        "apphost: cannot read surface {surface_id} geometry via {}: {e}",
+                        pengudroid_proto::default_socket_path().display()
+                    );
+                }
+                self.client = None;
+                return;
+            }
+        };
+        if display_w == 0 || display_h == 0 {
+            return;
+        }
+        self.failures = 0;
+        if self.applied == Some((display_w, display_h)) {
+            return;
+        }
+        self.applied = Some((display_w, display_h));
+        let g = geometry().for_resize(display_w, display_h);
+        for (key, value) in g.export() {
+            std::env::set_var(key, value);
+        }
+        let roots = window_roots(env);
+        let mut poked = 0;
+        for root in &roots {
+            if poke_relayout(env, *root) {
+                poked += 1;
+            }
+        }
+        println!(
+            "apphost: window is now {display_w}x{display_h}; guest relayout at {}x{} px \
+             ({}x{} dp{}), {poked} root(s) poked",
+            g.width,
+            g.height,
+            g.width_dp(),
+            g.height_dp(),
+            if g.is_tablet() { ", tablet" } else { "" },
+        );
+    }
+}
+
+/// The `ViewRootImpl` of every window, in `WindowManagerGlobal.mViews` order.
+fn window_roots(env: &JniEnv) -> Vec<JObject> {
+    let mut roots = Vec::new();
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+        return roots;
+    };
+    let (Some(get_instance), Some(views_field)) = (
+        env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+        env.field_id(wmg_class, "mViews", "Ljava/util/ArrayList;"),
+    ) else {
+        return roots;
+    };
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+        return roots;
+    };
+    let views = env.object_field(wmg, views_field);
+    if views.is_null() {
+        return roots;
+    }
+    let Some(list_class) = env.find_class("java/util/ArrayList") else {
+        return roots;
+    };
+    let (Some(size_m), Some(get_m)) = (
+        env.method_id(list_class, "size", "()I"),
+        env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+    ) else {
+        return roots;
+    };
+    let Some(view_class) = env.find_class("android/view/View") else {
+        return roots;
+    };
+    let Some(get_root) = env.method_id(view_class, "getViewRootImpl", "()Landroid/view/ViewRootImpl;")
+    else {
+        return roots;
+    };
+    let count = env.call_int(views, size_m, &[]).unwrap_or(0);
+    for index in 0..count {
+        env.describe_exception();
+        let Some(view) = env.call_object(views, get_m, &[JValue { i: index as i32 }]) else {
+            continue;
+        };
+        if view.is_null() {
+            continue;
+        }
+        let Some(root) = env.call_object(view, get_root, &[]) else {
+            continue;
+        };
+        if !root.is_null() {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Ask one window for a relayout whose frames come from the window manager.
+fn poke_relayout(env: &JniEnv, root: JObject) -> bool {
+    let Some(vri_class) = env.find_class("android/view/ViewRootImpl") else {
+        return false;
+    };
+    // `relayoutAsync` is oneway, so the client keeps the frames it computed
+    // from a stale `mMeasuredWidth`. `mForceNextWindowRelayout` makes
+    // `performTraversals` call `IWindowSession.relayout`, whose reply the host
+    // fills from the geometry above.
+    if let Some(f) = env.field_id(vri_class, "mForceNextWindowRelayout", "Z") {
+        env.set_boolean_field(root, f, true);
+    }
+    if let Some(f) = env.field_id(vri_class, "mLayoutRequested", "Z") {
+        env.set_boolean_field(root, f, true);
+    }
+    env.method_id(vri_class, "scheduleTraversals", "()V")
+        .map(|m| env.call_void(root, m, &[]))
+        .unwrap_or(false)
 }
 
 /// `PENGUDROID_PUMP_RESIZED=1`: play the window manager's `IWindow.resized`.
@@ -3843,6 +4097,19 @@ impl ServiceHost {
     }
 
     fn dispatch(&mut self, request: ServiceRequest) {
+        // Play Billing binds with `Intent.setPackage("com.android.vending")`
+        // and no component, so there is no in-app Service to create. Answer
+        // with the broker-hosted IInAppBillingService binder instead.
+        if request.package == "com.android.vending" {
+            match self.service_manager_binder(BILLING_SERVICE_NAME) {
+                Some(binder) if !binder.is_null() => {
+                    println!("service: answering com.android.vending bind with the hosted billing binder");
+                    self.connect_dispatchers(&request, binder);
+                }
+                _ => eprintln!("service: hosted billing binder unavailable for {}", request.class),
+            }
+            return;
+        }
         let Some(intent) = self.request_intent(&request) else {
             return;
         };
@@ -4191,6 +4458,19 @@ impl ServiceHost {
             return None;
         }
         Some(intent)
+    }
+
+    /// Resolve a broker-hosted service through the framework's
+    /// `ServiceManager.getService`, which lands on the shim's handle-0
+    /// `IServiceManager.getService` and comes back as a `BinderProxy` for the
+    /// hosted handle.
+    fn service_manager_binder(&self, name: &str) -> Option<JObject> {
+        let sm = self.env.find_class("android/os/ServiceManager")?;
+        let get = self
+            .env
+            .static_method_id(sm, "getService", "(Ljava/lang/String;)Landroid/os/IBinder;")?;
+        self.env
+            .call_static_object(sm, get, &[JValue { l: self.env.new_string(name) }])
     }
 
     fn component_name(&self, request: &ServiceRequest) -> Option<JObject> {
@@ -6097,7 +6377,7 @@ fn force_visible(env: &JniEnv, record: JObject) {
                 }
             }
         }
-        force_window_frame(env, root, SURFACE_W, SURFACE_H);
+        force_window_frame(env, root, surface_w(), surface_h());
         dump_draw_state(env, root, index as usize);
         schedule_roots_dump(env);
         // `performTraversals` must run inside a Choreographer frame callback:
@@ -6139,7 +6419,7 @@ fn build_surface_control(env: &JniEnv) -> Option<JObject> {
         env.call_object(
             builder,
             set_size,
-            &[JValue { i: SURFACE_W }, JValue { i: SURFACE_H }],
+            &[JValue { i: surface_w() }, JValue { i: surface_h() }],
         );
     }
     let build = env.method_id(builder_class, "build", "()Landroid/view/SurfaceControl;")?;
@@ -6647,7 +6927,268 @@ fn install_user_thermal_transactions(env: &JniEnv) -> Option<()> {
             "unregisterThermalEventListener", "getCurrentTemperatures", "getCurrentTemperaturesWithType",
             "registerThermalStatusListener", "unregisterThermalStatusListener", "getCurrentThermalStatus",
             "getCurrentCoolingDevices", "getCurrentCoolingDevicesWithType", "getThermalHeadroom",
-        ])
+        ])?;
+    install_empty_list_transactions(env, "shortcut", "android/content/pm/IShortcutService$Stub",
+        &["getShortcuts", "getShareTargets"])?;
+    install_empty_list_transactions(env, "jobscheduler", "android/app/job/IJobScheduler$Stub",
+        &["getAllPendingJobsInNamespace", "getAllJobSnapshots"])?;
+    install_fd_transactions(env, "graphicsstats", "android/view/IGraphicsStats$Stub",
+        &["requestBufferForProcess"])
+}
+
+/// Register a service whose listed methods answer a `ParcelFileDescriptor`
+/// over a fresh ashmem region. A status-only fallthrough decodes as a null
+/// PFD and the framework NPEs on `ParcelFileDescriptor.getFd()`
+/// (`HardwareRenderer` gfx stats buffer).
+fn install_fd_transactions(
+    env: &JniEnv, service: &str, stub_class: &str, methods: &[&str],
+) -> Option<()> {
+    let _frame = env.local_frame(8)?;
+    let stub = env.find_class(stub_class)?;
+    let mut codes = Vec::with_capacity(methods.len());
+    for method in methods {
+        let field = env.static_field_id(stub, &format!("TRANSACTION_{method}"), "I")?;
+        codes.push(u32::try_from(env.static_int_field(stub, field)).ok()?);
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_fd_transactions")?;
+    let setter: unsafe extern "C" fn(*const std::ffi::c_char, *const u32, usize) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    let name = std::ffi::CString::new(service).ok()?;
+    if !unsafe { setter(name.as_ptr(), codes.as_ptr(), codes.len()) } { return None; }
+    println!("binder: fd-reply {service} transaction codes = {codes:?}");
+    Some(())
+}
+
+/// Register a service whose listed methods answer an empty `ParceledListSlice`.
+/// A status-only fallthrough decodes as a null slice and the framework NPEs on
+/// `ParceledListSlice.getList()` (`ShortcutManager`, `JobSchedulerImpl`).
+fn install_empty_list_transactions(
+    env: &JniEnv, service: &str, stub_class: &str, methods: &[&str],
+) -> Option<()> {
+    let _frame = env.local_frame(8)?;
+    let stub = env.find_class(stub_class)?;
+    let mut codes = Vec::with_capacity(methods.len());
+    for method in methods {
+        let field = env.static_field_id(stub, &format!("TRANSACTION_{method}"), "I")?;
+        codes.push(u32::try_from(env.static_int_field(stub, field)).ok()?);
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_empty_list_transactions")?;
+    let setter: unsafe extern "C" fn(*const std::ffi::c_char, *const u32, usize) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    let name = std::ffi::CString::new(service).ok()?;
+    if !unsafe { setter(name.as_ptr(), codes.as_ptr(), codes.len()) } { return None; }
+    println!("binder: empty-list {service} transaction codes = {codes:?}");
+    Some(())
+}
+
+/// The Play Billing service games bind to. There is no vending process, so
+/// the binder broker hosts `IInAppBillingService` itself; the transaction
+/// codes are the interface's declaration order from FIRST_CALL_TRANSACTION=1
+/// (the bundled Play Billing library obfuscates its own Stub, so the codes
+/// are hardcoded here and any mismatch shows up as a traced unknown code).
+const BILLING_SERVICE_NAME: &str = "com.android.vending.billing.IInAppBillingService";
+
+/// Install the hosted Play Billing replies into the binder broker.
+///
+/// Codes (AIDL declaration order): 1 isBillingSupported, 2 getSkuDetails,
+/// 3 getBuyIntent, 4 getPurchases, 5 consumePurchase, 6 getBuyIntentToReplaceSkus,
+/// 7 getBuyIntentExtraParams, 8 consumePurchaseExtraParams, 9 getBillingConfig,
+/// 10 isAlternativeBillingOnlyAvailable, 11 createAlternativeBillingOnlyToken,
+/// 12 getAlternativeBillingOnlyDialogIntent, 13 isExternalPaymentAvailable,
+/// 14 getExternalPaymentDialogIntent, 15 createExternalPaymentReportingDetails.
+///
+/// Purchase flows are answered with `RESPONSE_CODE=6` (ERROR) so BillingClient
+/// never opens a purchase UI; queries answer OK with empty results, which is
+/// what a logged-out, purchase-free account looks like.
+fn install_billing(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(64)?;
+    let is_supported_setter: unsafe extern "C" fn(u32) -> bool =
+        unsafe { std::mem::transmute(shim_symbol("__pengudroid_binder_set_billing_is_supported")?) };
+    let int_setter: unsafe extern "C" fn(u32, i32) -> bool =
+        unsafe { std::mem::transmute(shim_symbol("__pengudroid_binder_set_billing_int")?) };
+    let bundle_setter: unsafe extern "C" fn(u32, *const u8, usize) -> bool =
+        unsafe { std::mem::transmute(shim_symbol("__pengudroid_binder_set_billing_bundle")?) };
+    if !unsafe { is_supported_setter(1) } {
+        return None;
+    }
+    // Int-returning methods: consumePurchase(5), consumePurchaseExtraParams(8),
+    // isAlternativeBillingOnlyAvailable(10), isExternalPaymentAvailable(13)
+    // all answer RESPONSE_OK (0).
+    for code in [5u32, 8, 10, 13] {
+        if !unsafe { int_setter(code, 0) } {
+            return None;
+        }
+    }
+    let bundle_class = env.find_class("android/os/Bundle")?;
+    let put_int = env.method_id(bundle_class, "putInt", "(Ljava/lang/String;I)V")?;
+    let put_string = env.method_id(bundle_class, "putString", "(Ljava/lang/String;Ljava/lang/String;)V")?;
+    let put_string_list = env.method_id(
+        bundle_class,
+        "putStringArrayList",
+        "(Ljava/lang/String;Ljava/util/ArrayList;)V",
+    )?;
+    let (list_class, empty_list) = new_instance(env, "java/util/ArrayList")?;
+    let _ = list_class;
+    let bundle_with = |env: &JniEnv, response_code: i32| -> Option<JObject> {
+        let (_, bundle) = new_instance(env, "android/os/Bundle")?;
+        if !env.call_void(bundle, put_int, &[
+            JValue { l: env.new_string("RESPONSE_CODE") },
+            JValue { i: response_code },
+        ]) {
+            return None;
+        }
+        Some(bundle)
+    };
+    // A Bundle return value is read by the proxy with `Parcel.readBundle`,
+    // which expects the outer length word that `Parcel.writeBundle` writes —
+    // `Bundle.writeToParcel` + `marshall` alone is missing it, and the client
+    // then reads the "BNDL" magic as the length ("Bundle length is not
+    // aligned by 4"). Marshal through `writeBundle` instead.
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let parcel_obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let write_bundle = env.method_id(parcel_class, "writeBundle", "(Landroid/os/Bundle;)V")?;
+    let parcel_marshall = env.method_id(parcel_class, "marshall", "()[B")?;
+    let mut install = |env: &JniEnv, code: u32, bundle: JObject| -> Option<()> {
+        let parcel = env.call_static_object(parcel_class, parcel_obtain, &[])?;
+        if !env.call_void(parcel, write_bundle, &[JValue { l: bundle }]) {
+            return None;
+        }
+        let bytes = env.call_object(parcel, parcel_marshall, &[])?;
+        let bytes = env.byte_array_copy(bytes)?;
+        if !unsafe { bundle_setter(code, bytes.as_ptr(), bytes.len()) } {
+            return None;
+        }
+        Some(())
+    };
+    // getSkuDetails(2): OK with an empty details list.
+    {
+        let bundle = bundle_with(env, 0)?;
+        if !env.call_void(bundle, put_string_list, &[
+            JValue { l: env.new_string("DETAILS_LIST") },
+            JValue { l: empty_list },
+        ]) {
+            return None;
+        }
+        install(env, 2, bundle)?;
+    }
+    // getPurchases: OK with empty purchase lists and no continuation token.
+    // Billing 8.3.0 issues this as transaction code 11 ("Querying owned
+    // items"); the legacy code 4 gets the same answer. Without the three
+    // INAPP_*_LIST keys the client reads a null owned-items list and reports
+    // "Purchase bundle invalid" / "Querying purchases failed" even though
+    // RESPONSE_CODE is OK.
+    let purchases_bundle = |env: &JniEnv| -> Option<JObject> {
+        let bundle = bundle_with(env, 0)?;
+        for key in [
+            "INAPP_PURCHASE_ITEM_LIST",
+            "INAPP_PURCHASE_DATA_LIST",
+            "INAPP_DATA_SIGNATURE_LIST",
+        ] {
+            if !env.call_void(bundle, put_string_list, &[
+                JValue { l: env.new_string(key) },
+                JValue { l: empty_list },
+            ]) {
+                return None;
+            }
+        }
+        if !env.call_void(bundle, put_string, &[
+            JValue { l: env.new_string("INAPP_CONTINUATION_TOKEN") },
+            JValue { l: env.new_string("") },
+        ]) {
+            return None;
+        }
+        Some(bundle)
+    };
+    for code in [4u32, 11] {
+        install(env, code, purchases_bundle(env)?)?;
+    }
+    // Buy-intent methods (3, 6, 7, 12, 14): RESPONSE_CODE=6 (ERROR) so the
+    // client reports failure instead of showing a purchase dialog.
+    for code in [3u32, 6, 7, 12, 14] {
+        install(env, code, bundle_with(env, 6)?)?;
+    }
+    // getBillingConfig(9), createExternalPaymentReportingDetails(15): OK.
+    for code in [9u32, 15] {
+        install(env, code, bundle_with(env, 0)?)?;
+    }
+    println!("binder: hosted Play Billing {BILLING_SERVICE_NAME} transaction codes 1..15 installed");
+    Some(())
+}
+
+/// Answer `IPackageManager.queryIntentServices` for the Play Billing probe.
+///
+/// `BillingClient` checks the billing service with
+/// `PackageManager.queryIntentServices` before binding; on this framework
+/// revision that lands on the `package` handle as
+/// `IPackageManager$Stub.TRANSACTION_queryIntentServices`. An empty answer
+/// makes it report "Billing service unavailable" and retry forever, so the
+/// reply is a one-element `ParceledListSlice` whose `ResolveInfo` points at
+/// the vending package. The shim only uses it when the request's Intent names
+/// `com.android.vending`, so unrelated service queries are unaffected.
+fn install_vending_query_reply(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(32)?;
+    let step = |env: &JniEnv, s: &str| {
+        if env.exception_check() {
+            eprintln!("apphost: install_vending_query_reply ok through {s}");
+            Some(())
+        } else {
+            eprintln!("apphost: install_vending_query_reply FAILED at {s}");
+            None
+        }
+    };
+    let stub = env.find_class("android/content/pm/IPackageManager$Stub")?;
+    step(env, "find IPackageManager$Stub")?;
+    let field = env.static_field_id(stub, "TRANSACTION_queryIntentServices", "I")?;
+    step(env, "static field TRANSACTION_queryIntentServices")?;
+    let code = u32::try_from(env.static_int_field(stub, field)).ok()?;
+    if code == 0 {
+        return None;
+    }
+    eprintln!("apphost: TRANSACTION_queryIntentServices = {code}");
+    let (ri_class, ri) = new_instance(env, "android/content/pm/ResolveInfo")?;
+    step(env, "new ResolveInfo")?;
+    let (si_class, si) = new_instance(env, "android/content/pm/ServiceInfo")?;
+    step(env, "new ServiceInfo")?;
+    let set_str = |class: JClass, obj: JObject, field: &str, value: &str| {
+        if let Some(id) = env.field_id(class, field, "Ljava/lang/String;") {
+            env.set_object_field(obj, id, env.new_string(value));
+        }
+    };
+    set_str(si_class, si, "packageName", "com.android.vending");
+    set_str(si_class, si, "name", "com.android.vending.billing.IInAppBillingService");
+    // ComponentInfo.writeToParcel NPEs without an ApplicationInfo.
+    let (ai_class, ai) = new_instance(env, "android/content/pm/ApplicationInfo")?;
+    set_str(ai_class, ai, "packageName", "com.android.vending");
+    if let Some(id) = env.field_id(si_class, "applicationInfo", "Landroid/content/pm/ApplicationInfo;") {
+        env.set_object_field(si, id, ai);
+    }
+    if let Some(id) = env.field_id(ri_class, "serviceInfo", "Landroid/content/pm/ServiceInfo;") {
+        env.set_object_field(ri, id, si);
+    }
+    let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
+    step(env, "new ArrayList")?;
+    let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
+    if env.call_boolean(list, add, &[JValue { l: ri }]) != Some(true) {
+        eprintln!("apphost: install_vending_query_reply: ArrayList.add failed");
+        return None;
+    }
+    step(env, "list.add")?;
+    let pls_class = env.find_class("android/content/pm/ParceledListSlice")?;
+    let ctor = env.method_id(pls_class, "<init>", "(Ljava/util/List;)V")?;
+    let pls = env.new_object(pls_class, ctor, &[JValue { l: list }])?;
+    step(env, "new ParceledListSlice")?;
+    let bytes = marshal_object(env, pls, "android/content/pm/ParceledListSlice")?;
+    step(env, "marshal ParceledListSlice")?;
+    let sym = shim_symbol("__pengudroid_binder_set_vending_query_reply")?;
+    let setter: unsafe extern "C" fn(u32, *const u8, usize) -> bool =
+        unsafe { std::mem::transmute(sym) };
+    if !unsafe { setter(code, bytes.as_ptr(), bytes.len()) } {
+        eprintln!("apphost: install_vending_query_reply: shim setter rejected the reply");
+        return None;
+    }
+    step(env, "shim setter")?;
+    println!("binder: vending queryIntentServices code={code} answered with a 1-entry ResolveInfo slice ({} bytes)", bytes.len());
+    Some(())
 }
 
 fn install_media_transactions(env: &JniEnv) -> Option<()> {
@@ -6671,24 +7212,143 @@ fn install_media_transactions(env: &JniEnv) -> Option<()> {
     Some(())
 }
 
+/// The hosted session has no `system_server` peer, so its setters update shim
+/// state. A method this framework revision does not declare is passed as 0 and
+/// never dispatches.
+///
+/// `ISession.aidl` was renamed over time (`connect`→`setActive`,
+/// `disconnect`→`destroySession`, `setSessionActivity`→`setLaunchPendingIntent`,
+/// `setSessionExtras`→`setExtras`) and `isPlaybackActive` is gone, so each
+/// logical operation lists the names it has shipped under, newest first.
+const MEDIA_SESSION_SETTERS: [&[&str]; 11] = [
+    &["setActive", "connect"],
+    &["destroySession", "disconnect"],
+    &["setFlags"],
+    &["setMetadata"],
+    &["setPlaybackState"],
+    &["setLaunchPendingIntent", "setSessionActivity"],
+    &["setExtras", "setSessionExtras"],
+    &["setPlaybackToLocal"],
+    &["setPlaybackToRemote"],
+    &["setCurrentVolume"],
+    &["isPlaybackActive"],
+];
+
+fn install_media_session_transactions(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let stub = env.find_class("android/media/session/ISession$Stub")?;
+    let mut codes = [0u32; MEDIA_SESSION_SETTERS.len()];
+    for (out, candidates) in codes.iter_mut().zip(MEDIA_SESSION_SETTERS) {
+        for method in candidates {
+            let name = format!("TRANSACTION_{method}");
+            let Some(field) = env.try_static_field_id(stub, &name, "I") else { continue };
+            let code = env.static_int_field(stub, field);
+            if code > 0 {
+                *out = code as u32;
+                break;
+            }
+        }
+    }
+    if codes.iter().all(|&code| code == 0) {
+        eprintln!("apphost: the framework ISession$Stub declares no known setter");
+        return None;
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_media_session_transactions")?;
+    let setter: unsafe extern "C" fn(*const u32, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes.as_ptr(), codes.len()) } { return None; }
+    println!("media: framework ISession setter transaction codes = {codes:?}");
+    Some(())
+}
+
 /// Read generated framework constants instead of assuming a platform release's
 /// private AIDL method order. The APK's targetSdk never selects this wire ABI.
+/// `AudioSystem.listAudioPorts`/`listAudioPatches` probe the audio policy
+/// service, not the flinger, and `AudioManager.updateAudioPortCache` retries
+/// them continuously. Publishing the real codes lets the shim answer with an
+/// empty list instead of leaving the framework to read a count out of an empty
+/// parcel.
+fn install_audio_policy_transactions(env: &JniEnv) -> Option<()> {
+    // The third code is getAttributesForStreamType, answered with the
+    // marshalled AudioAttributes installed by install_audio_attributes_reply;
+    // the fourth is getStreamTypeForAttributes, answered with STREAM_MUSIC.
+    install_service_transactions(env,
+        "android/media/IAudioPolicyService$Stub",
+        "__pengudroid_binder_set_audio_policy_transactions",
+        &["listAudioPorts", "listAudioPatches", "getAttributesForStreamType", "getStreamTypeForAttributes"])
+}
+
+/// `AudioSystem.getAttributesForStreamType` asks the audio policy service for
+/// the legacy-stream attributes and logs `getAttributesForStreamType Failed`
+/// when the reply decodes as null (BBR2 hit this on every AudioTrack setup).
+/// Answer with a media/music AudioAttributes for STREAM_MUSIC, marshalled by
+/// the framework itself so the parcel layout matches this build.
+fn install_audio_attributes_reply(env: &JniEnv) {
+    // The Stub's return type is the AIDL `android.media.audio.common.AudioAttributes`
+    // (fields usage/contentType/flags/source/tags), NOT the framework
+    // `android.media.AudioAttributes` — the Proxy reads it with the common
+    // CREATOR, so the parcel must be marshalled from the common class.
+    let build = (|| -> Option<Vec<u8>> {
+        let class = env.find_class("android/media/audio/common/AudioAttributes")?;
+        let ctor = env.method_id(class, "<init>", "()V")?;
+        let attrs = env.new_object(class, ctor, &[])?;
+        // USAGE_MEDIA=1, CONTENT_TYPE_MUSIC=2.
+        for (field, value) in [("usage", 1), ("contentType", 2), ("flags", 0), ("source", 0)] {
+            let id = env.field_id(class, field, "I")?;
+            env.set_int_field(attrs, id, value);
+        }
+        marshal_object(env, attrs, "android/media/audio/common/AudioAttributes")
+    })();
+    match build {
+        Some(data) => {
+            install_reply(&data, "__pengudroid_binder_set_audio_attributes");
+            println!("audio: legacy-stream AudioAttributes installed ({} bytes)", data.len());
+        }
+        None => eprintln!("apphost: could not marshal AudioAttributes; getAttributesForStreamType stays null"),
+    }
+}
+
 fn install_audio_focus_transactions(env: &JniEnv) -> Option<()> {
     let _frame = env.local_frame(16)?;
     let stub = env.find_class("android/media/IAudioService$Stub")?;
-    let mut codes = [0u32; 4];
+    let mut codes = [0u32; 6];
     for (out, name) in codes.iter_mut().zip([
         "TRANSACTION_requestAudioFocus", "TRANSACTION_abandonAudioFocus",
         "TRANSACTION_unregisterAudioFocusClient", "TRANSACTION_getCurrentAudioFocus",
+        "TRANSACTION_setAllowedCapturePolicy", "TRANSACTION_getAllowedCapturePolicy",
     ]) {
         let field = env.static_field_id(stub, name, "I")?;
         *out = u32::try_from(env.static_int_field(stub, field)).ok()?;
     }
     let setter = shim_symbol("__pengudroid_binder_set_audio_focus_transactions")?;
-    let setter: unsafe extern "C" fn(u32, u32, u32, u32) -> bool =
+    let setter: unsafe extern "C" fn(u32, u32, u32, u32, u32, u32) -> bool =
         unsafe { std::mem::transmute(setter) };
-    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3]) } { return None; }
+    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3], codes[4], codes[5]) } { return None; }
     println!("audio: framework focus transaction codes = {codes:?}");
+    Some(())
+}
+
+/// `AudioTrack`/`AudioRecord` open a stream with `trackPlayer`/`trackRecorder`
+/// and read the int player id from the reply; `playerEvent`/`recorderEvent` and
+/// the release methods are void. BBR2's FMOD bring-up hit codes 2 and 4
+/// (`trackPlayer`/`playerEvent`) as UNKNOWN_TRANSACTION until these were
+/// installed.
+fn install_audio_player_transactions(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let stub = env.find_class("android/media/IAudioService$Stub")?;
+    let mut codes = [0u32; 7];
+    for (out, name) in codes.iter_mut().zip([
+        "TRANSACTION_trackPlayer", "TRANSACTION_playerAttributes", "TRANSACTION_playerEvent",
+        "TRANSACTION_releasePlayer", "TRANSACTION_trackRecorder", "TRANSACTION_recorderEvent",
+        "TRANSACTION_releaseRecorder",
+    ]) {
+        let field = env.static_field_id(stub, name, "I")?;
+        *out = u32::try_from(env.static_int_field(stub, field)).ok()?;
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_audio_player_transactions")?;
+    let setter: unsafe extern "C" fn(u32, u32, u32, u32, u32, u32, u32) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3], codes[4], codes[5], codes[6]) } { return None; }
+    println!("audio: framework player transaction codes = {codes:?}");
     Some(())
 }
 
@@ -6879,7 +7539,7 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         let visible = JValue { i: env.call_static_int(types, default_visible, &[])? };
         if !env.call_void(layout, compute, &[
             JValue { l: params }, JValue { l: insets }, JValue { l: safe }, JValue { l: bounds },
-            JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H },
+            JValue { i: 1 }, JValue { i: surface_w() }, JValue { i: surface_h() },
             visible, JValue { f: 1.0 }, JValue { l: frames },
         ]) { return None; }
         let frame = env.object_field(frames, env.field_id(frames_class, "frame", "Landroid/graphics/Rect;")?);
@@ -6889,7 +7549,7 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         let height = env.method_id(rect_class, "height", "()I")?;
         let (w, h) = (env.call_int(frame, width, &[])?, env.call_int(frame, height, &[])?);
         println!("window: local WindowLayout.computeFrames = {w}x{h}");
-        if w != SURFACE_W || h != SURFACE_H { return None; }
+        if w != surface_w() || h != surface_h() { return None; }
         probe_window_resized_payload(env)?;
         Some(())
     };
@@ -6938,7 +7598,8 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
     let input_stub = env.find_class("android/hardware/input/IInputManager$Stub")?;
     let mut input_codes = Vec::new();
     for name in ["getInputDevice", "getInputDeviceIds", "isInputDeviceEnabled", "enableInputDevice",
-        "disableInputDevice", "hasKeys", "getKeyCodeForKeyLocation", "registerInputDevicesChangedListener"] {
+        "disableInputDevice", "hasKeys", "getKeyCodeForKeyLocation", "registerInputDevicesChangedListener",
+        "getVelocityTrackerStrategy"] {
         // API 37 moved enabled state into InputDevice itself.
         if name == "isInputDeviceEnabled" { input_codes.push(0); continue; }
         let field = env.static_field_id(input_stub, &format!("TRANSACTION_{name}"), "I")?;
@@ -7317,9 +7978,9 @@ fn install_display_replies(env: &JniEnv) {
         set_int(
             field,
             if field.contains("Height") {
-                SURFACE_H
+                surface_h()
             } else {
-                SURFACE_W
+                surface_w()
             },
         );
     }
@@ -7329,7 +7990,7 @@ fn install_display_replies(env: &JniEnv) {
     // makes `DisplayMetrics.density` zero — which turns
     // `ThreadedRenderer.setLightCenter`'s `zRatio` into Infinity and aborts the
     // first traversal with "lightZ must be a finite positive".
-    set_int("logicalDensityDpi", DENSITY_DPI);
+    set_int("logicalDensityDpi", density_dpi());
     // Display.STATE_ON = 2, Display.TYPE_INTERNAL = 1, Surface.ROTATION_0 = 0.
     set_int("state", 2);
     set_int("committedState", 2);
@@ -7350,7 +8011,7 @@ fn install_display_replies(env: &JniEnv) {
         // This constructor is present in the pinned API-37 framework source.
         let ctor = env.method_id(class, "<init>", "(IIIF)V")?;
         let mode = env.new_object(class, ctor, &[
-            JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H }, JValue { f: 60.0 },
+            JValue { i: 1 }, JValue { i: surface_w() }, JValue { i: surface_h() }, JValue { f: 60.0 },
         ])?;
         let modes = env.new_object_array(1, class, std::ptr::null_mut())?;
         env.set_object_array_element(modes, 0, mode);
@@ -7526,8 +8187,8 @@ fn build_client_window_frames(env: &JniEnv) -> Option<JObject> {
             &[
                 JValue { i: 0 },
                 JValue { i: 0 },
-                JValue { i: SURFACE_W },
-                JValue { i: SURFACE_H },
+                JValue { i: surface_w() },
+                JValue { i: surface_h() },
             ],
         )?;
         env.set_object_field(frames, f, rect);
@@ -7679,12 +8340,16 @@ fn install_provider_list(env: &JniEnv, list: JObject, app_info: JObject, spec: &
             }
         }
         // `androidx.startup.InitializationProvider.onCreate` asks the package
-        // manager for its own `ProviderInfo` to read the initializer list out of
-        // `metaData`; publish the same object under the class name.
+        // manager for its own `ProviderInfo` (IPM code 15) by ComponentName, so
+        // publish the object under the class name. `FileProvider` instead calls
+        // `resolveContentProvider(authority, GET_META_DATA)` (IPM code 41) and
+        // reads `metaData["android.support.FILE_PROVIDER_PATHS"]` off the result,
+        // so publish the same object under the authority too.
         if let Some(bytes) = marshal_object(env, info, "android/content/pm/ProviderInfo") {
             install_provider_entry(&provider.name, &bytes);
             if let Some(authority) = &provider.authority {
                 install_provider_authority(&provider.name, authority);
+                install_provider_entry(&format!("auth:{authority}"), &bytes);
             }
         }
         if env.call_boolean(list, add, &[JValue { l: info }]) == Some(true) {
@@ -7815,6 +8480,10 @@ const SETTINGS_VALUES: &[(&str, &str)] = &[
     ("adb_enabled", "0"),
     ("device_provisioned", "1"),
     ("user_setup_complete", "1"),
+    // Ad SDKs (AppLovin/FBAudienceNetwork) read `Settings.Secure.getInt(
+    // "limit_ad_tracking")`; a null value throws `SettingNotFoundException`
+    // inside `parseIntSetting` and kills the collector thread.
+    ("limit_ad_tracking", "0"),
 ];
 
 /// Install one marshalled `Bundle` per `Settings` key.
@@ -8180,22 +8849,36 @@ mod tests {
     /// than a Material `AlertDialog`'s 280 dp minimum, so dialogs overflowed the
     /// window and lost their buttons.
     #[test]
-    fn dp_matches_the_surface_and_density() {
-        assert_eq!(DENSITY_DPI, 320);
-        assert_eq!(SURFACE_W, 720);
-        assert_eq!(SURFACE_H, 1280);
-        assert_eq!(SURFACE_W_DP, 360);
-        assert_eq!(SURFACE_H_DP, 640);
+    fn dp_fields_follow_the_surface_and_density() {
+        let g = geometry();
+        assert_eq!(surface_w(), g.width);
+        assert_eq!(surface_h(), g.height);
+        assert_eq!(density_dpi(), g.density_dpi);
+        assert_eq!(surface_w_dp(), g.width_dp());
+        assert_eq!(surface_h_dp(), g.height_dp());
 
         // `dp = px * 160 / dpi` must round-trip back to the pixel size.
-        assert_eq!(SURFACE_W_DP * DENSITY_DPI / 160, SURFACE_W);
-        assert_eq!(SURFACE_H_DP * DENSITY_DPI / 160, SURFACE_H);
+        assert_eq!(surface_w_dp() * density_dpi() / 160, surface_w());
+        assert_eq!(surface_h_dp() * density_dpi() / 160, surface_h());
     }
 
-    /// 360 dp is wide enough for the narrowest thing the framework will draw.
+    /// The unset environment is the documented default phone surface.
     #[test]
-    fn the_screen_is_wide_enough_for_a_material_dialog() {
-        // `AlertDialog`'s minimum width is 280 dp.
-        assert!(SURFACE_W_DP >= 280, "{SURFACE_W_DP} dp is too narrow");
+    fn the_default_geometry_is_a_360x640_dp_phone() {
+        if std::env::var_os("PENGUDROID_SURFACE_W").is_some() {
+            return; // the harness pinned a window; the policy is tested in `geometry`
+        }
+        assert_eq!((surface_w(), surface_h(), density_dpi()), (720, 1280, 320));
+        assert_eq!((surface_w_dp(), surface_h_dp()), (360, 640));
+        assert!(surface_w_dp() >= crate::geometry::MIN_USABLE_DP);
+    }
+
+    /// A large window must reach the framework as a tablet, not as a phone laid
+    /// out in a big frame.
+    #[test]
+    fn a_tablet_shaped_window_exports_tablet_dp() {
+        let g = crate::geometry::Geometry::for_window(1024, 768, None);
+        assert!(g.is_tablet());
+        assert!(g.smallest_width_dp() >= crate::geometry::TABLET_MIN_DP);
     }
 }

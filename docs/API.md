@@ -20,6 +20,7 @@ This document describes PenguDroid's control protocol and CLI. See [LIMITATIONS.
 | `pengudroid start app.apk [--wait]` | Run the guest under the daemon; `--wait` waits for its exit code. | Working |
 | `pengudroid start --demo [--wait]` | Run the built-in demo under the daemon. | Working |
 | `pengudroid key <linux-keycode> [down|up]` | Send a physical key through the daemon. Without a state, sends press and release; separate states support Shift/Ctrl chords. | Working; virtual device, character map, and NewPipe text entry verified |
+| `pengudroid window [<id>] [--maximize\|--unmaximize\|--fullscreen\|--windowed]` | List live windows (no id) or change one's compositor state, then print its guest buffer size versus its window size in px and dp, with `, tablet` when the smallest width reaches 600 dp. The daemon asks its `xdg_toplevel`, so this reaches the same path a title-bar button does. | Working; verified on GNOME/Mutter against BBR2 and the demo |
 | `pengudroid ps` | List running guests from the daemon's process table. | Working |
 | `pengudroid services` | List broker services with handle, name, and interface. | Working |
 | `pengudroid getprop [NAME]` | Read one property, or list all properties if `NAME` is omitted. | Working |
@@ -40,7 +41,53 @@ input. The desktop launcher sends `0` or `1` from the selected app's checkbox;
 changes apply on the next launch. `PENGUDROID_KEYMAP_PATH` is the resolved
 profile path passed to the guest before its prefix changes HOME.
 
-## Protocol (v2)
+## Runtime properties
+
+The guest gets Android system properties from a seed table in the shim. Any of
+them can be overridden for one run with `PENGUDROID_PROP_<exact.property.name>`;
+because the names contain dots, quote the assignment and use `env`:
+
+```sh
+env 'PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true' \
+  ./target/debug/pengudroid art-test --sysroot .toolchain/sysroot-android17 ...
+```
+
+`pengudroid launch` inherits the environment the same way.
+
+The override is applied before `JNI_CreateJavaVM`, so it is visible to
+`__system_property_get` and to ART's own startup property reads. It is a
+debugging knob, not a supported configuration: an override that contradicts the
+platform identity (API level, ABI, release) aborts the launch with a message
+rather than being silently ignored. Known users are
+`ro.dalvik.vm.native.bridge` ([NATIVE_BRIDGE.md](NATIVE_BRIDGE.md)) and
+`ro.dalvik.vm.enable_uffd_gc`, which is what makes the boot image validate
+([ANDROID17.md](ANDROID17.md)).
+
+## Debug hooks for runtime faults
+
+`PENGUDROID_CRASH_BT=1` installs the shim's last-resort fault handler after
+`JNI_CreateJavaVM`. It does **not** replace an existing handler: whatever was
+installed first (ART's) is queried with `sigaction(sig, NULL, &old)` and invoked
+first, and the shim only dumps a native backtrace if that returns without
+resolving the fault. This matters because ART owns `SIGBUS` while a
+userfaultfd compaction is running — replacing that handler would turn every
+normal page-in into a crash. `PENGUDROID_DEBUG_FAULTS=1` prints the install
+result per signal (`fault hook sig=N installed=…`) so a silently failed hook is
+visible.
+
+`PENGUDROID_UFFD_ALLOW_MOVE=1` stops the shim's `ioctl` interposer from clearing
+`UFFD_FEATURE_MOVE`/`_UFFDIO_MOVE` out of ART's `UFFDIO_API` reply. Host kernels
+6.8+ advertise `UFFDIO_MOVE`, which selects ART's newest compaction path; the
+shim masks it by default so ART stays on the older `UFFDIO_COPY` path, which is
+the one reproduced and documented in [STATUS.md](STATUS.md). Neither setting
+makes the boot image usable — that needs signal resume inside translated guest
+code (see [LIMITATIONS.md](LIMITATIONS.md) §2).
+
+## Protocol (v5)
+
+`PROTO_VERSION` in `crates/pengudroid-proto/src/lib.rs` is the authoritative
+number; `Hello` must match it exactly or the daemon rejects the connection, so
+bump it whenever a message layout changes.
 
 Transport uses a non-empty `PENGUDROID_SOCKET` when set; otherwise it uses `$XDG_RUNTIME_DIR/pengudroid/daemon.sock` with mode `0600`. Set `PENGUDROID_SOCKET` to run a private daemon while keeping `XDG_RUNTIME_DIR` pointed at the real Wayland/PipeWire session. The CLI, daemon, and guest must use the same socket value.
 
@@ -59,12 +106,14 @@ Frames use a length prefix: `[u32 body_len][body]`, where `body = [kind u8][fiel
 | `GuestCall { code, data, token }` / `GuestCallReply { status, data }` | Daemon ↔ guest | Deliver a guest service call and its reply. |
 | `CreateSurface { width, height, title }` → `SurfaceCreated { … }` + fd | Guest → daemon | Create a Wayland toplevel and shared buffer. |
 | `SetSurfaceOptions { surface_id, fps_meter }` → `Ack` | Guest → daemon | Set per-window FPS title display for a surface owned by this connection's process. |
+| `SetWindowState { surface_id, state }` → `Ack` | CLI → daemon | Ask the compositor to maximize (`WINDOW_MAXIMIZED`), fullscreen (`WINDOW_FULLSCREEN`), or leave both. `state` may combine only those two bits; anything else is `Error { code: -22 }`, and an unknown surface is `-3`. The resulting `configure` keeps the guest buffer and only moves the window, which is what makes "resize without losing internal resolution" work. Used by `pengudroid window` (see [LIMITATIONS.md](LIMITATIONS.md) §4.2). |
+| `SurfaceGeometry { surface_id, … }` → `SurfaceGeometry { width, height, display_width, display_height }` | CLI/guest → daemon | Ask what a surface is showing: the guest's own buffer size versus the window it is scaled into. Send it with `Message::query_surface_geometry`. `Error { code: -3 }` means the daemon has no such surface, which happens normally while an app replaces its window; `-19` means there is no compositor. Used by `PENGUDROID_FOLLOW_RESIZE` to follow a live window resize (see [LIMITATIONS.md](LIMITATIONS.md) §4.2). |
 | `PresentFrame { surface_id }` → `Ack` | Guest → daemon | Commit the shared buffer. |
 | `PresentShm { surface_id, width, height, stride, format }` + fd → `Ack` | Guest → daemon | Snapshot a CPU memfd buffer and present it through `wl_shm`. Android formats 1/2/4/5 are supported; stride is in bytes. `Ack` means the source buffer may be reused; it does not prove that the frame appeared on screen. |
 | `GetProp` / `SetProp` / `ListProps` | CLI/guest | Access the property store. |
 | `Shutdown` → `Goodbye` | CLI → daemon | Shut down cleanly. |
 
-Errors are returned as `Error { code, message }`, where `code` is a negative errno: `-2` file not found, `-3` unknown PID, `-5` spawn or fd error, `-17` name conflict, `-19` graphics unavailable, `-22` unknown handle, `-32` guest disconnected, and `-110` guest service timeout (5 seconds).
+Errors are returned as `Error { code, message }`, where `code` is a negative errno: `-2` file not found, `-3` unknown PID or surface, `-5` spawn or fd error, `-17` name conflict, `-19` graphics unavailable, `-22` unknown handle, `-32` guest disconnected, and `-110` guest service timeout (5 seconds).
 
 ## Local verification
 
