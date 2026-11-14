@@ -40,6 +40,11 @@ fn geometry() -> crate::geometry::Geometry {
     crate::geometry::Geometry::from_env()
 }
 
+/// `(width, height)` of the surface in pixels.
+fn surface_size() -> (i32, i32) {
+    (surface_w(), surface_h())
+}
+
 /// Surface width in pixels.
 fn surface_w() -> i32 {
     geometry().width
@@ -63,6 +68,18 @@ fn surface_w_dp() -> i32 {
 /// The surface height in dp.
 fn surface_h_dp() -> i32 {
     geometry().height_dp()
+}
+
+
+/// `Configuration.ORIENTATION_*` for a surface of this size.
+const fn configuration_orientation(width: i32, height: i32) -> i32 {
+    const ORIENTATION_PORTRAIT: i32 = 1;
+    const ORIENTATION_LANDSCAPE: i32 = 2;
+    if width > height {
+        ORIENTATION_LANDSCAPE
+    } else {
+        ORIENTATION_PORTRAIT
+    }
 }
 
 use std::path::Path;
@@ -318,6 +335,10 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
     set_int("screenWidthDp", surface_w_dp());
     set_int("screenHeightDp", surface_h_dp());
     set_int("smallestScreenWidthDp", surface_w_dp().min(surface_h_dp()));
+    // `setToDefaults()` leaves this ORIENTATION_UNDEFINED. Resources pick
+    // `layout-land`/`-port` from it, and engines read it to decide which way up
+    // to render, so it has to follow the surface like the dp fields do.
+    set_int("orientation", configuration_orientation(surface_w(), surface_h()));
     // WindowLayout.computeFrames uses Configuration.windowConfiguration bounds
     // for local relayout, not DisplayInfo or screenWidthDp. Empty bounds made a
     // later relayoutAsync collapse a previously valid activity window to 0x0.
@@ -1156,7 +1177,7 @@ fn surface_video_dimensions(env: &JniEnv, view: JObject) -> (i32, i32) {
         let height = env.field_id(class, "mHeight", "I").map(|f| env.int_field(root, f))?;
         (width > 0 && height > 0).then_some((width, height))
     })();
-    let (container_w, container_h) = root_size.unwrap_or((720, 1280));
+    let (container_w, container_h) = root_size.unwrap_or(surface_size());
     let (mut w, mut h) = if container_w.saturating_mul(9) > container_h.saturating_mul(16) {
         (container_h.saturating_mul(16) / 9, container_h)
     } else {
@@ -1658,15 +1679,15 @@ fn report_surface_views(env: &JniEnv, verbose: bool) {
                         );
                         if ww <= 0 || wh <= 0 {
                             if let Some(f) = env.field_id(vri_class, "mWidth", "I") {
-                                env.set_int_field(vri, f, 720);
+                                env.set_int_field(vri, f, surface_w());
                             }
                             if let Some(f) = env.field_id(vri_class, "mHeight", "I") {
-                                env.set_int_field(vri, f, 1280);
+                                env.set_int_field(vri, f, surface_h());
                             }
                             // Do not write the root's Rect from this worker:
                             // the main thread owns layout and may be reading it.
                             // Frame changes belong in the window-manager reply.
-                            println!("views:   ViewRootImpl.mWidth {ww} -> 720");
+                            println!("views:   ViewRootImpl.mWidth {ww} -> {}", surface_w());
                         }
                         // `layoutRequested` is `mLayoutRequested && (!mStopped ||
                         // mReportNextDraw)`, so a stopped window silently drops
@@ -4769,6 +4790,8 @@ fn spawn_input_pump(env: &JniEnv) {
         // ignoring the wheel anyway. A real fix needs either that hidden setter or
         // an `InputManager.injectInputEvent` path.
         let set_axis_value: Option<JMethodId> = None;
+        // Resolved up front, used only when a keymap is active (see below).
+        let multi_touch = MultiTouchJni::resolve(&env, motion_class);
         let Some(key_class) = env.find_class("android/view/KeyEvent") else {
             return;
         };
@@ -4981,7 +5004,19 @@ fn spawn_input_pump(env: &JniEnv) {
             let path = std::env::var_os("PENGUDROID_KEYMAP_PATH")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| pengudroid_input::keymap::keymap_path(package));
-            let text = std::fs::read_to_string(&path).ok()?;
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                // No profile of the user's own: fall back to the built-in one
+                // for this game, laid out for the current display.
+                let (w, h) = (surface_w(), surface_h());
+                let map = pengudroid_input::presets::for_package(package, w as f32, h as f32)?;
+                println!(
+                    "input: built-in keymap for {package} at {w}x{h} ({} binding(s)); \
+                     save your own to {} to replace it",
+                    map.bindings.len(),
+                    path.display()
+                );
+                return Some(map);
+            };
             match pengudroid_input::keymap::Keymap::parse(&text) {
                 Ok(map) if !map.bindings.is_empty() => {
                     println!(
@@ -5001,9 +5036,103 @@ fn spawn_input_pump(env: &JniEnv) {
             }
         });
         let mut mapped_held = crate::keymap_gesture::HeldPoints::default();
-        // Mapped gestures share one pointer, so the press time of the most
-        // recent `Down` is enough to keep `MotionEvent`'s downTime consistent.
-        let mut mapped_down = 0i64;
+        // With a keymap the mouse and every mapped key are separate fingers of
+        // one multi-pointer stream: walking (a joystick), turning the camera
+        // (the mouse) and pressing a skill overlap, and Android has a single
+        // event stream per window. Without a keymap nothing overlaps, so the
+        // long-verified single-pointer path stays exactly as it was.
+        // `PENGUDROID_LEGACY_TOUCH=1` forces that path even with a keymap, at
+        // the cost of one finger at a time.
+        let multi_touch = multi_touch.filter(|_| {
+            keymap.is_some() && std::env::var_os("PENGUDROID_LEGACY_TOUCH").is_none()
+        });
+        if keymap.is_some() {
+            println!(
+                "input: mapped touches are {}",
+                if multi_touch.is_some() { "multi-pointer" } else { "single-pointer (legacy)" }
+            );
+        }
+        let touch_state = std::cell::RefCell::new(crate::keymap_gesture::TouchState::default());
+        // `downTime` of the gesture in progress: taken at the first finger and
+        // kept until the last one lifts.
+        let gesture_down = std::cell::Cell::new(0i64);
+        let send_touch = |event: crate::keymap_gesture::Event| {
+            use crate::keymap_gesture::Event;
+            let Some(multi) = &multi_touch else {
+                // One finger at a time: the pointer id is irrelevant.
+                match event {
+                    Event::Down { x, y, .. } => {
+                        gesture_down
+                            .set(env.call_static_long(clock_class, uptime, &[]).unwrap_or(0));
+                        inject(ACTION_DOWN, x, y, gesture_down.get());
+                    }
+                    Event::Move { x, y, .. } => inject(ACTION_MOVE, x, y, gesture_down.get()),
+                    Event::Up { x, y, .. } => inject(ACTION_UP, x, y, gesture_down.get()),
+                }
+                return;
+            };
+            let Some(frame) = touch_state.borrow_mut().apply(event) else {
+                return;
+            };
+            let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+            if frame.starts_gesture {
+                gesture_down.set(now);
+            }
+            let Some(_frame_refs) = env.local_frame(64 + 2 * frame.pointers.len() as i32) else {
+                return;
+            };
+            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+                return;
+            };
+            let roots = env.object_field(wmg, roots_field);
+            if roots.is_null() {
+                return;
+            }
+            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else {
+                return;
+            };
+            if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                println!(
+                    "input: touch action={:#x} pointers={:?}",
+                    frame.action, frame.pointers
+                );
+            }
+            if let Some(event) = multi.obtain(&env, motion_class, &frame, gesture_down.get(), now) {
+                env.call_void(root, dispatch, &[JValue { l: event }]);
+            }
+        };
+        // Mouse-look needs the compositor to lock the pointer; the gleshim
+        // owns the daemon connection, so the request goes through it.
+        let pointer_lock: Option<unsafe extern "C" fn(i32) -> i32> = {
+            let sym = unsafe {
+                libc::dlsym(
+                    libc::RTLD_DEFAULT,
+                    b"pengudroid_pointer_lock\0".as_ptr() as *const libc::c_char,
+                )
+            };
+            (!sym.is_null()).then(|| unsafe { std::mem::transmute(sym) })
+        };
+        // Whether the pointer is locked right now, as far as this side knows.
+        let mut pointer_locked = false;
+        let mut last_look_motion = std::time::Instant::now();
+        // How long the mouse must rest before the camera finger is lifted.
+        const LOOK_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
+        // Run a mapped binding for a key or mouse-button edge.
+        let run_binding = |action: &pengudroid_input::keymap::Action,
+                           code: u16,
+                           pressed: bool,
+                           held: &mut crate::keymap_gesture::HeldPoints| {
+            let gesture_steps = crate::keymap_gesture::steps(action, code, pressed, held);
+            if !gesture_steps.is_empty() && std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                println!("input: keymap code={code} -> {} touch step(s)", gesture_steps.len());
+            }
+            for step in gesture_steps {
+                if step.delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(step.delay_ms));
+                }
+                send_touch(step.event);
+            }
+        };
 
         let mut last_trace = std::time::Instant::now();
         // `PENGUDROID_TRACE_ROOTS=<ms>`: a timeline of the window roots. The
@@ -5055,6 +5184,11 @@ fn spawn_input_pump(env: &JniEnv) {
                 trace_surface_views(&env);
             }
             if unsafe { poll(buf.as_mut_ptr()) } == 0 {
+                if mapped_held.look_finger_down() && last_look_motion.elapsed() >= LOOK_IDLE {
+                    for step in mapped_held.look_idle() {
+                        send_touch(step.event);
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(8));
                 continue;
             }
@@ -5083,35 +5217,36 @@ fn spawn_input_pump(env: &JniEnv) {
                 // playable without also typing into the app.
                 if let Some(map) = &keymap {
                     if let Some(action) = map.action_for(a as u16) {
-                        let gesture_steps = crate::keymap_gesture::steps(
-                            action,
-                            a as u16,
-                            b != 0.0,
-                            &mut mapped_held,
-                        );
-                        if !gesture_steps.is_empty() {
-                            println!(
-                                "input: keymap code={a} -> {} touch step(s)",
-                                gesture_steps.len()
-                            );
-                        }
-                        for step in gesture_steps {
-                            if step.delay_ms > 0 {
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    step.delay_ms,
-                                ));
-                            }
-                            match step.event {
-                                crate::keymap_gesture::Event::Down { x, y } => {
-                                    mapped_down =
-                                        env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
-                                    inject(ACTION_DOWN, x, y, mapped_down);
+                        run_binding(action, a as u16, b != 0.0, &mut mapped_held);
+                        // A `look` binding toggles mouse-look; keep the
+                        // compositor's pointer lock in step with it.
+                        if mapped_held.look_active() != pointer_locked {
+                            let want = mapped_held.look_active();
+                            let ok = pointer_lock
+                                .is_some_and(|lock| unsafe { lock(i32::from(want)) } != 0);
+                            if want && !ok {
+                                // No lock means no relative motion: leaving
+                                // the mode on would only swallow the mouse.
+                                for step in mapped_held.look_cancel() {
+                                    send_touch(step.event);
                                 }
-                                crate::keymap_gesture::Event::Move { x, y } => {
-                                    inject(ACTION_MOVE, x, y, mapped_down);
-                                }
-                                crate::keymap_gesture::Event::Up { x, y } => {
-                                    inject(ACTION_UP, x, y, mapped_down);
+                                eprintln!(
+                                    "input: mouse-look is unavailable (the compositor did not \
+                                     lock the pointer)"
+                                );
+                            } else {
+                                pointer_locked = want;
+                                println!("input: mouse-look {}", if want { "on" } else { "off" });
+                                if want && pressed {
+                                    // The left button was mid-drag as a touch;
+                                    // its release now belongs to mouse-look, so
+                                    // lift that finger here.
+                                    pressed = false;
+                                    send_touch(crate::keymap_gesture::Event::Up {
+                                        id: crate::keymap_gesture::MOUSE_POINTER,
+                                        x: last.0,
+                                        y: last.1,
+                                    });
                                 }
                             }
                         }
@@ -5151,6 +5286,55 @@ fn spawn_input_pump(env: &JniEnv) {
                 }
                 continue;
             }
+            // Relative motion only arrives while the pointer is locked.
+            if tag == 7 {
+                last_look_motion = std::time::Instant::now();
+                for step in mapped_held.look_motion(a, b) {
+                    send_touch(step.event);
+                }
+                continue;
+            }
+            // A mouse button other than the left one can carry a binding
+            // (`MOUSE_RIGHT = tap ...`); unbound, it is ignored as before. The
+            // left button is the touch itself — except in mouse-look, where
+            // there is no cursor to touch with and its binding applies.
+            // (A left-button binding pressed in mouse-look is also released
+            // through here if the mode was switched off while it was held.)
+            if tag == 4
+                && (a as u32 != 0x110 || mapped_held.look_active() || mapped_held.is_down(0x110))
+            {
+                if let Some(action) = keymap.as_ref().and_then(|m| m.action_for(a as u16)) {
+                    run_binding(action, a as u16, b != 0.0, &mut mapped_held);
+                }
+                continue;
+            }
+            if multi_touch.is_some() {
+                // The mouse is finger 0 of the shared multi-pointer stream.
+                use crate::keymap_gesture::{Event, MOUSE_POINTER};
+                match tag {
+                    1 | 3 => {
+                        last = (a, b);
+                        if pressed {
+                            send_touch(Event::Move { id: MOUSE_POINTER, x: a, y: b });
+                        } else if touch_state.borrow().is_idle() {
+                            // A hover is its own stream; it may not interleave
+                            // with a touch gesture that is in progress.
+                            inject(ACTION_HOVER_MOVE, a, b, down_time);
+                        }
+                    }
+                    4 => {
+                        pressed = b != 0.0;
+                        let (x, y) = last;
+                        send_touch(if pressed {
+                            Event::Down { id: MOUSE_POINTER, x, y }
+                        } else {
+                            Event::Up { id: MOUSE_POINTER, x, y }
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             let (action, x, y) = match tag {
                 1 | 3 => {
                     last = (a, b);
@@ -5179,6 +5363,105 @@ fn spawn_input_pump(env: &JniEnv) {
             inject(action, x, y, down_time);
         }
     });
+}
+
+/// JNI handles for building a multi-pointer `MotionEvent`.
+///
+/// `MotionEvent.obtain(long, long, int, float, float, int)` can only describe
+/// one finger. The public 14-argument overload takes `PointerProperties[]` and
+/// `PointerCoords[]`, which is what `ACTION_POINTER_DOWN`/`_UP` need.
+struct MultiTouchJni {
+    obtain: JMethodId,
+    props_class: JClass,
+    props_ctor: JMethodId,
+    props_id: JFieldId,
+    props_tool: JFieldId,
+    coords_class: JClass,
+    coords_ctor: JMethodId,
+    coords_x: JFieldId,
+    coords_y: JFieldId,
+    coords_pressure: JFieldId,
+    coords_size: JFieldId,
+}
+
+impl MultiTouchJni {
+    fn resolve(env: &JniEnv, motion_class: JClass) -> Option<MultiTouchJni> {
+        let props_class = env.find_class("android/view/MotionEvent$PointerProperties")?;
+        let coords_class = env.find_class("android/view/MotionEvent$PointerCoords")?;
+        Some(MultiTouchJni {
+            obtain: env.static_method_id(
+                motion_class,
+                "obtain",
+                "(JJII[Landroid/view/MotionEvent$PointerProperties;\
+                 [Landroid/view/MotionEvent$PointerCoords;IIFFIIII)Landroid/view/MotionEvent;",
+            )?,
+            props_class,
+            props_ctor: env.method_id(props_class, "<init>", "()V")?,
+            props_id: env.field_id(props_class, "id", "I")?,
+            props_tool: env.field_id(props_class, "toolType", "I")?,
+            coords_class,
+            coords_ctor: env.method_id(coords_class, "<init>", "()V")?,
+            coords_x: env.field_id(coords_class, "x", "F")?,
+            coords_y: env.field_id(coords_class, "y", "F")?,
+            coords_pressure: env.field_id(coords_class, "pressure", "F")?,
+            coords_size: env.field_id(coords_class, "size", "F")?,
+        })
+    }
+
+    /// Build the event for `frame`. The caller owns the local references.
+    fn obtain(
+        &self,
+        env: &JniEnv,
+        motion_class: JClass,
+        frame: &crate::keymap_gesture::Frame,
+        down_time: i64,
+        event_time: i64,
+    ) -> Option<JObject> {
+        const TOOL_TYPE_FINGER: i32 = 1;
+        const SOURCE_TOUCHSCREEN: i32 = 0x1002;
+        let count = frame.pointers.len() as i32;
+        let props = env.new_object_array(count, self.props_class, std::ptr::null_mut())?;
+        let coords = env.new_object_array(count, self.coords_class, std::ptr::null_mut())?;
+        if props.is_null() || coords.is_null() {
+            return None;
+        }
+        for (index, pointer) in frame.pointers.iter().enumerate() {
+            let prop = env.new_object(self.props_class, self.props_ctor, &[])?;
+            let coord = env.new_object(self.coords_class, self.coords_ctor, &[])?;
+            if prop.is_null() || coord.is_null() {
+                return None;
+            }
+            env.set_int_field(prop, self.props_id, pointer.id);
+            env.set_int_field(prop, self.props_tool, TOOL_TYPE_FINGER);
+            env.set_float_field(coord, self.coords_x, pointer.x);
+            env.set_float_field(coord, self.coords_y, pointer.y);
+            env.set_float_field(coord, self.coords_pressure, 1.0);
+            env.set_float_field(coord, self.coords_size, 1.0);
+            env.set_object_array_element(props, index as i32, prop);
+            env.set_object_array_element(coords, index as i32, coord);
+        }
+        let event = env.call_static_object(
+            motion_class,
+            self.obtain,
+            &[
+                JValue { j: down_time },
+                JValue { j: event_time },
+                JValue { i: frame.action },
+                JValue { i: count },
+                JValue { l: props },
+                JValue { l: coords },
+                JValue { i: 0 },   // metaState
+                JValue { i: 0 },   // buttonState
+                JValue { f: 1.0 }, // xPrecision
+                JValue { f: 1.0 }, // yPrecision
+                JValue { i: 0 },   // deviceId
+                JValue { i: 0 },   // edgeFlags
+                JValue { i: SOURCE_TOUCHSCREEN },
+                JValue { i: 0 }, // flags
+            ],
+        )?;
+        (!event.is_null()).then_some(event)
+    }
 }
 
 /// Select the top focusable app window and deliver the window-manager focus
@@ -7449,10 +7732,10 @@ pub fn probe_native_display(env: &JniEnv) -> bool {
                     let (w, h, rate) = (width(current), height(current), fps(current));
                     let (mut dataspace, mut format) = (-1, -1);
                     color(display, &mut dataspace, &mut format);
-                    if display_type(display) != 0 || (w, h) != (720, 1280)
+                    if display_type(display) != 0 || (w, h) != surface_size()
                         || !rate.is_finite() || (rate - 60.0).abs() > 0.01
                         || (dataspace, format) != (0, 1) { return None; }
-                    println!("display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed");
+                    println!("display: native internal {w}x{h} @ 60 Hz, SDR RGBA_8888 passed");
                     Some(())
                 })();
                 // Config/display pointers are borrowed from this single allocation.
@@ -8880,5 +9163,14 @@ mod tests {
         let g = crate::geometry::Geometry::for_window(1024, 768, None);
         assert!(g.is_tablet());
         assert!(g.smallest_width_dp() >= crate::geometry::TABLET_MIN_DP);
+    }
+
+    /// The configuration must say which way up the surface is; a landscape
+    /// game laid out with `ORIENTATION_PORTRAIT` picks the wrong resources.
+    #[test]
+    fn configuration_orientation_follows_the_surface() {
+        assert_eq!(configuration_orientation(720, 1280), 1);
+        assert_eq!(configuration_orientation(1280, 720), 2);
+        assert_eq!(configuration_orientation(1920, 1080), 2);
     }
 }

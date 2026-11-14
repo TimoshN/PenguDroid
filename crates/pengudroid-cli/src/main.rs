@@ -17,6 +17,7 @@ mod audio;
 mod bundle;
 mod client;
 mod deps;
+mod display;
 mod doctor;
 mod geometry;
 mod gpu;
@@ -31,6 +32,7 @@ mod main_thread_probe;
 mod nativelib;
 mod native;
 mod process_identity;
+mod requirements;
 mod runner;
 mod runtime;
 mod sysroot;
@@ -73,6 +75,7 @@ fn real_main() -> i32 {
         "info" | "inspect" => cmd_info(&args[2..]),
         "deps" => deps::run(&args[2..]),
         "doctor" => doctor::run(&args[2..]),
+        "keymap-preset" => cmd_keymap_preset(&args[2..]),
         "sysroot" => sysroot::sysroot(&args[2..]),
         "runtime" => runtime::runtime(&args[2..]),
         "art-test" => sysroot::art_test(&args[2..]),
@@ -464,6 +467,42 @@ fn cmd_info(args: &[String]) -> i32 {
     }
 }
 
+/// `pengudroid keymap-preset [<package> [WxH]]`: print a built-in keymap.
+///
+/// The output is the profile file format, so it can be redirected straight to
+/// the path the runtime reads and edited from there.
+fn cmd_keymap_preset(args: &[String]) -> i32 {
+    let Some(package) = args.first() else {
+        for package in pengudroid_input::presets::packages() {
+            println!("{package}");
+        }
+        return 0;
+    };
+    let size = match args.get(1) {
+        Some(text) => match display::parse_size(text) {
+            Ok(size) => size,
+            Err(e) => {
+                eprintln!("pengudroid keymap-preset: {e}");
+                return 2;
+            }
+        },
+        None => display::Geometry::LANDSCAPE,
+    };
+    let Some(map) =
+        pengudroid_input::presets::for_package(package, size.width as f32, size.height as f32)
+    else {
+        eprintln!("pengudroid keymap-preset: no built-in keymap for {package}");
+        return 1;
+    };
+    println!("# {package} at {}x{} (built-in preset; positions are approximate)", size.width, size.height);
+    println!(
+        "# save as {}",
+        pengudroid_input::keymap::keymap_path(package).display()
+    );
+    print!("{}", map.render());
+    0
+}
+
 /// The `--plain` form of [`ApkInfo`]: one `key<TAB>value` line per field.
 ///
 /// Only fields a caller can act on are printed, and the activity falls back to
@@ -788,6 +827,7 @@ fn print_help() {
          \x20   deps <lib.so>                               bionic import coverage\n\
          \x20   doctor <app.apk>                            can this APK run? what is missing?\n\
          \x20   runtime [--status] [--download]           find/prepare the Android runtime (no --sysroot needed)\n\
+         \x20   keymap-preset [<package> [WxH]]             print a built-in keymap (no args: list them)\n\
          \x20   sysroot <dir>                               inspect an extracted Android system tree\n\
          \x20   art-test --sysroot <dir>                    try JNI_CreateJavaVM against it\n\
          \x20     [--classpath <apk|jar>] [--find-class <C>] [--main <C>]\n\
