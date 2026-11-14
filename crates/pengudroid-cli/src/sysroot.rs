@@ -2309,7 +2309,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         "x86_64"
     };
     let apk_path = std::path::PathBuf::from(&apk);
-    let data_dir = std::env::temp_dir().join(format!("pengudroid-data/{package}"));
+    let data_dir = crate::launcher::app_data_dir(&package);
     let lib_dir = std::env::temp_dir().join(format!(
         "pengudroid-libs/{package}/lib/{native_abi}"
     ));

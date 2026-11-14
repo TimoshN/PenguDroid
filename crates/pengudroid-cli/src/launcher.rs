@@ -147,6 +147,70 @@ fn plan_bundle(path: &std::path::Path) -> Result<(ApkInfo, Plan), String> {
     }
 }
 
+/// Where an app's private data lives (`/data/data/<pkg>`, its external files,
+/// downloaded game resources): `$PENGUDROID_DATA_ROOT/<pkg>`, by default
+/// `$XDG_DATA_HOME/pengudroid/data/<pkg>`. It must survive a reboot and must
+/// not live in RAM: `/tmp` is a tmpfs on most desktops, and a game that
+/// downloads 20+ GB of resources would fill memory and lose them on reboot.
+///
+/// Data an earlier version left in `/tmp/pengudroid-data/<pkg>` is moved here
+/// the first time, so an existing login survives the change.
+pub fn app_data_dir(package: &str) -> PathBuf {
+    let root = std::env::var_os("PENGUDROID_DATA_ROOT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+                .unwrap_or_else(std::env::temp_dir)
+                .join("pengudroid/data")
+        });
+    let dir = root.join(package);
+    let legacy = std::env::temp_dir().join("pengudroid-data").join(package);
+    if !dir.exists() && legacy.is_dir() && legacy != dir {
+        match move_tree(&legacy, &dir) {
+            Ok(()) => println!("data: moved {} to {}", legacy.display(), dir.display()),
+            Err(e) => eprintln!("data: could not move {} to {}: {e}", legacy.display(), dir.display()),
+        }
+    }
+    dir
+}
+
+/// Move a directory tree, across filesystems if need be (tmpfs to disk).
+fn move_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    // A partial copy goes to a sibling name first, so an interrupted move
+    // never looks like a complete data directory.
+    let staging = to.with_extension("moving");
+    let _ = std::fs::remove_dir_all(&staging);
+    copy_tree(from, &staging)?;
+    std::fs::rename(&staging, to)?;
+    std::fs::remove_dir_all(from)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// The default prefix for a package: `$XDG_DATA_HOME/pengudroid/prefixes/<pkg>`.
 pub fn default_prefix(package: &str) -> PathBuf {
     let data = std::env::var_os("XDG_DATA_HOME")
@@ -518,6 +582,13 @@ pub fn launch(args: &[String]) -> i32 {
                 "PENGUDROID_KEYMAP_PATH",
                 pengudroid_input::keymap::keymap_path(&info.package),
             );
+            // Same for app data: resolved against the host's HOME, before the
+            // prefix replaces it, so data persists across launches and prefixes.
+            if std::env::var_os("PENGUDROID_DATA_ROOT").is_none() {
+                if let Some(root) = app_data_dir(&info.package).parent() {
+                    cmd.env("PENGUDROID_DATA_ROOT", root);
+                }
+            }
             cmd.arg("--main").arg(main);
             // ARM-only apps need the native bridge. This stays opt-in so the
             // existing x86_64 app path (NewPipe and friends) is unchanged; the
@@ -631,6 +702,30 @@ fn run_child(mut cmd: std::process::Command) -> i32 {
             eprintln!("pengudroid launch: cannot start the guest: {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    use super::*;
+
+    #[test]
+    fn moving_a_tree_keeps_files_links_and_nesting() {
+        let base = std::env::temp_dir().join(format!("pd-move-{}", std::process::id()));
+        let from = base.join("from");
+        std::fs::create_dir_all(from.join("shared_prefs")).unwrap();
+        std::fs::write(from.join("shared_prefs/login.xml"), "token").unwrap();
+        std::os::unix::fs::symlink("shared_prefs/login.xml", from.join("link")).unwrap();
+        let to = base.join("disk/data/pkg");
+        // copy_tree is what a cross-device move falls back to.
+        copy_tree(&from, &to).unwrap();
+        assert_eq!(std::fs::read_to_string(to.join("shared_prefs/login.xml")).unwrap(), "token");
+        assert_eq!(std::fs::read_link(to.join("link")).unwrap(), PathBuf::from("shared_prefs/login.xml"));
+        std::fs::remove_dir_all(&to).unwrap();
+        move_tree(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert!(to.join("shared_prefs/login.xml").exists());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
 

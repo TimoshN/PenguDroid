@@ -453,7 +453,7 @@ pub fn native_main(args: &[String]) -> i32 {
 
     // Data directories the app may write to.
     let package = std::env::var("PENGUDROID_PACKAGE").unwrap_or_else(|_| "app".into());
-    let data_dir = std::env::temp_dir().join("pengudroid-data").join(&package);
+    let data_dir = crate::launcher::app_data_dir(&package);
     let _ = std::fs::create_dir_all(&data_dir);
     let data_path = CString::new(data_dir.to_string_lossy().as_bytes()).unwrap_or_default();
 
