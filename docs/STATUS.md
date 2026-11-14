@@ -229,6 +229,16 @@ Validation: shim **159 passed**, cli green (94+7+2+3+2), `cargo build
   (`View.onCheckIsTextEditor`), as with any keymapper; before, they became
   touches on the HUD and never reached the login form. The press decides and
   its release follows it.
+* Windows added after launch (dialogs, popups, SDK overlays) now get a
+  surface: only an Activity's own window was surfaced on resume, so
+  `WindowManager.addView` windows existed but were never drawn. NewPipe's
+  "Keep Android Open" dialog had been invisible all along, and Genshin's
+  Geetest v4 slide captcha (shown after pressing Login, `aigis` mmtType 1)
+  loaded its page but never appeared. `attach_new_windows` runs on the main
+  loop every 250 ms and gives such windows (type > TYPE_BASE_APPLICATION, added,
+  visible, not stopped, no valid SurfaceControl) what resume gives an Activity.
+  Each window is its own desktop window; a dialog is not composited over its
+  parent with a dim, so non-fullscreen dialogs sit on black.
 * Not done: key repeat (Wayland leaves repeat to the client) and switching
   layout groups at runtime (the map is built from the first group at start).
 

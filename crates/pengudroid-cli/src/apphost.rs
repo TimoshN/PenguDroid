@@ -3609,6 +3609,7 @@ pub fn loop_forever(env: &JniEnv) {
     loop {
         drain_activity_requests(env, &mut scratch);
         webview::probe_tick(env);
+        attach_new_windows(env);
         match env.call_static_boolean(
             looper_class,
             once,
@@ -6700,81 +6701,146 @@ fn force_visible(env: &JniEnv, record: JObject) {
             continue;
         }
         if decor.is_null() || !env.is_same_object(env.object_field(root, view_field), decor) { continue; }
-        // Never make another, stopped Activity visible while resuming this one.
-        // `isViewVisible()` is false while `mAppVisible` is false, and
-        // `performTraversals` then skips `performDraw` entirely. On a device the
-        // window manager flips this; here the field is set directly.
-        if let Some(f) = env.field_id(root_class, "mAppVisible", "Z") {
-            env.set_boolean_field(root, f, true);
+        surface_window(env, root_class, root, index as usize);
+    }
+}
+
+/// The window manager's half for windows added after launch: dialogs, popups
+/// and SDK overlays (a captcha box, a permission prompt) go through
+/// `WindowManager.addView` and, with no window manager, never receive a
+/// surface, so they exist but are never drawn. Throttled; main thread only.
+fn attach_new_windows(env: &JniEnv) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250)) {
+            return;
         }
-        // `isViewVisible()` also needs the root view to be VISIBLE.
-        if let Some(view_field) = env.field_id(root_class, "mView", "Landroid/view/View;") {
+        *last = Some(std::time::Instant::now());
+    }
+    let _ = (|| -> Option<()> {
+        let _frame = env.local_frame(32)?;
+        let wmg_class = env.find_class("android/view/WindowManagerGlobal")?;
+        let get_instance = env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;")?;
+        let wmg = env.call_static_object(wmg_class, get_instance, &[])?;
+        if wmg.is_null() { return None; }
+        let roots = env.object_field(wmg, env.field_id(wmg_class, "mRoots", "Ljava/util/ArrayList;")?);
+        if roots.is_null() { return None; }
+        let list_class = env.find_class("java/util/ArrayList")?;
+        let size = env.method_id(list_class, "size", "()I")?;
+        let get = env.method_id(list_class, "get", "(I)Ljava/lang/Object;")?;
+        let root_class = env.find_class("android/view/ViewRootImpl")?;
+        let view_field = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+        let added = env.field_id(root_class, "mAdded", "Z")?;
+        let stopped = env.field_id(root_class, "mStopped", "Z")?;
+        let sc_field = env.field_id(root_class, "mSurfaceControl", "Landroid/view/SurfaceControl;")?;
+        let sc_class = env.find_class("android/view/SurfaceControl")?;
+        let sc_valid = env.method_id(sc_class, "isValid", "()Z")?;
+        let view_class = env.find_class("android/view/View")?;
+        let visibility = env.method_id(view_class, "getVisibility", "()I")?;
+        // An Activity's own window is surfaced when it resumes; only windows
+        // of type above TYPE_BASE_APPLICATION (1) are this function's business.
+        let params_field = env.field_id(root_class, "mWindowAttributes", "Landroid/view/WindowManager$LayoutParams;")?;
+        let params_class = env.find_class("android/view/WindowManager$LayoutParams")?;
+        let type_field = env.field_id(params_class, "type", "I")?;
+        for i in 0..env.call_int(roots, size, &[])? {
+            let Some(root) = env.call_object(roots, get, &[JValue { i }]) else { continue };
+            if root.is_null() || !env.boolean_field(root, added) || env.boolean_field(root, stopped) { continue; }
             let view = env.object_field(root, view_field);
-            if !view.is_null() {
-                if let Some(view_class) = env.find_class("android/view/View") {
-                    if let Some(get_vis) = env.method_id(view_class, "getVisibility", "()I") {
-                        let vis = env.call_int(view, get_vis, &[]).unwrap_or(-1);
-                        println!("apphost: root {index} mView.getVisibility() = {vis} (0 = VISIBLE)");
-                    }
+            if view.is_null() || env.call_int(view, visibility, &[]) != Some(0) { continue; }
+            let params = env.object_field(root, params_field);
+            if params.is_null() || env.int_field(params, type_field) <= 1 { continue; }
+            let sc = env.object_field(root, sc_field);
+            if !sc.is_null() && env.call_boolean(sc, sc_valid, &[]) == Some(true) { continue; }
+            println!("apphost: window root {i} (type {}) was added without a surface; attaching one", env.int_field(params, type_field));
+            surface_window(env, root_class, root, i as usize);
+        }
+        Some(())
+    })();
+}
+
+/// What the window manager does for a window that is added: make it visible,
+/// give it a valid surface and a frame, and schedule its first traversal.
+/// Activities get this on resume; dialogs and popups added later get it from
+/// [`attach_new_windows`].
+fn surface_window(env: &JniEnv, root_class: JClass, root: JObject, index: usize) {
+    let Some(schedule) = env.method_id(root_class, "scheduleTraversals", "()V") else {
+        return;
+    };
+    // Never make another, stopped Activity visible while resuming this one.
+    // `isViewVisible()` is false while `mAppVisible` is false, and
+    // `performTraversals` then skips `performDraw` entirely. On a device the
+    // window manager flips this; here the field is set directly.
+    if let Some(f) = env.field_id(root_class, "mAppVisible", "Z") {
+        env.set_boolean_field(root, f, true);
+    }
+    // `isViewVisible()` also needs the root view to be VISIBLE.
+    if let Some(view_field) = env.field_id(root_class, "mView", "Landroid/view/View;") {
+        let view = env.object_field(root, view_field);
+        if !view.is_null() {
+            if let Some(view_class) = env.find_class("android/view/View") {
+                if let Some(get_vis) = env.method_id(view_class, "getVisibility", "()I") {
+                    let vis = env.call_int(view, get_vis, &[]).unwrap_or(-1);
+                    println!("apphost: root {index} mView.getVisibility() = {vis} (0 = VISIBLE)");
                 }
             }
         }
-        // `performDraw` also requires a valid surface. The SurfaceControl we
-        // hand back from `relayout` does not survive `SurfaceControl.readFromParcel`
-        // (the parcel layout is version specific), so build one through the
-        // framework's own builder - that path goes through
-        // `SurfaceComposerClient.createSurface`, which the broker answers - and
-        // copy it into `mSurface`.
-        if let Some(sc_field) = env.field_id(root_class, "mSurfaceControl", "Landroid/view/SurfaceControl;") {
-            let sc = env.object_field(root, sc_field);
-            let valid = if sc.is_null() {
-                false
-            } else {
-                env.find_class("android/view/SurfaceControl")
-                    .and_then(|c| env.method_id(c, "isValid", "()Z"))
-                    .and_then(|m| env.call_boolean(sc, m, &[]))
-                    .unwrap_or(false)
-            };
-            println!("apphost: root {index} mSurfaceControl.isValid() = {valid}");
-            if !valid {
-                if let Some(built) = build_surface_control(env) {
-                    // `relayoutWindow` ends with
-                    // `if (mSurfaceControl.isValid()) { ... } else { destroySurface(); }`,
-                    // so fixing only `mSurface` is not enough: the next traversal
-                    // releases it again. The control has to be valid too.
-                    if let Some(sc_field) =
-                        env.field_id(root_class, "mSurfaceControl", "Landroid/view/SurfaceControl;")
-                    {
-                        env.set_object_field(root, sc_field, built);
-                        println!("apphost: root {index} mSurfaceControl := built");
-                    }
-                    // Android 17 removed `ViewRootImpl.mForceDisableBLAST`: BLAST is
-                    // the only render path. There is no legacy fallback to select.
-                    if std::env::var_os("PENGUDROID_BLAST").is_some() {
-                        println!("apphost: root {index} BLAST is always enabled on Android 17");
-                    }
-                    if let Some(surface_field) =
-                        env.field_id(root_class, "mSurface", "Landroid/view/Surface;")
-                    {
-                        let surface = env.object_field(root, surface_field);
-                        if !surface.is_null() {
-                            if let Some(surface_class) = env.find_class("android/view/Surface") {
-                                if let Some(copy_from) = env.method_id(
-                                    surface_class,
-                                    "copyFrom",
-                                    "(Landroid/view/SurfaceControl;)V",
-                                ) {
-                                    if env.call_void(surface, copy_from, &[JValue { l: built }]) {
-                                        println!("apphost: root {index} mSurface.copyFrom(built) done");
-                                        if let Some(is_valid) =
-                                            env.method_id(surface_class, "isValid", "()Z")
-                                        {
-                                            let ok = env.call_boolean(surface, is_valid, &[]);
-                                            println!("apphost: root {index} mSurface.isValid() = {ok:?}");
-                                        }
-                                    } else {
-                                        eprintln!("apphost: root {index} mSurface.copyFrom threw");
+    }
+    // `performDraw` also requires a valid surface. The SurfaceControl we
+    // hand back from `relayout` does not survive `SurfaceControl.readFromParcel`
+    // (the parcel layout is version specific), so build one through the
+    // framework's own builder - that path goes through
+    // `SurfaceComposerClient.createSurface`, which the broker answers - and
+    // copy it into `mSurface`.
+    if let Some(sc_field) = env.field_id(root_class, "mSurfaceControl", "Landroid/view/SurfaceControl;") {
+        let sc = env.object_field(root, sc_field);
+        let valid = if sc.is_null() {
+            false
+        } else {
+            env.find_class("android/view/SurfaceControl")
+                .and_then(|c| env.method_id(c, "isValid", "()Z"))
+                .and_then(|m| env.call_boolean(sc, m, &[]))
+                .unwrap_or(false)
+        };
+        println!("apphost: root {index} mSurfaceControl.isValid() = {valid}");
+        if !valid {
+            if let Some(built) = build_surface_control(env) {
+                // `relayoutWindow` ends with
+                // `if (mSurfaceControl.isValid()) { ... } else { destroySurface(); }`,
+                // so fixing only `mSurface` is not enough: the next traversal
+                // releases it again. The control has to be valid too.
+                if let Some(sc_field) =
+                    env.field_id(root_class, "mSurfaceControl", "Landroid/view/SurfaceControl;")
+                {
+                    env.set_object_field(root, sc_field, built);
+                    println!("apphost: root {index} mSurfaceControl := built");
+                }
+                // Android 17 removed `ViewRootImpl.mForceDisableBLAST`: BLAST is
+                // the only render path. There is no legacy fallback to select.
+                if std::env::var_os("PENGUDROID_BLAST").is_some() {
+                    println!("apphost: root {index} BLAST is always enabled on Android 17");
+                }
+                if let Some(surface_field) =
+                    env.field_id(root_class, "mSurface", "Landroid/view/Surface;")
+                {
+                    let surface = env.object_field(root, surface_field);
+                    if !surface.is_null() {
+                        if let Some(surface_class) = env.find_class("android/view/Surface") {
+                            if let Some(copy_from) = env.method_id(
+                                surface_class,
+                                "copyFrom",
+                                "(Landroid/view/SurfaceControl;)V",
+                            ) {
+                                if env.call_void(surface, copy_from, &[JValue { l: built }]) {
+                                    println!("apphost: root {index} mSurface.copyFrom(built) done");
+                                    if let Some(is_valid) =
+                                        env.method_id(surface_class, "isValid", "()Z")
+                                    {
+                                        let ok = env.call_boolean(surface, is_valid, &[]);
+                                        println!("apphost: root {index} mSurface.isValid() = {ok:?}");
                                     }
+                                } else {
+                                    eprintln!("apphost: root {index} mSurface.copyFrom threw");
                                 }
                             }
                         }
@@ -6782,19 +6848,19 @@ fn force_visible(env: &JniEnv, record: JObject) {
                 }
             }
         }
-        force_window_frame(env, root, surface_w(), surface_h());
-        dump_draw_state(env, root, index as usize);
-        schedule_roots_dump(env);
-        // `performTraversals` must run inside a Choreographer frame callback:
-        // calling it directly makes `Choreographer.getFrameTimeNanos()` throw
-        // "must only be called as part of a callback while a frame is in
-        // progress". `scheduleTraversals()` posts the framework's own
-        // TraversalRunnable, which is the correct entry point.
-        if env.call_void(root, schedule, &[]) {
-            println!("apphost: scheduleTraversals() done for root {index}");
-        } else {
-            eprintln!("apphost: scheduleTraversals threw for root {index}");
-        }
+    }
+    force_window_frame(env, root, surface_w(), surface_h());
+    dump_draw_state(env, root, index as usize);
+    schedule_roots_dump(env);
+    // `performTraversals` must run inside a Choreographer frame callback:
+    // calling it directly makes `Choreographer.getFrameTimeNanos()` throw
+    // "must only be called as part of a callback while a frame is in
+    // progress". `scheduleTraversals()` posts the framework's own
+    // TraversalRunnable, which is the correct entry point.
+    if env.call_void(root, schedule, &[]) {
+        println!("apphost: scheduleTraversals() done for root {index}");
+    } else {
+        eprintln!("apphost: scheduleTraversals threw for root {index}");
     }
 }
 
