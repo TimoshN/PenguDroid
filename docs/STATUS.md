@@ -224,6 +224,11 @@ Validation: shim **159 passed**, cli green (94+7+2+3+2), `cargo build
   `PENGUDROID_SYNTH_KEYS="9000:23,40,39,26,30"` (test-only key injection,
   `+ms` items pause): the page reported `ıişğa`. In Genshin the keys reach
   the native login `EditText` and the HoYoverse login WebView.
+* Keys bound by a game keymap (Genshin's built-in preset binds 17, e.g.
+  D/E/W/A/S) type normally while a text field has focus
+  (`View.onCheckIsTextEditor`), as with any keymapper; before, they became
+  touches on the HUD and never reached the login form. The press decides and
+  its release follows it.
 * Not done: key repeat (Wayland leaves repeat to the client) and switching
   layout groups at runtime (the map is built from the first group at start).
 

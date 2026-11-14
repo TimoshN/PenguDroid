@@ -4808,6 +4808,9 @@ fn spawn_input_pump(env: &JniEnv) {
         const ACTION_SCROLL: i32 = 8;
 
         let mut keyboard = crate::keyboard::Keyboard::default();
+        // Bound keys pressed while a text field had focus: their releases
+        // must reach the field too, not the keymap.
+        let mut typed_past_keymap: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut down_time = 0i64;
         let mut pressed = false;
         let mut last = (0.0f32, 0.0f32);
@@ -5243,10 +5246,27 @@ fn spawn_input_pump(env: &JniEnv) {
             }
             // Keyboard: `a` is the Linux keycode, `b` is 1 for press.
             if tag == 6 {
+                // While a text field has focus (a login form, chat, a WebView
+                // input) keys type, as with any keymapper: the press decides,
+                // and its release follows the same way.
+                let typing = keymap.as_ref().is_some_and(|m| m.action_for(a as u16).is_some()) && {
+                    if b != 0.0 {
+                        let roots = env.call_static_object(wmg_class, get_instance, &[])
+                            .map(|wmg| env.object_field(wmg, roots_field))
+                            .filter(|r| !r.is_null());
+                        let editing = roots
+                            .and_then(|roots| keyboard_root(&env, roots, root_class, size_m, get_m))
+                            .is_some_and(|root| focused_text_editor(&env, root, root_class));
+                        if editing { typed_past_keymap.insert(a as u32); }
+                        editing
+                    } else {
+                        typed_past_keymap.remove(&(a as u32))
+                    }
+                };
                 // A bound key drives a touch gesture instead of the Android
                 // key. Consuming it here is what makes a touch-only game
                 // playable without also typing into the app.
-                if let Some(map) = &keymap {
+                if let Some(map) = keymap.as_ref().filter(|_| !typing) {
                     if let Some(action) = map.action_for(a as u16) {
                         run_binding(action, a as u16, b != 0.0, &mut mapped_held);
                         // A `look` binding toggles mouse-look; keep the
@@ -5501,6 +5521,28 @@ impl MultiTouchJni {
 /// Select the top focusable app window and deliver the window-manager focus
 /// callback. LayoutParams types preserve app/dialog ordering even when a dialog
 /// was added during onCreate, before its activity's base window was attached.
+/// Whether the root's focused view edits text (`View.onCheckIsTextEditor`):
+/// an EditText, or a WebView whose focused node is editable.
+fn focused_text_editor(env: &JniEnv, root: JObject, root_class: JClass) -> bool {
+    (|| -> Option<bool> {
+        let _frame = env.local_frame(8)?;
+        let view_field = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+        let view = env.object_field(root, view_field);
+        if view.is_null() {
+            return Some(false);
+        }
+        let view_class = env.find_class("android/view/View")?;
+        let find_focus = env.method_id(view_class, "findFocus", "()Landroid/view/View;")?;
+        let focus = env.call_object(view, find_focus, &[])?;
+        if focus.is_null() {
+            return Some(false);
+        }
+        let is_editor = env.method_id(view_class, "onCheckIsTextEditor", "()Z")?;
+        env.call_boolean(focus, is_editor, &[])
+    })()
+    .unwrap_or(false)
+}
+
 /// `PENGUDROID_TRACE_INPUT`: which window and view a key went to, and the
 /// focused view's text afterwards.
 fn trace_key_target(env: &JniEnv, root: JObject, root_class: JClass) {
