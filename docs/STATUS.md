@@ -139,10 +139,20 @@ Fixed in order:
    is no longer blocklisted, and the frame dump shows the 2D canvas and the
    WebGL canvases (`target/wv43.png`).
 
-Open: in about one run of three, the *first* WebGL canvas of the page
-(antialiased WebGL2) stays white while the others show; it shows when another
-WebGL canvas is created first. Probably a first-frame race between the GPU
-thread's shared-image producer and the RenderThread compositor.
+5. The "first WebGL canvas sometimes stays white" problem was not a race:
+   gleshim's `eglMakeCurrent` bound its surface FBO unconditionally, which
+   overwrote the context's own framebuffer binding on every context switch.
+   Chromium tracks its bindings and does not rebind after a switch, so a
+   WebGL `clear` landed in gleshim's FBO and the back buffer copied to the
+   canvas stayed empty (a 6-canvas page without `readPixels` showed none of
+   them, every run). `eglMakeCurrent` now re-targets only framebuffer 0
+   (draw and read separately), sets the viewport only the first time a
+   context is made current, and creating the surface texture no longer
+   changes the context's `GL_TEXTURE_2D` binding. Plain `EGL_SYNC_FENCE_KHR`
+   syncs now `glFinish` like native fences. Regression test:
+   `make_current_keeps_the_contexts_own_framebuffer_binding` (fails on the
+   old code). The 6-canvas page and the fixture show every canvas.
+
 `PENGUDROID_WEBVIEW_SWITCHES="name=value;..."` passes Chromium switches for
 experiments. Debug aids: `PENGUDROID_TRACE_GLESHIM=1` now labels EGL calls
 with `tid/thread-name`, and `PENGUDROID_ALLOW_PTRACE=1` lets gdb attach to the

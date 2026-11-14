@@ -600,6 +600,9 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
     let tex = match rec.targets.iter().find(|t| t.group == info.group) {
         Some(target) => target.tex,
         None => {
+            // Creating the texture must not disturb the context's own
+            // GL_TEXTURE_2D binding.
+            let previous = host_get_integer(host, 0x8069) as u32; // GL_TEXTURE_BINDING_2D
             let mut tex = 0u32;
             gen_textures(1, &mut tex);
             if tex == 0 {
@@ -619,6 +622,7 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
             );
             tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            bind_texture(GL_TEXTURE_2D, previous);
             rec.targets.push(Target { group: info.group, tex, fbos: Vec::new() });
             tex
         }
@@ -645,6 +649,94 @@ unsafe fn bind_surface_fbo(surface: EGLSurface, host: &Host) -> Result<(), Strin
     }
     if let Some(viewport) = host.gl_viewport {
         viewport(0, 0, rec.w as c_int, rec.h as c_int);
+    }
+    Ok(())
+}
+
+/// `glGetIntegerv(pname)` on the current host context (0 if unavailable).
+unsafe fn host_get_integer(host: &Host, pname: u32) -> i32 {
+    type GetIntegerv = unsafe extern "C" fn(u32, *mut i32);
+    static REAL: OnceLock<Option<GetIntegerv>> = OnceLock::new();
+    let real = REAL.get_or_init(|| {
+        let gpa = host.get_proc_address?;
+        let p = gpa(c"glGetIntegerv".as_ptr());
+        (!p.is_null()).then(|| std::mem::transmute::<*mut c_void, GetIntegerv>(p))
+    });
+    let mut value = 0;
+    if let Some(get) = real {
+        get(pname, &mut value);
+    }
+    value
+}
+
+/// Whether framebuffer `name` is what the context sees as its default
+/// framebuffer: 0 itself, or one of the surface FBOs this shim made for the
+/// context (`ensure_fbo`), which stand in for 0.
+fn is_default_framebuffer(name: u32, serial: u64) -> bool {
+    if name == 0 {
+        return true;
+    }
+    let surfaces: Vec<usize> = live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    surfaces.into_iter().any(|surface| {
+        // SAFETY: live surfaces are SurfaceRecs owned by this shim.
+        let rec = unsafe { &*(surface as *const SurfaceRec) };
+        rec.targets.iter().any(|t| t.fbos.iter().any(|&(s, fbo)| s == serial && fbo == name))
+    })
+}
+
+/// `eglMakeCurrent`'s half of default-framebuffer emulation.
+///
+/// Real EGL never changes a context's framebuffer bindings: making a context
+/// current only re-targets *framebuffer 0* at the new surface, and sets the
+/// viewport the first time the context is made current. Binding the surface
+/// FBO unconditionally overwrote the app's own FBO binding on every switch.
+/// Chromium tracks its bindings and does not rebind after a switch, so a
+/// WebGL clear landed in this shim's FBO instead of the canvas, and the
+/// canvas reached the screen blank.
+unsafe fn make_current_surface_fbo(surface: EGLSurface, host: &Host) -> Result<(), String> {
+    const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
+    const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+    const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+    const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
+    let current = CURRENT_CONTEXT.with(|c| c.get());
+    let info = context_info(current);
+    let first_time = {
+        static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let first = !seen.contains(&info.serial);
+        if first {
+            seen.push(info.serial);
+        }
+        first
+    };
+    let draw = host_get_integer(host, GL_DRAW_FRAMEBUFFER_BINDING) as u32;
+    let read = host_get_integer(host, GL_READ_FRAMEBUFFER_BINDING) as u32;
+    let draw_default = first_time || is_default_framebuffer(draw, info.serial);
+    let read_default = first_time || is_default_framebuffer(read, info.serial);
+    let (_, fbo) = ensure_fbo(surface, host)?;
+    if let Some(bind_framebuffer) = host.gl_bind_framebuffer {
+        match (draw_default, read_default) {
+            (true, true) => bind_framebuffer(GL_FRAMEBUFFER, fbo),
+            (true, false) => {
+                bind_framebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+                bind_framebuffer(GL_READ_FRAMEBUFFER, read);
+            }
+            (false, true) => {
+                bind_framebuffer(GL_DRAW_FRAMEBUFFER, draw);
+                bind_framebuffer(GL_READ_FRAMEBUFFER, fbo);
+            }
+            // `ensure_fbo` may have bound a new FBO while creating it.
+            (false, false) => {
+                bind_framebuffer(GL_DRAW_FRAMEBUFFER, draw);
+                bind_framebuffer(GL_READ_FRAMEBUFFER, read);
+            }
+        }
+    }
+    if first_time {
+        let rec = &*(surface as *const SurfaceRec);
+        if let Some(viewport) = host.gl_viewport {
+            viewport(0, 0, rec.w as c_int, rec.h as c_int);
+        }
     }
     Ok(())
 }
@@ -1601,7 +1693,7 @@ pub unsafe extern "C" fn eglMakeCurrent(
     if !draw.is_null() {
         // Binding has to happen after the context is current. `draw` is one of
         // our `SurfaceRec`s; `ensure_fbo`/`bind_surface_fbo` need no lock.
-        if let Err(e) = bind_surface_fbo(draw, host) {
+        if let Err(e) = make_current_surface_fbo(draw, host) {
             log_once(format_args!("eglMakeCurrent: {e}"));
             return EGL_FALSE;
         }
@@ -1787,10 +1879,14 @@ pub unsafe extern "C" fn eglCreateImageKHR(dpy: EGLDisplay, ctx: EGLContext, tar
     if target == EGL_NATIVE_BUFFER_ANDROID {
         return create_native_buffer_image(host, dpy, buffer);
     }
-    match host.create_image_khr {
+    let image = match host.create_image_khr {
         Some(create) => create(dpy, ctx, target, buffer, attribs),
         None => std::ptr::null_mut(),
+    };
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] eglCreateImageKHR target={target:#x} ctx={ctx:p} buffer={buffer:p} -> {image:p} thread={}", thread_label());
     }
+    image
 }
 
 /// `eglDestroyImageKHR`: images made from an AHardwareBuffer are reference counted.
@@ -2104,8 +2200,8 @@ pub unsafe extern "C" fn eglQuerySurface(
 // `validate_display`, which is where the flood of
 // "libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)" came from.
 //
-// A sync object here is a bare sentinel: the FBO is rendered synchronously and
-// presentation copies the whole buffer, so there is never anything to wait for.
+// A sync object here is a bare sentinel: creating one finishes the GPU work
+// submitted so far (`eglCreateSyncKHR`), so every wait is already satisfied.
 
 /// `EGL_CONDITION_SATISFIED_KHR`.
 const EGL_CONDITION_SATISFIED_KHR: c_int = 0x30F6;
@@ -2122,19 +2218,30 @@ pub unsafe extern "C" fn eglCreateSyncKHR(
 ) -> *mut c_void {
     const EGL_SYNC_NATIVE_FENCE_ANDROID: u32 = 0x3144;
     const EGL_SYNC_NATIVE_FENCE_FD_ANDROID: c_int = 0x3145;
-    if kind == EGL_SYNC_NATIVE_FENCE_ANDROID {
-        let imported = read_attribs(attrib_list).and_then(|list| {
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] eglCreateSyncKHR kind={kind:#x} thread={}", thread_label());
+    }
+    let imported = (kind == EGL_SYNC_NATIVE_FENCE_ANDROID)
+        .then(|| read_attribs(attrib_list))
+        .flatten()
+        .and_then(|list| {
             list.chunks(2).find(|pair| pair.len() == 2 && pair[0] == EGL_SYNC_NATIVE_FENCE_FD_ANDROID)
                 .map(|pair| pair[1])
         });
-        match imported {
-            // A consumer waiting on a producer's fence: the producer finished
-            // its GPU work before handing the fd out (see below), and EGL takes
-            // ownership of the fd.
-            Some(fd) if fd >= 0 => { libc::close(fd); }
-            // A producer asking for a fence over the work submitted so far.
-            _ => { if let Some(finish) = host().ok().and_then(|h| h.gl_finish) { finish(); } }
-        }
+    match imported {
+        // A consumer waiting on a producer's fence: the producer finished
+        // its GPU work before handing the fd out (see below), and EGL takes
+        // ownership of the fd.
+        Some(fd) if fd >= 0 => { libc::close(fd); }
+        // A producer asking for a fence over the work submitted so far, plain
+        // (EGL_SYNC_FENCE_KHR) or native. Waits on our syncs return at once,
+        // so the work has to be complete before the sync exists. Chromium
+        // hands a WebGL frame from its GPU thread to the RenderThread
+        // compositor (another share group, through an EGLImage) behind a
+        // plain fence; without this finish the compositor could sample the
+        // texture before the clear/draw landed, and a canvas that is never
+        // redrawn stayed white.
+        _ => { if let Some(finish) = host().ok().and_then(|h| h.gl_finish) { finish(); } }
     }
     std::ptr::addr_of!(SYNC_SENTINEL) as *mut c_void
 }
@@ -2936,6 +3043,52 @@ mod thread_tests {
             eglDestroySurface(dpy, surface);
             eglDestroyContext(dpy, first);
             eglDestroyContext(dpy, second);
+        }
+    }
+
+    /// eglMakeCurrent re-targets framebuffer 0 only: an app FBO bound in a
+    /// context stays bound across a switch to another context and back
+    /// (Chromium's WebGL contexts rely on this), while a context that had
+    /// the default framebuffer bound gets the surface FBO again.
+    #[test]
+    fn make_current_keeps_the_contexts_own_framebuffer_binding() {
+        let Ok(host) = host() else { eprintln!("skip: no host EGL"); return; };
+        let Some(gen_framebuffers) = host.gl_gen_framebuffers else { return };
+        unsafe {
+            let dpy = eglGetDisplay(std::ptr::null_mut());
+            let (mut major, mut minor) = (0, 0);
+            if dpy.is_null() || eglInitialize(dpy, &mut major, &mut minor) != EGL_TRUE { eprintln!("skip: no display"); return; }
+            eglBindAPI(0x30A0);
+            let attribs: [c_int; 5] = [0x3033, 0x0001, 0x3040, 0x0040, 0x3038];
+            let (mut config, mut count): (EGLConfig, c_int) = (std::ptr::null_mut(), 0);
+            if eglChooseConfig(dpy, attribs.as_ptr(), &mut config, 1, &mut count) != EGL_TRUE || count < 1 { eprintln!("skip: no ES3 config"); return; }
+            let context_attribs = [0x3098, 3, 0x3038];
+            let app = eglCreateContext(dpy, config, std::ptr::null_mut(), context_attribs.as_ptr());
+            let other = eglCreateContext(dpy, config, app, context_attribs.as_ptr());
+            let surface_attribs = [0x3057, 16, 0x3056, 16, 0x3038];
+            let surface = eglCreatePbufferSurface(dpy, config, surface_attribs.as_ptr());
+            assert!(!app.is_null() && !other.is_null() && !surface.is_null());
+
+            assert_eq!(eglMakeCurrent(dpy, surface, surface, app), EGL_TRUE);
+            let surface_fbo = host_get_integer(host, 0x8CA6) as u32;
+            assert_ne!(surface_fbo, 0, "the surface FBO stands in for framebuffer 0");
+            let mut own = 0u32;
+            gen_framebuffers(1, &mut own);
+            glBindFramebuffer(GL_FRAMEBUFFER, own);
+            assert_eq!(eglMakeCurrent(dpy, surface, surface, other), EGL_TRUE);
+            assert_eq!(eglMakeCurrent(dpy, surface, surface, app), EGL_TRUE);
+            assert_eq!(host_get_integer(host, 0x8CA6) as u32, own, "draw binding survives the switch");
+            assert_eq!(host_get_integer(host, 0x8CAA) as u32, own, "read binding survives the switch");
+
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            assert_eq!(eglMakeCurrent(dpy, surface, surface, other), EGL_TRUE);
+            assert_eq!(eglMakeCurrent(dpy, surface, surface, app), EGL_TRUE);
+            assert_eq!(host_get_integer(host, 0x8CA6) as u32, surface_fbo, "framebuffer 0 follows the surface");
+
+            eglMakeCurrent(dpy, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+            eglDestroySurface(dpy, surface);
+            eglDestroyContext(dpy, other);
+            eglDestroyContext(dpy, app);
         }
     }
 
