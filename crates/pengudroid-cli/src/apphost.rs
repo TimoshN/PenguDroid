@@ -4906,6 +4906,37 @@ fn spawn_input_pump(env: &JniEnv) {
         // `"665,682;145,300@12000"` means "tap OK after 8 s, then open the first
         // feed item 12 s later".
         eprintln!("apphost: input pump: reached the click/probe stage");
+        // `PENGUDROID_SYNTH_KEYS="delayMs:code,+ms,code,..."` (test only) queues Linux
+        // key presses once the delay passes, through the same queue and key path
+        // as compositor keys. With no window there is no other way to type.
+        if let Ok(spec) = std::env::var("PENGUDROID_SYNTH_KEYS") {
+            let inject = unsafe {
+                libc::dlsym(libc::RTLD_DEFAULT, b"pengudroid_input_inject_key\0".as_ptr() as *const libc::c_char)
+            };
+            if !inject.is_null() {
+                let inject: extern "C" fn(u32, i32) = unsafe { std::mem::transmute(inject) };
+                let (delay, codes) = spec.split_once(':').unwrap_or(("8000", spec.as_str()));
+                let delay = delay.trim().parse::<u64>().unwrap_or(8000);
+                // `+ms` items pause, e.g. `"9000:1,+1500,23,40"`: Escape (Back)
+                // closes a dialog before the text is typed.
+                let codes: Vec<String> = codes.split(',').map(|c| c.trim().to_string()).collect();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    for item in codes {
+                        if let Some(ms) = item.strip_prefix('+').and_then(|m| m.parse::<u64>().ok()) {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                            continue;
+                        }
+                        let Ok(code) = item.parse::<u32>() else { continue };
+                        inject(code, 1);
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                        inject(code, 0);
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                    }
+                    println!("apphost: synthetic keys injected");
+                });
+            }
+        }
         let spec = std::env::var("PENGUDROID_SYNTH_CLICK").unwrap_or_default();
         if !spec.is_empty()
             || std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
@@ -5284,6 +5315,9 @@ fn spawn_input_pump(env: &JniEnv) {
                         env.call_void(root, dispatch, &[JValue { l: event }]);
                     }
                 }
+                if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                    trace_key_target(&env, root, root_class);
+                }
                 continue;
             }
             // Relative motion only arrives while the pointer is locked.
@@ -5467,6 +5501,42 @@ impl MultiTouchJni {
 /// Select the top focusable app window and deliver the window-manager focus
 /// callback. LayoutParams types preserve app/dialog ordering even when a dialog
 /// was added during onCreate, before its activity's base window was attached.
+/// `PENGUDROID_TRACE_INPUT`: which window and view a key went to, and the
+/// focused view's text afterwards.
+fn trace_key_target(env: &JniEnv, root: JObject, root_class: JClass) {
+    let _ = (|| -> Option<()> {
+        let _frame = env.local_frame(16)?;
+        let object = env.find_class("java/lang/Object")?;
+        let to_string = env.method_id(object, "toString", "()Ljava/lang/String;")?;
+        let view_field = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+        let view = env.object_field(root, view_field);
+        let view_class = env.find_class("android/view/View")?;
+        let find_focus = env.method_id(view_class, "findFocus", "()Landroid/view/View;")?;
+        let focus = env.call_object(view, find_focus, &[])?;
+        let title = env.call_object(root, to_string, &[]).and_then(|o| env.get_string(o)).unwrap_or_default();
+        let focused = if focus.is_null() {
+            "<none>".to_string()
+        } else {
+            env.call_object(focus, to_string, &[]).and_then(|o| env.get_string(o)).unwrap_or_default()
+        };
+        let mut text = String::new();
+        if !focus.is_null() {
+            if let Some(tv) = env.find_class("android/widget/TextView") {
+                let class = env.find_class("java/lang/Class")?;
+                let is_instance = env.method_id(class, "isInstance", "(Ljava/lang/Object;)Z")?;
+                if env.call_boolean(tv, is_instance, &[JValue { l: focus }]) == Some(true) {
+                    let get_text = env.method_id(tv, "getText", "()Ljava/lang/CharSequence;")?;
+                    if let Some(t) = env.call_object(focus, get_text, &[]) {
+                        text = env.call_object(t, to_string, &[]).and_then(|o| env.get_string(o)).unwrap_or_default();
+                    }
+                }
+            }
+        }
+        println!("input: key -> root {title} focus {focused} text {:?}", text.chars().count());
+        Some(())
+    })();
+}
+
 fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
     size: JMethodId, get: JMethodId) -> Option<JObject> {
     let view_class = env.find_class("android/view/View")?;
@@ -5479,6 +5549,16 @@ fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
     let has_focus = env.method_id(view_class, "hasWindowFocus", "()Z")?;
     let change_focus = env.method_id(root_class, "windowFocusChanged", "(Z)V")?;
     let stopped = env.field_id(root_class, "mStopped", "Z")?;
+    // Like the window manager, focus only windows that have a surface: a
+    // dialog that was added but never drawn must not swallow every key.
+    let surface_field = env.field_id(root_class, "mSurface", "Landroid/view/Surface;");
+    let surface_class = env.find_class("android/view/Surface");
+    let is_valid = surface_class.and_then(|c| env.method_id(c, "isValid", "()Z"));
+    let has_surface = |root: JObject| -> bool {
+        let (Some(field), Some(valid)) = (surface_field, is_valid) else { return true };
+        let surface = env.object_field(root, field);
+        !surface.is_null() && env.call_boolean(surface, valid, &[]) == Some(true)
+    };
     let count = env.call_int(roots, size, &[])?;
     let mut windows = Vec::new();
     let mut target = None;
@@ -5492,7 +5572,7 @@ fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
         let flags = env.int_field(params, flags_field);
         // FLAG_NOT_FOCUSABLE, and hidden roots, cannot take physical keys.
         if flags & 8 != 0 || env.boolean_field(root, stopped)
-            || env.call_int(view, visibility, &[]) != Some(0) { continue; }
+            || env.call_int(view, visibility, &[]) != Some(0) || !has_surface(root) { continue; }
         let rank = (env.int_field(params, type_field), i);
         if target.as_ref().map_or(true, |(best, _)| rank > *best) {
             target = Some((rank, root));
@@ -7895,7 +7975,12 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
     let parcel_class = env.find_class("android/os/Parcel")?;
     let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
     let parcel = env.call_static_object(parcel_class, obtain, &[])?;
-    let raw = crate::keyboard::virtual_character_map_parcel();
+    // The desktop's own layout (published by the daemon), so `getUnicodeChar`
+    // on an ordinary key event types what the user's keyboard says: EditText,
+    // WebView and engines all read characters through this map.
+    let (keys, source) = crate::keyboard::desktop_keys();
+    println!("keyboard: character map from {source} ({} keys)", keys.len());
+    let raw = crate::keyboard::character_map_parcel(&keys);
     let bytes = env.new_byte_array(raw.len() as i32)?;
     env.set_byte_array_region(bytes, 0, &raw);
     let unmarshall = env.method_id(parcel_class, "unmarshall", "([BII)V")?;

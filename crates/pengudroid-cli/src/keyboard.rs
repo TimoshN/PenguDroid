@@ -183,6 +183,7 @@ mod tests {
         assert_eq!(keyboard.event(30, false, 6).unwrap().meta, 0);
     }
 
+
     #[test]
     fn shortcuts_and_editing_keys_reach_android() {
         let mut keyboard = Keyboard::default();
@@ -195,39 +196,102 @@ mod tests {
     }
 }
 
-/// Android 17's native KeyCharacterMap parcel, including the JNI wrapper's
-/// device id and presence flag. Native read/writeToParcel validate this layout
-/// again at runtime. See frameworks/native/libs/input/KeyCharacterMap.cpp.
-/// This is a US physical layout; compositor XKB layouts are a separate layer.
-pub fn virtual_character_map_parcel() -> Vec<u8> {
-    let mut keys: Vec<(i32, char, char)> = (0..26)
-        .map(|i| (29 + i, (b'a' + i as u8) as char, (b'A' + i as u8) as char))
+/// What one Android key types under each modifier combination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyChars {
+    pub code: i32,
+    pub base: char,
+    pub shift: char,
+    pub caps: Option<char>,
+    pub caps_shift: Option<char>,
+    pub altgr: Option<char>,
+    pub altgr_shift: Option<char>,
+}
+
+/// The US physical layout, used when the desktop's keymap is unavailable.
+pub fn us_keys() -> Vec<KeyChars> {
+    let mut keys: Vec<KeyChars> = (0..26)
+        .map(|i| {
+            let (lower, upper) = ((b'a' + i as u8) as char, (b'A' + i as u8) as char);
+            KeyChars { code: 29 + i, base: lower, shift: upper, caps: Some(upper), caps_shift: Some(lower), altgr: None, altgr_shift: None }
+        })
         .collect();
-    for (i, (plain, shifted)) in "0123456789".chars().zip(")!@#$%^&*(".chars()).enumerate() {
-        keys.push((7 + i as i32, plain, shifted));
+    let plain = |code: i32, base: char, shift: char| KeyChars { code, base, shift, caps: None, caps_shift: None, altgr: None, altgr_shift: None };
+    for (i, (base, shift)) in "0123456789".chars().zip(")!@#$%^&*(".chars()).enumerate() {
+        keys.push(plain(7 + i as i32, base, shift));
     }
-    keys.extend([
+    for (code, base, shift) in [
         (55, ',', '<'), (56, '.', '>'), (62, ' ', ' '), (61, '\t', '\t'),
         (66, '\n', '\n'), (68, '`', '~'), (69, '-', '_'), (70, '=', '+'),
         (71, '[', '{'), (72, ']', '}'), (73, '\\', '|'), (74, ';', ':'),
         (75, '\'', '"'), (76, '/', '?'),
-    ]);
-    keys.sort_by_key(|k| k.0);
+    ] {
+        keys.push(plain(code, base, shift));
+    }
+    keys.sort_by_key(|k| k.code);
+    keys
+}
+
+/// What each key types in the desktop's own layout (first layout group), so
+/// Android's KeyCharacterMap answers `getUnicodeChar` the way the user's
+/// keyboard is labelled: Turkish `ı` on I, `i` on the apostrophe key, `@` on
+/// AltGr+Q. Key codes stay physical, so games keep their bindings.
+pub fn layout_keys(layout: &mut pengudroid_input::xkb::Layout) -> Vec<KeyChars> {
+    let mut keys = Vec::new();
+    for linux in 1..=127u32 {
+        let Some(code) = android_keycode(linux) else { continue };
+        // Tab and Enter are control characters, which XKB does not report as text.
+        if code == 61 || code == 66 {
+            let c = if code == 61 { '\t' } else { '\n' };
+            keys.push(KeyChars { code, base: c, shift: c, caps: None, caps_shift: None, altgr: None, altgr_shift: None });
+            continue;
+        }
+        let Some(base) = layout.character_with(linux, 0, false, false, false) else { continue };
+        let shift = layout.character_with(linux, 0, true, false, false).unwrap_or(base);
+        let caps = layout.character_with(linux, 0, false, false, true).filter(|c| *c != base);
+        let caps_shift = caps.and_then(|_| layout.character_with(linux, 0, true, false, true));
+        let altgr = layout.character_with(linux, 0, false, true, false).filter(|c| *c != base);
+        let altgr_shift = layout.character_with(linux, 0, true, true, false).filter(|c| Some(*c) != altgr && *c != shift);
+        keys.push(KeyChars { code, base, shift, caps, caps_shift, altgr, altgr_shift });
+    }
+    keys.sort_by_key(|k| k.code);
+    keys.dedup_by_key(|k| k.code);
+    keys
+}
+
+/// The desktop's layout from the keymap the daemon published, or US.
+pub fn desktop_keys() -> (Vec<KeyChars>, &'static str) {
+    let text = std::fs::read(pengudroid_proto::keymap_path()).ok().and_then(|bytes| std::ffi::CString::new(bytes).ok());
+    match text.and_then(|t| pengudroid_input::xkb::Layout::from_keymap_text(&t)) {
+        Some(mut layout) => (layout_keys(&mut layout), "desktop keymap"),
+        None => (us_keys(), "US default"),
+    }
+}
+
+/// Android 17's native KeyCharacterMap parcel, including the JNI wrapper's
+/// device id and presence flag. Native read/writeToParcel validate this layout
+/// again at runtime. See frameworks/native/libs/input/KeyCharacterMap.cpp.
+pub fn character_map_parcel(keys: &[KeyChars]) -> Vec<u8> {
+    const SHIFT: i32 = 0x1;
+    const ALT_RIGHT: i32 = 0x20;
+    const CAPS: i32 = 0x100000;
     // Device id, presence, empty length-prefixed String8 (length and NUL),
-    // keyboard type, overlay flag and key count. Only the API-37 layout exists.
+    // keyboard type (FULL = 4), overlay flag and key count.
     let mut words = vec![-1i32, 1, 0, 0, 4, 0, keys.len() as i32];
-    for (code, plain, shifted) in keys {
-        let number = if plain.is_ascii_digit() { plain as i32 } else { 0 };
-        words.extend([code, shifted as i32, number]);
-        if plain.is_ascii_lowercase() {
-            // Most specific first, matching native getKeyBehavior's first hit.
-            for (meta, ch) in [(0x100001, plain), (0x100000, shifted), (1, shifted), (0, plain)] {
-                words.extend([1, meta, ch as i32, 0, 0]);
-            }
-        } else {
-            for (meta, ch) in [(1, shifted), (0, plain)] {
-                words.extend([1, meta, ch as i32, 0, 0]);
-            }
+    for key in keys {
+        let number = if key.base.is_ascii_digit() { key.base as i32 } else { 0 };
+        let label = key.shift.to_uppercase().next().unwrap_or(key.shift);
+        words.extend([key.code, label as i32, number]);
+        // Most specific first: native getKeyBehavior takes the first match.
+        let mut behaviors = Vec::new();
+        if let Some(c) = key.altgr_shift { behaviors.push((ALT_RIGHT | SHIFT, c)); }
+        if let Some(c) = key.altgr { behaviors.push((ALT_RIGHT, c)); }
+        if let Some(c) = key.caps_shift { behaviors.push((CAPS | SHIFT, c)); }
+        if let Some(c) = key.caps { behaviors.push((CAPS, c)); }
+        behaviors.push((SHIFT, key.shift));
+        behaviors.push((0, key.base));
+        for (meta, c) in behaviors {
+            words.extend([1, meta, c as i32, 0, 0]);
         }
         words.push(0); // end of behavior list
     }
@@ -235,9 +299,45 @@ pub fn virtual_character_map_parcel() -> Vec<u8> {
     words.into_iter().flat_map(i32::to_le_bytes).collect()
 }
 
+/// The US map, as the parcel above.
+pub fn virtual_character_map_parcel() -> Vec<u8> {
+    character_map_parcel(&us_keys())
+}
+
 #[cfg(test)]
 mod parcel_tests {
-    use super::virtual_character_map_parcel;
+    use super::*;
+
+    #[test]
+    fn turkish_desktop_layout_becomes_the_android_character_map() {
+        let Some(mut tr) = pengudroid_input::xkb::Layout::from_names("tr", "") else {
+            eprintln!("skip: no libxkbcommon/xkeyboard-config");
+            return;
+        };
+        let keys = layout_keys(&mut tr);
+        let key = |code: i32| keys.iter().find(|k| k.code == code).cloned().unwrap();
+        // KEYCODE_I types dotless ı / I; the apostrophe key types i / İ.
+        assert_eq!((key(37).base, key(37).shift), ('ı', 'I'));
+        assert_eq!((key(75).base, key(75).shift), ('i', 'İ'));
+        assert_eq!(key(75).caps, Some('İ'));
+        // KEYCODE_SEMICOLON is ş, KEYCODE_LEFT_BRACKET ğ, AltGr+Q (KEYCODE_Q) @.
+        assert_eq!(key(74).base, 'ş');
+        assert_eq!(key(71).base, 'ğ');
+        assert_eq!(key(45).altgr, Some('@'));
+        // Tab and Enter still type their control characters.
+        assert_eq!(key(61).base, '\t');
+        assert_eq!(key(66).base, '\n');
+        // The parcel is well formed for any layout.
+        let bytes = character_map_parcel(&keys);
+        assert_eq!(bytes.len() % 4, 0);
+    }
+
+    #[test]
+    fn us_fallback_matches_the_previous_table() {
+        let keys = us_keys();
+        assert_eq!(keys.iter().find(|k| k.code == 29).map(|k| (k.base, k.shift)), Some(('a', 'A')));
+        assert_eq!(keys.iter().find(|k| k.code == 8).map(|k| (k.base, k.shift)), Some(('1', '!')));
+    }
 
     #[test]
     fn api37_character_map_uses_string8_and_all_three_overlay_lists() {

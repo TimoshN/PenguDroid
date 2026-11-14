@@ -1684,6 +1684,26 @@ mod imp {
         }
     }
 
+    /// Map the keymap fd the compositor sent and copy out its NUL-terminated text.
+    fn read_keymap(fd: std::os::fd::OwnedFd, size: usize) -> Option<std::ffi::CString> {
+        use std::os::fd::AsRawFd;
+        if size == 0 {
+            return None;
+        }
+        // SAFETY: a private read-only mapping of the compositor's keymap fd.
+        unsafe {
+            let map = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_PRIVATE, fd.as_raw_fd(), 0);
+            if map == libc::MAP_FAILED {
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(map as *const u8, size);
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(size);
+            let text = std::ffi::CString::new(&bytes[..end]).ok();
+            libc::munmap(map, size);
+            text
+        }
+    }
+
     impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         fn event(
             state: &mut Self,
@@ -1714,6 +1734,23 @@ mod imp {
                 wl_keyboard::Event::Key { key, state: key_state, .. } => {
                     let pressed = matches!(key_state, WEnum::Value(KeyState::Pressed));
                     state.keyboard_key(key, pressed);
+                }
+                wl_keyboard::Event::Keymap { format, fd, size } => {
+                    use wayland_client::protocol::wl_keyboard::KeymapFormat;
+                    // Guests build their KeyCharacterMap from this file, so a
+                    // key types the user's layout (Turkish ı, AltGr symbols).
+                    let path = pengudroid_proto::keymap_path();
+                    let written = matches!(format, WEnum::Value(KeymapFormat::XkbV1))
+                        && read_keymap(fd, size as usize).is_some_and(|text| {
+                            let temp = path.with_extension("keymap.tmp");
+                            std::fs::write(&temp, text.as_bytes()).is_ok() && std::fs::rename(&temp, &path).is_ok()
+                        });
+                    if written {
+                        crate::info!("keyboard layout published at {}", path.display());
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                        crate::info!("keyboard layout unavailable; guests use a US key map");
+                    }
                 }
                 _ => {}
             }

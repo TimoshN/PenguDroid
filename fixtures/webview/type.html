@@ -1,0 +1,9 @@
+<!doctype html>
+<title>Loading</title>
+<input id="t" autofocus style="font-size:40px;width:90%">
+<script>
+const t = document.getElementById('t');
+function report() { if (t.value.length >= 5) document.title = 'PenguDroid JS OK typed:' + t.value; }
+t.addEventListener('input', report);
+setInterval(() => { t.focus(); report(); }, 500);
+</script>

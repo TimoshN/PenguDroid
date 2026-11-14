@@ -1081,6 +1081,14 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
 /// Input events forwarded by the daemon, waiting for the host to pick them up.
 static INPUT_QUEUE: Mutex<Vec<(u32, pengudroid_proto::InputKind)>> = Mutex::new(Vec::new());
 
+/// Queue a key as if the compositor had sent it (test hook for
+/// `PENGUDROID_SYNTH_KEYS`): it then takes exactly the path a real key does.
+#[no_mangle]
+pub extern "C" fn pengudroid_input_inject_key(keycode: u32, pressed: i32) {
+    INPUT_QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+        .push((0, pengudroid_proto::InputKind::Key { keycode, pressed: pressed != 0 }));
+}
+
 /// Subscribe to the compositor's input for `surface_id` on a second connection.
 ///
 /// The present connection is strictly request/reply, so unsolicited input would
@@ -2596,6 +2604,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         finish();
     }
     dump_frame_once(surface, host);
+    trace_presents(surface);
 
     let exported = match export_surface_dmabuf(surface) {
         Ok(exported) => exported,
@@ -2701,6 +2710,29 @@ fn pace_swap(surface: usize) {
 /// The compositor cannot be screenshotted from a sandboxed session, so this is
 /// how the render output is inspected: the FBO is read back with
 /// `glReadPixels` and written as a binary PPM (no image crate needed).
+/// `PENGUDROID_TRACE_PRESENTS`: one line per surface per second with how many
+/// frames it swapped, so a window that stops redrawing is visible.
+fn trace_presents(surface: EGLSurface) {
+    if std::env::var_os("PENGUDROID_TRACE_PRESENTS").is_none() {
+        return;
+    }
+    static COUNTS: Mutex<Vec<(usize, u64, Option<std::time::Instant>)>> = Mutex::new(Vec::new());
+    let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = surface as usize;
+    let i = match counts.iter().position(|(s, _, _)| *s == key) {
+        Some(i) => i,
+        None => { counts.push((key, 0, None)); counts.len() - 1 }
+    };
+    let entry = &mut counts[i];
+    entry.1 += 1;
+    if entry.2.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+        // SAFETY: every non-null surface is a SurfaceRec this module allocated.
+        let rec = unsafe { &*(surface as *const SurfaceRec) };
+        eprintln!("[gleshim] presents surface {} ({}x{}) total {}", rec.surface_id, rec.w, rec.h, entry.1);
+        entry.2 = Some(std::time::Instant::now());
+    }
+}
+
 unsafe fn dump_frame_once(surface: EGLSurface, host: &Host) {
     let Some(path) = std::env::var_os("PENGUDROID_DUMP_FRAME") else {
         return;

@@ -1185,6 +1185,14 @@ pub fn default_socket_path() -> std::path::PathBuf {
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(), uid())
 }
 
+/// The XKB keymap of the desktop's keyboard, written by the daemon next to its
+/// socket whenever the compositor sends one. A guest builds its Android
+/// `KeyCharacterMap` from it, so keys type the user's layout (Turkish `ı`,
+/// AltGr symbols) through the ordinary key path.
+pub fn keymap_path() -> std::path::PathBuf {
+    default_socket_path().with_extension("keymap")
+}
+
 fn socket_path(explicit: Option<&std::ffi::OsStr>, runtime: Option<&std::ffi::OsStr>, uid: u32) -> std::path::PathBuf {
     if let Some(path) = explicit.filter(|s| !s.is_empty()) {
         return std::path::PathBuf::from(path);
@@ -1365,6 +1373,7 @@ mod tests {
             surface_id: 4,
             event: InputKind::PointerRelative { dx: -3.5, dy: 12.25 },
         });
+
         roundtrip(Message::RunApk {
             path: "/tmp/app.apk".into(),
             component: Some("com.x/.Main".into()),

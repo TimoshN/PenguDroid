@@ -206,6 +206,27 @@ answers `[status=0][3]` (STREAM_MUSIC). Smoke #10 otherwise ran 240 s with
 Validation: shim **159 passed**, cli green (94+7+2+3+2), `cargo build
 --offline` clean.
 
+### 2026-11-15: keyboard layouts and text input
+
+* The daemon publishes the compositor's XKB keymap next to its socket
+  (`pengudroid_proto::keymap_path()`, `daemon.keymap`). apphost compiles it
+  with the system libxkbcommon (`pengudroid_input::xkb`, dlopen'ed) and builds
+  Android's virtual `KeyCharacterMap` from it, so an ordinary key event types
+  the user's layout: Turkish Q gives `ı` on I, `i` on the apostrophe key, `ş`,
+  `ğ`, AltGr+Q `@`, Caps Lock `İ`. Key codes stay physical, so games keep
+  their bindings. Without a keymap (headless) the US map is used.
+  An earlier attempt sent layout characters as `KeyEvent.ACTION_MULTIPLE`;
+  Chromium ignores those, so WebView pages got only the keys whose US
+  character matched ("some keys work, some don't").
+* Key focus skips windows without a valid `Surface`: NewPipe adds a dialog
+  window that is never drawn, and it took every key.
+* Verified headless with `fixtures/webview/type.html`, a Turkish keymap and
+  `PENGUDROID_SYNTH_KEYS="9000:23,40,39,26,30"` (test-only key injection,
+  `+ms` items pause): the page reported `ıişğa`. In Genshin the keys reach
+  the native login `EditText` and the HoYoverse login WebView.
+* Not done: key repeat (Wayland leaves repeat to the client) and switching
+  layout groups at runtime (the map is built from the first group at start).
+
 ### Next concrete task
 
 Watch bridged smoke #11 (`/tmp/bbr2-bridge11.log`, 900 s) and confirm the

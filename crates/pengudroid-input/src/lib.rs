@@ -18,6 +18,7 @@ pub mod keymap;
 pub mod mapper;
 pub mod presets;
 pub mod uinput;
+pub mod xkb;
 
 pub use keymap::{Action, Binding, Dir, Keymap};
 pub use mapper::KeyMapper;

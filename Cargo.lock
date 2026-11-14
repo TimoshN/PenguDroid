@@ -3005,6 +3005,7 @@ dependencies = [
  "libc",
  "pengudroid-device",
  "pengudroid-hostgpu",
+ "pengudroid-input",
  "pengudroid-proto",
  "pengudroid-socket",
  "sctk-adwaita",
