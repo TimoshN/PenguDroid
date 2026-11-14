@@ -2,7 +2,42 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Where we left off — Genshin Impact 7.2.0 boots to a rendering main activity (2026-11-14)
+## Where we left off — Play Billing reply framing fixed; Genshin launches clean, billing connect loop gone (2026-11-14, `1b7dd75`)
+
+Pick up here. The hosted `IInAppBillingService` replies were mis-framed and
+that had two visible effects in Genshin 7.2.0: `isBillingSupported` echoed the
+apiVersion back (read as `BILLING_UNAVAILABLE`) so `BillingClient` looped
+CONNECTING/DISCONNECTED ~22 times, and Bundle replies crashed
+`Parcel.readBundle` with "Bundle length is not aligned by 4" because the
+billing 8.3.0 proxy consumes **two** ints (status + unconditional exception
+code) before the payload. Fixed in `1b7dd75`:
+
+- `binder.rs` `make_reply` BILLING_SERVICE branch writes an extra `0` int
+  (exception code) after the status word: replies are now
+  `[status=0][exc=0][payload]`.
+- `isBillingSupported` (code 1) parses `[i32 apiVersion][String16 pkg][String16
+  type]` and answers 0 (RESPONSE_OK) for `inapp`/`subs`, 3 otherwise.
+- `apphost.rs` `install_billing` marshals Bundle replies through
+  `Parcel.writeBundle` (adds the outer length word) and installs the full
+  empty-purchases bundle (RESPONSE_CODE=0 + empty `INAPP_PURCHASE_ITEM_LIST` /
+  `INAPP_PURCHASE_DATA_LIST` / `INAPP_DATA_SIGNATURE_LIST` StringArrayLists +
+  empty `INAPP_CONTINUATION_TOKEN`) on getPurchases codes **4 and 11**
+  (billing 8.3.0 queries owned items via code 11).
+
+Verified: `/tmp/genshin-trace7.log` (420 s, exit=124: framing fix confirmed,
+code-11 bundle parses, 0 "not aligned", 0 SIGSEGV, 7 CONNECTED),
+`/tmp/genshin-trace8.log` (420 s, exit=124: 336-byte purchases bundle on code
+11, 0 crashes, vsync frames to 23160, connect loop gone). Remaining benign
+noise: exactly one "getPurchase() got null owned items list" /
+"Querying purchases failed" — also present in the earlier good 900 s baseline
+`/tmp/genshin-full.log`; the game launches and renders regardless (no
+purchasing needed for login). All 162 shim + 11 integration + CLI tests green.
+
+Next: BBR2 XAPK regression after the framing change
+(`/tmp/bbr2-smoke17.log`), then a final long Genshin run + resize/tablet
+verification.
+
+## Previous — Genshin Impact 7.2.0 boots to a rendering main activity (2026-11-14)
 
 Pick up here. Genshin (`/tmp/genshin.apks`, repacked from `~/Downloads` APKM,
 base at `/tmp/genshin-apkm/base.apk`) now launches without `--sysroot`:
