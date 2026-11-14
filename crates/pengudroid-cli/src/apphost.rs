@@ -7005,8 +7005,22 @@ fn install_billing(env: &JniEnv) -> Option<()> {
         }
         Some(bundle)
     };
+    // A Bundle return value is read by the proxy with `Parcel.readBundle`,
+    // which expects the outer length word that `Parcel.writeBundle` writes —
+    // `Bundle.writeToParcel` + `marshall` alone is missing it, and the client
+    // then reads the "BNDL" magic as the length ("Bundle length is not
+    // aligned by 4"). Marshal through `writeBundle` instead.
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let parcel_obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let write_bundle = env.method_id(parcel_class, "writeBundle", "(Landroid/os/Bundle;)V")?;
+    let parcel_marshall = env.method_id(parcel_class, "marshall", "()[B")?;
     let mut install = |env: &JniEnv, code: u32, bundle: JObject| -> Option<()> {
-        let bytes = marshal_object(env, bundle, "android/os/Bundle")?;
+        let parcel = env.call_static_object(parcel_class, parcel_obtain, &[])?;
+        if !env.call_void(parcel, write_bundle, &[JValue { l: bundle }]) {
+            return None;
+        }
+        let bytes = env.call_object(parcel, parcel_marshall, &[])?;
+        let bytes = env.byte_array_copy(bytes)?;
         if !unsafe { bundle_setter(code, bytes.as_ptr(), bytes.len()) } {
             return None;
         }
@@ -7023,8 +7037,13 @@ fn install_billing(env: &JniEnv) -> Option<()> {
         }
         install(env, 2, bundle)?;
     }
-    // getPurchases(4): OK with empty purchase lists and no continuation token.
-    {
+    // getPurchases: OK with empty purchase lists and no continuation token.
+    // Billing 8.3.0 issues this as transaction code 11 ("Querying owned
+    // items"); the legacy code 4 gets the same answer. Without the three
+    // INAPP_*_LIST keys the client reads a null owned-items list and reports
+    // "Purchase bundle invalid" / "Querying purchases failed" even though
+    // RESPONSE_CODE is OK.
+    let purchases_bundle = |env: &JniEnv| -> Option<JObject> {
         let bundle = bundle_with(env, 0)?;
         for key in [
             "INAPP_PURCHASE_ITEM_LIST",
@@ -7044,16 +7063,18 @@ fn install_billing(env: &JniEnv) -> Option<()> {
         ]) {
             return None;
         }
-        install(env, 4, bundle)?;
+        Some(bundle)
+    };
+    for code in [4u32, 11] {
+        install(env, code, purchases_bundle(env)?)?;
     }
     // Buy-intent methods (3, 6, 7, 12, 14): RESPONSE_CODE=6 (ERROR) so the
     // client reports failure instead of showing a purchase dialog.
     for code in [3u32, 6, 7, 12, 14] {
         install(env, code, bundle_with(env, 6)?)?;
     }
-    // getBillingConfig(9), createAlternativeBillingOnlyToken(11),
-    // createExternalPaymentReportingDetails(15): OK.
-    for code in [9u32, 11, 15] {
+    // getBillingConfig(9), createExternalPaymentReportingDetails(15): OK.
+    for code in [9u32, 15] {
         install(env, code, bundle_with(env, 0)?)?;
     }
     println!("binder: hosted Play Billing {BILLING_SERVICE_NAME} transaction codes 1..15 installed");

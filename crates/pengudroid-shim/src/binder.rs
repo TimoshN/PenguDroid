@@ -2883,6 +2883,14 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     if name_for_handle(tr.target_handle).as_deref() == Some(BILLING_SERVICE) {
         // Hosted Play Billing: the status word was already written above, so
         // the body is an int or a marshalled Bundle depending on the code.
+        // Play Billing proxies (zzau.zza in billing 8.3.0) consume TWO ints
+        // before the payload — `readInt()` status plus `readException()`'s
+        // unconditional code read — so an extra 0 (no exception) word must
+        // sit between the status and the int/Bundle payload. Without it the
+        // first payload word is eaten as the exception code and a Bundle
+        // reply's "BNDL" magic lands on `readBundle`'s length read
+        // ("Bundle length is not aligned by 4").
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // exception code: none
         let data = if tr.data_size > 0 && tr.data_ptr != 0 {
             unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) }
         } else {
@@ -2892,16 +2900,41 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         let body = after_interface_token(data, descriptor).unwrap_or(&[]);
         let is_supported_code = *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner());
         if tr.code == is_supported_code && is_supported_code != 0 {
-            // isBillingSupported(apiVersion, packageName, type): the first
-            // int after the interface token is apiVersion; vending echoes it
-            // back as RESPONSE_OK for a supported type.
+            // isBillingSupported(apiVersion, packageName, type) returns a
+            // RESPONSE_* code: 0 (RESPONSE_OK) when vending supports the
+            // requested item type, 3 (BILLING_UNAVAILABLE) otherwise. The
+            // body is [i32 apiVersion][String packageName][String type];
+            // echoing apiVersion back made every probe look like
+            // BILLING_UNAVAILABLE, so BillingClient disconnected and retried
+            // forever. Answer OK for the standard "inapp"/"subs" types.
+            const RESPONSE_OK: i32 = 0;
+            const BILLING_UNAVAILABLE: i32 = 3;
             let api_version = body
                 .get(..4)
                 .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
                 .unwrap_or(3);
-            parcel.extend_from_slice(&api_version.to_ne_bytes());
+            let item_type = body
+                .get(4..)
+                .and_then(|rest| {
+                    read_string16(rest, 0)
+                        .or_else(|| read_string8(rest, 0))
+                        .and_then(|(_pkg, next)| {
+                            read_string16(rest, next)
+                                .or_else(|| read_string8(rest, next))
+                                .map(|(t, _)| t)
+                        })
+                })
+                .flatten();
+            let response = match item_type.as_deref() {
+                Some("inapp") | Some("subs") => RESPONSE_OK,
+                _ => BILLING_UNAVAILABLE,
+            };
+            parcel.extend_from_slice(&response.to_ne_bytes());
             if trace_enabled() {
-                diag(&format!("[binder]   -> billing isBillingSupported code={} apiVersion={api_version}\n", tr.code));
+                diag(&format!(
+                    "[binder]   -> billing isBillingSupported code={} apiVersion={api_version} type={item_type:?} response={response}\n",
+                    tr.code
+                ));
             }
         } else if let Some(reply) = BILLING_REPLIES
             .lock()
@@ -5786,12 +5819,15 @@ mod tests {
     }
 
     /// The hosted Play Billing interface answers installed codes with their
-    /// int or marshalled-Bundle body behind the status word, echoes the
-    /// request's apiVersion for `isBillingSupported`, and leaves unknown
-    /// codes as a status-only fallthrough (traced, never UNKNOWN_TRANSACTION:
-    /// BillingClient retries forever on a transport error).
+    /// int or marshalled-Bundle body behind the status word, answers
+    /// `isBillingSupported` with RESPONSE_OK for `inapp`/`subs` and
+    /// BILLING_UNAVAILABLE otherwise (echoing apiVersion back made every
+    /// probe look unsupported, so BillingClient disconnected and retried
+    /// forever), and leaves unknown codes as a status-only fallthrough
+    /// (traced, never UNKNOWN_TRANSACTION: BillingClient retries forever on
+    /// a transport error).
     #[test]
-    fn billing_service_answers_installed_codes_and_echoes_api_version() {
+    fn billing_service_answers_installed_codes_and_is_supported_by_type() {
         let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let target = handle_for(BILLING_SERVICE);
         {
@@ -5809,11 +5845,13 @@ mod tests {
         expected.extend_from_slice(&[0, 0]);
         expected.resize((expected.len() + 3) & !3, 0);
         assert_eq!(reply.parcel, expected);
-        // Unknown code with nothing installed: status-only fallthrough.
+        // Unknown code with nothing installed: status + exception-code
+        // fallthrough (proxies read the exception code unconditionally).
         let reply = unsafe { make_reply(&transaction(target, 3, &[]), 1) };
         assert_eq!(reply.flags, 0);
         assert_eq!(reply.parcel.len(), 8);
         assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
         // Install isBillingSupported (code 1) plus an int (5) and a Bundle (2).
         assert!(__pengudroid_binder_set_billing_is_supported(1));
         assert!(__pengudroid_binder_set_billing_int(5, 0));
@@ -5822,8 +5860,19 @@ mod tests {
         assert!(!__pengudroid_binder_set_billing_is_supported(0));
         assert!(!__pengudroid_binder_set_billing_int(0, 0));
         assert!(unsafe { !__pengudroid_binder_set_billing_bundle(2, std::ptr::null(), 4) });
-        // Build a request parcel: [len][token utf16][NUL][pad][apiVersion=3]…
+        // Build a request parcel: [len][token utf16][NUL][pad][apiVersion=3]
+        // [String16 packageName][String16 type].
         let descriptor = "com.android.vending.billing.IInAppBillingService";
+        let write_string16 = |data: &mut Vec<u8>, s: &str| {
+            data.extend_from_slice(&(s.len() as u32).to_ne_bytes());
+            for unit in s.encode_utf16() {
+                data.extend_from_slice(&unit.to_ne_bytes());
+            }
+            data.extend_from_slice(&[0, 0]);
+            while data.len() % 4 != 0 {
+                data.push(0);
+            }
+        };
         let mut data = Vec::new();
         data.extend_from_slice(&(descriptor.len() as u32).to_ne_bytes());
         for unit in descriptor.encode_utf16() {
@@ -5834,28 +5883,48 @@ mod tests {
             data.push(0);
         }
         data.extend_from_slice(&3i32.to_ne_bytes());
-        data.extend_from_slice(b"com.example.game\0\0");
-        data.extend_from_slice(b"inapp\0\0\0");
+        write_string16(&mut data, "com.example.game");
+        let head = data.clone();
+        write_string16(&mut data, "inapp");
         let reply = unsafe { make_reply(&transaction(target, 1, &data), 1) };
         assert_eq!(reply.flags, 0);
-        let mut expected: Vec<u8> = [0u32, 3u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        // isBillingSupported("inapp") -> RESPONSE_OK (0) behind the
+        // status word and the exception-code word.
+        let mut expected: Vec<u8> = [0u32, 0u32, 0u32].into_iter().flat_map(u32::to_ne_bytes).collect();
         expected.resize((expected.len() + 7) & !7, 0);
         assert_eq!(reply.parcel, expected);
-        // Int reply: status word then the installed int.
+        // "subs" is supported too; an unknown type is BILLING_UNAVAILABLE (3).
+        let mut sub_data = head.clone();
+        write_string16(&mut sub_data, "subs");
+        let reply = unsafe { make_reply(&transaction(target, 1, &sub_data), 1) };
+        let mut expected: Vec<u8> = [0u32, 0u32, 0u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        let mut other_data = head;
+        write_string16(&mut other_data, "other");
+        let reply = unsafe { make_reply(&transaction(target, 1, &other_data), 1) };
+        let mut expected: Vec<u8> = [0u32, 0u32, 3u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Int reply: status + exception-code words then the installed int.
         let reply = unsafe { make_reply(&transaction(target, 5, &data), 1) };
-        let mut expected: Vec<u8> = [0u32, 0u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        let mut expected: Vec<u8> = [0u32, 0u32, 0u32].into_iter().flat_map(u32::to_ne_bytes).collect();
         expected.resize((expected.len() + 7) & !7, 0);
         assert_eq!(reply.parcel, expected);
-        // Bundle reply: status word then the marshalled bytes verbatim.
+        // Bundle reply: status + exception-code words then the marshalled
+        // bytes verbatim, so readBundle's length read lands on the real
+        // bundle length instead of the "BNDL" magic.
         let reply = unsafe { make_reply(&transaction(target, 2, &data), 1) };
         let mut expected: Vec<u8> = 0u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&0u32.to_ne_bytes());
         expected.extend_from_slice(&bundle);
         expected.resize((expected.len() + 7) & !7, 0);
         assert_eq!(reply.parcel, expected);
-        // A code with no installed reply stays a status-only fallthrough.
+        // A code with no installed reply stays a status+exception fallthrough.
         let reply = unsafe { make_reply(&transaction(target, 9, &data), 1) };
         assert_eq!(reply.flags, 0);
         assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
         {
             BILLING_REPLIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
             *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner()) = 0;
