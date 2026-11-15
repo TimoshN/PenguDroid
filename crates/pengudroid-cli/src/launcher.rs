@@ -603,7 +603,20 @@ pub fn launch(args: &[String]) -> i32 {
             // PENGUDROID_NATIVE_BRIDGE_NAME for a different build. The 128 MiB
             // heap is required once the bridge has reserved the guest address
             // layout (see LIMITATIONS.md §2.1 and NATIVE_BRIDGE.md).
-            if let Ok(bridge_lib) = std::env::var("PENGUDROID_NATIVE_BRIDGE_LIB") {
+            // The AppImage sets the bridge for every launch, but an app that
+            // ships x86_64 libraries (or none) must run them natively: the
+            // guest side would otherwise pick its arm64 libraries and translate
+            // everything, which is slow and far less compatible.
+            let mut apks = vec![app_path.clone()];
+            apks.extend(split_paths.iter().cloned());
+            let use_bridge = needs_native_bridge(&apks);
+            if !use_bridge {
+                cmd.env_remove("PENGUDROID_NATIVE_BRIDGE_LIB");
+            }
+            if let Some(bridge_lib) = std::env::var("PENGUDROID_NATIVE_BRIDGE_LIB")
+                .ok()
+                .filter(|_| use_bridge)
+            {
                 cmd.arg("--bridge-lib").arg(bridge_lib);
                 let name = std::env::var("PENGUDROID_NATIVE_BRIDGE_NAME")
                     .unwrap_or_else(|_| "libberberis_arm64.so".to_string());
@@ -641,6 +654,23 @@ fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
             // initializers (including Kotlin Companion objects) need this.
             // This enables runtime semantics, not a JDWP listening endpoint.
             cmd.arg("--vm-option").arg("-Xcompiler-option")
+/// Whether the app's native code needs the ARM translator: it ships ARM
+/// libraries and no libraries for the host ABI.
+fn needs_native_bridge(apks: &[String]) -> bool {
+    let mut arm = false;
+    for apk in apks {
+        let Ok(libs) = crate::apk::native_libs(apk) else { continue };
+        for lib in libs {
+            match lib.abi.as_str() {
+                "x86_64" => return false,
+                "arm64-v8a" | "armeabi-v7a" => arm = true,
+                _ => {}
+            }
+        }
+    }
+    arm
+}
+
                 .arg("--vm-option").arg("--debuggable");
             if b.abis.iter().any(|a| a == host) {
                 Some(host.to_string())
