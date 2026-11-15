@@ -169,7 +169,7 @@ pub fn native(args: &[String]) -> i32 {
     let preload = format!("{}:{}", shim.display(), gleshim.display());
     let ld_path = format!("{}:{}", compat.display(), libdir.display());
     cmd.env("LD_PRELOAD", preload)
-        .env("LD_LIBRARY_PATH", ld_path)
+        .env("LD_LIBRARY_PATH", crate::runtime::host_library_path(&ld_path))
         // Absolute shim path for the GL forwarders, which resolve their slots by
         // soname and would otherwise only reach host Mesa.
         .env("PENGUDROID_GLESHIM", &gleshim)

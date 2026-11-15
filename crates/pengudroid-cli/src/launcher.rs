@@ -490,6 +490,10 @@ pub fn launch(args: &[String]) -> i32 {
                 );
                 return 1;
             };
+            if let Err(error) = crate::runner::ensure_daemon(&pengudroid_proto::default_socket_path()) {
+                eprintln!("pengudroid launch: {error}");
+                return 1;
+            }
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
             cmd.arg("art-test")
                 .arg("--sysroot")

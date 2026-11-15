@@ -19,6 +19,14 @@ const CACHE_NAME: &str = "pengudroid";
 /// Relative location of the preparation tool inside a checkout.
 const PREPARE_SCRIPT: &str = "tools/prepare-android17.py";
 
+/// Preserve the AppImage's private libc and dependency closure in helpers.
+pub fn host_library_path(paths: &str) -> String {
+    match std::env::var("PENGUDROID_PORTABLE_LIBS") {
+        Ok(libs) if !libs.is_empty() => format!("{libs}:{paths}"),
+        _ => paths.to_string(),
+    }
+}
+
 fn non_empty(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())

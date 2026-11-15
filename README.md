@@ -1,588 +1,155 @@
+<div align="center">
+
+<img src="logo.png" alt="PenguDroid" width="144">
+
 # PenguDroid
 
-<img src="logo.png" alt="PenguDroid logo" width="150" align="right">
+**Android apps and ARM64 games on a Linux desktop.**
 
-**A no-KVM, no-container, no-VM Android compatibility layer for Linux — in Rust.**
+[Download the AppImage](https://github.com/denizomer10/PenguDroid/releases/latest) · [Current status](docs/STATUS.md) · [Architecture](docs/ARCHITECTURE.md) · [Known limitations](docs/LIMITATIONS.md)
 
-PenguDroid runs Android applications as ordinary Linux processes. There is no
-virtual machine, no LXC/Waydroid-style container, no namespace sandbox, and no
-booted `system.img`. Like Wine/Proton translate Windows to POSIX, PenguDroid
-translates Android's user-space interfaces — binder, Bionic libc, ART, the
-surface stack, audio — directly onto Linux primitives and onto the user's own
-session (Wayland, PipeWire, the host's Vulkan/GL drivers).
+</div>
 
-A small always-on daemon (`pengudroid-daemon`, analogous to Proton's
-`wineserver`) brokers shared resources and stays resident; apps come and go as
-normal processes that you can see in `ps aux`.
+PenguDroid runs Android applications as Linux processes. Java and Kotlin code use real Android ART; ARM64 native libraries run through the **Digitalis / Berberis ARM64-to-x86_64 bridge**. Graphics go to the host GPU and Wayland desktop, and audio goes to PipeWire. No Android virtual machine, container, root access or Android kernel is required at runtime.
 
-**Runtime target: Android 17 / API 37, x86_64 host.** Older runtime images are
-rejected, not used as fallback. APK minSdk/targetSdk remain application metadata.
-See [the migration boundaries](docs/ANDROID17.md) and
-[status](docs/STATUS.md) before interpreting historical results.
+The runtime target is **Android 17 / API 37 on x86_64 Linux**. This is a working compatibility layer under active development, not a promise that every Android application is supported.
 
----
+## Working applications — real screenshots
 
-## Two real apps, end to end
+### Genshin Impact 7.2.0
 
-Both of these are unmodified store builds running on a stock Linux desktop with
-no emulator, no container and no root.
+![Genshin Impact 7.2.0 gameplay on PenguDroid](docs/screenshots/genshin-impact-7.2.0-rtx3080.png)
 
-| Beach Buggy Racing 2 `2026.10.05` | NewPipe `v0.29.1` |
-|---|---|
-| ![Beach Buggy Racing 2 gameplay under PenguDroid](docs/screenshots/bbr2-race.png) | ![NewPipe live feed under PenguDroid](docs/screenshots/newpipe-live.png) |
-| A native ARM64 game: splash → update check → title → **a race in progress**. 22,911 dma-bufs presented in a 120 s run | A Java/ExoPlayer app: subclassed `Activity`, ViewPager, fragment pages, thumbnails fetched over the network |
+**Genshin Impact 7.2.0 working on NVIDIA GeForce RTX 3080 Founders Edition + Intel Core i3-12100F, with ARM64 Digitalis translation.**
 
-The frames above are not mock-ups or a static screenshot of a dead window: they
-were read back with `glReadPixels` from the app's own framebuffer while it ran,
-and are the same buffers the Wayland compositor received.
+The screenshot supplied from the working local build shows in-world gameplay, the character, party, map and HUD. It is an actual desktop window, not a mock-up. This establishes gameplay on the tested machine; it does not establish compatibility with every GPU, distribution, future game update or account flow. Game files and accounts are supplied by the user and are not included in the release.
 
-Boot sequence of the game, one row at a time (Vector Unit logo → profile/update
-screens → title → race):
+### Beach Buggy Racing 2 — 2026.10.26
+
+![Beach Buggy Racing 2 racing in PenguDroid](docs/screenshots/bbr2-race.png)
+
+**Beach Buggy Racing 2 working on RTX 3080 + Core i3-12100F, with ARM64 Digitalis translation.**
+
+The supported test package is the 2026.10.26 ARM64 XAPK. The older 2026.10.05 APKM fails during native startup in the clean release test.
+
+Verified progression: Vector Unit splash → update/profile screens → title → live race. The recorded 120-second run presented 22,911 frames before the later frame-rate cap was introduced. That historical frame count is not an FPS promise for this release.
+
+<details>
+<summary>See the captured boot sequence</summary>
 
 ![Beach Buggy Racing 2 boot sequence](docs/screenshots/bbr2-boot-sequence.png)
 
-And the desktop shell that wraps all of it — the same window the AppImage opens,
-with NewPipe installed through the `+` button:
+</details>
 
-![PenguDroid desktop manager with NewPipe installed](docs/screenshots/manager.png)
+### NewPipe — v0.29.1
 
+![NewPipe live feed in PenguDroid](docs/screenshots/newpipe-live.png)
+
+**NewPipe v0.29.1 working on RTX 3080 + Core i3-12100F through Android ART.** Its Java/Kotlin application code does not need ARM64 translation.
+
+The feed renders network-fetched thumbnails. Video and audio paths use the hosted Android media framework; the repository also contains captured playback evidence:
+
+![NewPipe video playback](docs/screenshots/newpipe-video.png)
+
+## Install and run
+
+1. Download `PenguDroid-x86_64.AppImage` from [Releases](https://github.com/denizomer10/PenguDroid/releases/latest).
+2. Make it executable and open it:
+
+   ```sh
+   chmod +x PenguDroid-x86_64.AppImage
+   ./PenguDroid-x86_64.AppImage
+   ```
+
+3. On the first launch, the manager downloads the pinned Android sysimage from Google's server, verifies its SHA-256, and extracts the runtime into your user cache. Progress appears in the manager. Keep an internet connection and at least **12 GiB of free space** for preparation.
+4. After setup completes, click **+** to install an `.apk`, `.apkm`, `.xapk` or `.apks` package. Select it in the library and click **Launch**.
+
+The release carries its own userspace libraries, loader, Python, image-extraction tools, native bridge and built ARM64 guest bundle. You do not need to install Python, Rust, an Android SDK, `debugfs` or `erofs-utils` to use this AppImage. The Android sysimage is downloaded on your machine rather than redistributed inside the release. Later launches reuse the installed runtime.
+
+**System requirements still apply:** an x86_64 Linux machine, a compatible Linux kernel, a Wayland desktop and working host graphics drivers. The AppImage cannot supply a kernel, compositor or a GPU's kernel driver. Other architectures and every Linux distribution have not been verified.
+
+If FUSE is unavailable, run without installing it:
+
+```sh
+./PenguDroid-x86_64.AppImage --appimage-extract-and-run
 ```
-$ pengudroid run com.vectorunit.cobalt.googleplay.apkm
-package:       com.vectorunit.cobalt.googleplay
-version:       2026.10.05 (500)
-main activity: com.vectorunit.cobalt/.CobaltActivity
-started guest: pid 27241 (com.vectorunit.cobalt.googleplay)
-the window is live; press Ctrl-C to stop the guest
+
+### Your app library
+
+![PenguDroid desktop manager](docs/screenshots/manager.png)
+
+The manager provides installation, per-app launch/stop/uninstall, persistent app data, frame-rate display preferences and keyboard mapping controls. Closing or stopping a stuck app is handled through its process group.
+
+Android apps keep their data under the per-user PenguDroid data directory. The runtime cache and app data are separate: updating the AppImage does not require deleting game downloads or logging in again.
+
+### CLI inside the same AppImage
+
+```sh
+./PenguDroid-x86_64.AppImage --cli --version
+./PenguDroid-x86_64.AppImage --cli runtime --download
+./PenguDroid-x86_64.AppImage --cli info /path/to/app.apk
+./PenguDroid-x86_64.AppImage --cli launch /path/to/app.apkm
+./PenguDroid-x86_64.AppImage --cli ps
+./PenguDroid-x86_64.AppImage --cli stop
 ```
 
-> **A note on the last millimetre.** The graphics stack was never the problem.
-> The game had been rendering for weeks; two logging bugs hid it (success is
-> silent in both the GL shim and the daemon), and the *actual* blocker was that
-> `PackageInfo.versionName` was hardcoded to `"1.0"`, so the game's update check
-> showed an "Important Update" dialog forever. Both are fixed and documented in
-> [STATUS.md](docs/STATUS.md) — a reminder that "no output" is a statement about
-> the instrumentation first, and the system second.
+Use `--appimage-extract-and-run` before `--cli` if you need the FUSE-free path. `PENGUDROID_SYSROOT` and `PENGUDROID_ARM64_GUEST_ROOT` remain available for explicit developer overrides.
 
-## How it fits together
+## What runs underneath
 
 ```mermaid
 flowchart LR
-    subgraph guest["app process (ordinary Linux process)"]
-        apk["APK dex + lib/&lt;abi&gt;/*.so"]
-        art["ART (libart.so)"]
-        shim["libpengudroid_shim.so<br/>Bionic → glibc"]
-        gl["libEGL / libGLESv2 shim"]
-    end
-    subgraph daemon["pengudroid-daemon (resident)"]
-        broker["binder broker<br/>service table"]
-        wl["Wayland broker<br/>xdg-shell + linux-dmabuf"]
-        audio["PipeWire ring"]
-        props["property store"]
-    end
-    host["host GPU (Mesa/NVIDIA)<br/>Wayland compositor<br/>pw-cat"]
-
-    apk --> art --> shim
-    gl -- dma-buf --- wl
-    shim -- transactions --> broker
-    shim -- getprop/setprop --> props
-    shim -- PCM --> audio
-    wl --> host
-    audio --> host
+    APK[Android package] --> ART[Android ART: Java / Kotlin]
+    APK --> ARM[Digitalis / Berberis: ARM64 natives]
+    ART --> SHIM[Bionic and Android API compatibility]
+    ARM --> SHIM
+    SHIM --> BROKER[PenguDroid daemon: Binder, windows, audio]
+    SHIM --> GL[Host EGL / GLES]
+    GL --> GPU[Host GPU and Wayland]
+    BROKER --> GPU
+    BROKER --> AUDIO[PipeWire]
 ```
 
-Java code runs on a real ART, loaded in-process as a host library. Native code
-runs either directly (x86_64 APKs) or through Intel's NDK translation
-(aarch64 APKs). Everything the framework expects from `system_server` — binder
-services, package info, activity lifecycle, window relayout, audio — is answered
-by the daemon and by the CLI's `apphost`.
+The host implements the framework contracts that normally come from Android services: package metadata, activity lifecycle, surfaces, input, networking and audio. The daemon brokers shared resources while applications remain ordinary host processes. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the boundaries and [NATIVE_BRIDGE.md](docs/NATIVE_BRIDGE.md) for ARM64 translation.
 
-## Quick start
+## Compatibility boundaries
+
+- The screenshots prove specific application versions on the stated hardware. They are not a general Android compatibility certification or a performance benchmark.
+- A working Wayland/GPU environment is required. An X11-only desktop is not the tested path.
+- WebView uses the runtime's actual Chromium provider through the hosted framework. Its in-process configuration is a compatibility path, not Android's isolated renderer-service architecture.
+- Google Play services, billing, DRM, device integrity, cameras and hardware-dependent APIs are not full Android implementations. Purchases and protected-service compatibility are not claimed.
+- Hardware video decoding depends on the host GPU and backend; software decoding remains relevant. See [HARDWARE_VIDEO.md](docs/HARDWARE_VIDEO.md).
+- Games can require large additional downloads and may change behavior after an update. PenguDroid does not include commercial APKs, game data or user credentials.
+
+[STATUS.md](docs/STATUS.md) records measured behavior and outstanding work. [LIMITATIONS.md](docs/LIMITATIONS.md) describes the remaining gaps; older investigation notes there are historical when explicitly superseded.
+
+## Build from source
 
 ```sh
-# 1. Build
-cargo build --release          # pengudroid, pengudroid-daemon, libpengudroid_shim.so
-
-# 2. Check an APK without running it
-./target/release/pengudroid info app.apk
-./target/release/pengudroid doctor app.apk
-
-# 3. Run it. The daemon starts on demand.
-./target/release/pengudroid run app.apk
-
-# 4. See what is running
-./target/release/pengudroid ps
-./target/release/pengudroid stop
+git clone https://github.com/denizomer10/PenguDroid.git
+cd PenguDroid
+cargo build --release --workspace
 ```
 
-The runtime needs an extracted Android 17 system tree (ART, framework jars, the
-codec2 services) and an ARM64 guest sysroot for aarch64 apps; both are prepared
-by the scripts in `tools/` and described in
-[ANDROID17.md](docs/ANDROID17.md). `pengudroid launch` keeps one prefix per
-package, like Proton.
-
-## Where we are right now
-
-`docs/STATUS.md` is the up-to-date handoff note: exactly what runs, what does
-not, and the failure point of each attempt.
-
-Verified today on the shipped `target/PenguDroid-x86_64.AppImage`:
-
-* **Games boot.** Beach Buggy Racing 2 reaches live gameplay (splash → update
-  check → title → race); NewPipe renders its live feed with real thumbnails.
-* **The manager works.** `+` (or `AppImage <apk>`) installs a package into
-  **Your library**, and **Launch / Stop / Uninstall** drive a real Android
-  process. NewPipe and GTLCS were both installed and listed through it.
-* **Tests:** 390 Rust (`cargo test --workspace --offline`) and 242 Python.
-
-* **Working:** daemon/lifecycle, binder broker, property store, ART in-process,
-  activity lifecycle driven from the host, hwui drawing, dma-buf presentation,
-  pointer/keyboard input, MediaCodec (ByteBuffer + Surface), AudioTrack,
-  OpenSL ES, PipeWire audio, app services, Play bundles (`.apkm`/`.xapk`).
-* **In progress:** hardware video decode integration, full window/layer
-  association, host IME composition. Frame pacing is done: `eglSwapBuffers`
-  is capped at `PENGUDROID_MAX_FPS` (default 60) instead of free-running.
-* **Not there yet:** `AHardwareBuffer`/gralloc allocation, camera, stable aarch64
-  translation for every game engine. The honest list is in
-  [LIMITATIONS.md](docs/LIMITATIONS.md).
-* **Toward Genshin Impact:** not launched yet. Landscape displays, multi-touch
-  keyboard/mouse controls (WASD joystick, pointer-lock mouse-look) and a built-in keymap are implemented
-  but not yet exercised live; the remaining gaps are listed in order in
-  [GENSHIN.md](docs/GENSHIN.md). `pengudroid doctor <apk>` reports them for any
-  package.
-
-## Status: what actually works vs. what is stubbed
-
-This is an **MVP skeleton with a genuinely working spine**. The infrastructure
-is real and tested; the Android runtime integration is the next (very large)
-milestone. App/framework rows below include historical measurements and must be
-revalidated on the API-37 target; the current migration gaps are listed in
-[ANDROID17.md](docs/ANDROID17.md).
-
-| Area | Status | Notes |
-|---|---|---|
-| Control daemon, lifecycle, `--daemonize`, signals | **Working** | ~few-ms startup, no boot phase |
-| Unix-socket protocol, framing, `SCM_RIGHTS` fd passing | **Working** | tested with real memfds |
-| `ashmem` via `memfd_create` + seals | **Working** | GROW/SHRINK seals verified to block `ftruncate` |
-| Kernel binder probe (`BINDER_VERSION` ioctl) + fallback | **Working** | detects `/dev/binderfs/binder`; falls back to userspace broker on desktop kernels |
-| Userspace binder broker: named services, transactions | **Working** | `pengudroid services` lists the table; platform stubs answer transactions |
-| Guest↔guest service calls (forwarded over the control socket) | **Working** | a guest registers a service, another connection transacts on its handle; covered by an integration test with a real daemon |
-| Android property store (`getprop`/`setprop`, enumeration) | **Working** | Android 17 / API 37 x86_64 identity; incompatible overrides and stale persisted identity are rejected |
-| APK + binary `AndroidManifest.xml` parsing | **Working** | ZIP (store/deflate) + AXML parser, unit-tested |
-| `pengudroid deps`: ELF import / Bionic-coverage analysis | **Working** | parses real arm64 / armv7 / x86-64 APK libraries; predicts `dlopen` outcome |
-| Loading **real Android APK libraries** on glibc (`de-bionic` + `libpath` + `nativelib`) | **Working** | real x86-64 APK libraries (`librtb.so`, `libgtb.so`, `libnativeutil.so`) `dlopen` successfully |
-| Loading a native `.so` under the shim (`LD_PRELOAD`) | **Working** | `dlopen` and `dlclose` verified |
-| Bionic teardown (C++ static destructors) | **Working** | suppressed on request (`PENGUDROID_SUPPRESS_DESTRUCTORS`); `--dlclose` on a faulting destructor goes 139 → 0 |
-| `__sF` standard streams | **Partial** | `stdin`/`stdout`/`stderr` via `__sF` map to glibc streams; other `FILE` uses are unsupported |
-| **Calling a real Android-style library and getting a correct result** | **Working** | `fixtures/native-demo` returns 500500 after `de-bionic` + load, via the shim |
-| **Loading an application's own native libraries (`nativelib --apk`)** | **Working** | extracts an APK's `lib/<abi>/*.so`, strips them, and loads the set; `fixtures/cpp-cascade` proves a consumer resolves the bundled `libc++_shared.so` (= 42) |
-| Wayland graphics broker (compositor, `wl_shm`, `xdg_wm_base`, toplevels) | **Working** | connects to the live session; surfaces + `wl_shm` buffers |
-| Guest process: owns a window, `ps`-visible, animated | **Working** | the `__guest` runtime; the compositor closing a window stops the guest |
-| Guest launched by the **daemon** (`RunApk`, `pengudroid start --wait`) | **Working** | daemon forks the CLI's `__guest`, reaps it, and reports its exit through `QueryRun`; an exited guest's window is destroyed and it leaves `ps` |
-| Fallback when the sandbox forbids `bind(2)` | **Working** | the daemon retries on an abstract (`@name`) Unix socket and clients connect to it transparently |
-| `pengudroid demo` | **Working** | built-in animated window, no APK and no manifest needed |
-| Host GPU via EGL/GLES/GBM (`gpu-info`, `gpu-test`) | **Working** | dlopen'd host EGL/GLES/GBM; offscreen render + pixel readback verified on Intel UHD 630 and NVIDIA RTX 3080 (EGL 1.5, GLES 3.2, dma-buf export/import) |
-| Zero-copy GPU presentation (`zwp_linux_dmabuf_v1`) | **Working** | the guest renders on the GPU, exports a dma-buf, the daemon imports and commits it |
-| Bionic `libEGL`/`libGLESv2` shim (`pengudroid-gleshim`) | **Working** | exports the EGL API; an app's EGL/GL calls render on the host GPU and swap into Wayland as dma-bufs — `fixtures/egl-app` swaps 5 frames |
-| Real apps' native libraries load | **Working** | after soname mapping + Bionic stubs: Dolphin `libmain.so` (15 MB) and PPSSPP `libppsspp_jni.so` (27 MB) both `dlopen` |
-| **NativeActivity apps without ART** (`pengudroid native`) | **Working** | the host builds `ANativeActivity`, drives the lifecycle, and the app renders on the host GPU; `fixtures/native-game` is a playable game at 1280×720, ~56 fps on an RTX 3080 |
-| APK assets (`AAssetManager`) | **Working** | `AAssetManager_open`/`read`/`seek`/`getBuffer` and directory enumeration read entries straight out of the APK |
-| `ALooper` | **Working** | a real `poll(2)` loop with `addFd`/`removeFd`/`pollOnce`/`pollAll`/`wake`, so an app's main thread blocks instead of spinning |
-| **Vulkan** | **Working** | Android's `libvulkan.so` maps to the host loader; `fixtures/native-vulkan` enumerates the RTX 3080 and creates a logical device + graphics queue |
-| `pengudroid doctor <apk>` | **Working** | reports ABIs, loadable libraries, NativeActivity entry point, graphics APIs, DEX size, assets, and a verdict |
-| `pengudroid sysroot` / `art-test` | **Working (diagnostic)** | validates an extracted Android system tree and attempts `JNI_CreateJavaVM` against it |
-| Optional isolation (`--isolate`) | **Working** | seccomp filter (33 syscalls denied) + `PR_SET_NO_NEW_PRIVS`; not a filesystem/network sandbox |
-| `AHardwareBuffer` / `gralloc` | **Not implemented** | apps that allocate GPU buffers through it still fail |
-| Camera | **Stub** | reports zero cameras |
-| OpenSL ES (audio) | **Working** | engine/output-mix/buffer-queue player implemented; `Enqueue` forwards PCM to `pw-cat`; `fixtures/opensl-app` verifies PLAYING + callbacks against the canonical headers |
-| `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
-| Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
-| **`AudioTrack` playback** | **Working (playback only)** | `AndroidRuntime::registerNativeMethods` is interposed and `android.media.AudioTrack`'s native table is replaced, so PCM goes through a bounded queue into `pw-cat`/`aplay` instead of `AudioFlinger`. `PENGUDROID_PROBE_AUDIO=1` writes half a second of a 440 Hz tone and shows the playback head advance; ExoPlayer plays through it. No mixing, effects, volume scaling or routing |
-| **App services (`startService`/`bindService`)** | **Working** | the host answers both `IActivityManager` transactions and plays `ActiveServices`: it builds `CreateServiceData`, posts `ActivityThread$H.CREATE_SERVICE` on the main thread, calls `handleCreateService`/`onBind`, publishes the binder and delivers `IServiceConnection.connected`. NewPipe's `PlayerService` comes up and ExoPlayer starts |
-| Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
-| Telephony (`ITelephony`) | **Working (no-SIM model)** | real AIDL transaction codes and `Parcel`-marshalled replies for the methods apps reach through `TelephonyManager`; `pengudroid telephony` transacts and decodes them |
-| **Running real DEX bytecode (ART)** | **API-37 migration** | Earlier Android 17 bringup returned `JNI_OK` and ran core/BLAST CheckJNI probes. Current sysroot selection accepts API-37 x86_64 only; the live fixture must be supplied to rerun those gates |
-| **Activity lifecycle driven from the host** | **Working** | with `--bind-app` the host plays `system_server`'s part: it builds `AppBindData` over JNI, calls `handleBindApplication`, then `handleLaunchActivity`/`handleResumeActivity` for the manifest's launcher activity. No `system_server`, no `AppBindData` parcel |
-| **hwui drawing** | **Working** | `ViewRootImpl.performTraversals` reaches `performDraw`, `ThreadedRenderer` renders the real view hierarchy into the shim's FBO, and `eglSwapBuffers` runs every frame |
-| **Presenting an app's frames on Wayland** | **Working** | the gleshim exports the FBO as a dma-buf, the daemon imports it through `zwp_linux_dmabuf_v1` and commits it; NewPipe's live feed is on screen (`docs/screenshots/newpipe.png`) |
-| **Pointer input** | **Working** | the daemon binds `wl_seat` and forwards pointer events to the guest that owns the surface; the host turns them into `MotionEvent`s and delivers them through `ViewRootImpl.dispatchInputEvent`. A click opens NewPipe's video page |
-| **Keyboard input** | **Partial** | Linux keycodes map to Android keys with Shift/Ctrl/Alt/Meta, Caps Lock and event timing; the host notifies the selected app window of focus. Escape and a dedicated Back key now map to Android `KEYCODE_BACK`, so a desktop keyboard can leave a screen without the mouse. Per-app keymap profiles (`$XDG_CONFIG_HOME/pengudroid/keymaps/<package>.keymap`) are applied at runtime: a bound key becomes a tap, hold or swipe, and is consumed instead of reaching the app as a key press. A virtual InputDevice and native KeyCharacterMap now pass six Unicode cases through the real ART/binder path; NewPipe text entry, Shift/Backspace/Ctrl+A and Enter search are now verified in the app UI. Host keymap and IME composition remain incomplete |
-| **Video playback (`MediaCodec`)** | **Working (ByteBuffer + Surface)** | the real codec2 service runs in-process (`C2PlatformComponentStore` → `utils::ComponentStore` → `BnHwComponentStore`), so `MediaCodecList` reports **53 codecs** with full `MediaCodecInfo` objects. `configure`/`start`/`queueInputBuffer`/`dequeueOutputBuffer` run the whole way through `libcodec2_soft_avcdec.so`; `PENGUDROID_PROBE_MEDIA=1` yields a decoded 320×240 frame that matches `ffmpeg`'s reference decode byte for byte, and `PENGUDROID_PROBE_SURFACE=1` delivers that frame to a real `Surface` consumer (`ImageReader`) through `BufferQueue`. CPU `SurfaceView` output uses immutable `wl_shm` snapshots scaled to its layout, with pointer events passing to the parent; passing allocator memfds as dma-bufs was invalid and disconnected the compositor. WindowConfiguration bounds now prevent the later 0x0 layout collapse. NewPipe Big Buck Bunny VOD advanced beyond 4200 frames over 191 seconds with a running PipeWire audio stream after fixing dead audio-sink handling and preserving the host session runtime (`PENGUDROID_SOCKET` isolates the broker). Host hardware H.264 decode (VA-API on Intel/AMD, Vulkan Video on NVIDIA) and direct GPU video import now pass hardware tests (see [HARDWARE_VIDEO.md](docs/HARDWARE_VIDEO.md)); NewPipe hardware Codec2 integration, full window/layer association and broader playback compatibility remain incomplete |
-| **Window geometry from the window manager** | **Working** | the `IWindowSession.relayout` reply carries a real `ClientWindowFrames` (1280×720), so `ViewRootImpl.mWidth/mHeight` are non-zero and the dirty rect is not empty |
-| Android packed relocations (`APS2` / `ANDROID_RELA` / `ANDROID_RELR`) | **Working** | `de-bionic` expands them into standard `RELA`/`RELR` (new `PT_LOAD` + retagged dynamic entries); without this a modern Android `.so` loads with *no* relocations applied |
-| Android linker API (`android_dlopen_ext`, namespaces, `__loader_*`) | **Working** | translated to glibc's flat namespace by the shim; `libdl_android.so` / `ld-android.so` resolve to the shim |
-| **Loading `libart.so` (the Android runtime)** | **Working** | the ART APEX closure (`libart`, `libartbase`, `libdexfile`, `libc++`, `libnativebridge`, `libunwindstack`, ...) `dlopen`s |
-| **Running `JNI_CreateJavaVM`** | **Working** | returns `JNI_OK` with a live `JavaVM`/`JNIEnv`; `GetVersion()` reports `JNI_VERSION_1_6` and the JNI function table is validated against the VM |
-| **Framework native registration** | **Working** | all 150 `register_android_*` groups exported by `libandroid_runtime.so` are called in `gRegJNI`-like order, so `android.os.Trace`, `android.util.Log`, Binder and friends have their natives |
-| **`ActivityThread.main`** | **Working (framework loop)** | invoked on the live VM; `attach()` completes against the emulated binder broker and the process enters `Looper.loop()`, waiting for `system_server` to bind it |
-| **Bionic `sigaction`/`sigset_t` translation** | **Working** | Bionic's `sigset_t` is 8 bytes and `struct sigaction` 32; glibc's are 128/152. Interposing the whole signal API is what made ART stop corrupting its own globals |
-| **Virtual Android root (`PENGUDROID_ROOT`)** | **Working** | absolute paths under `/apex`, `/system`, `/vendor`, `/data`, ... are rewritten into an extracted tree at the libc boundary (`open`/`fopen`/`stat`/...), so libcore's `VMClassLoader` can open the boot jars — no chroot, no mount namespace |
-| **Full boot class path (boot image + APEX fragments)** | **API-37 contract** | Required framework classpath metadata and APEX fragments determine jar order; malformed metadata and missing declared jars fail rather than selecting a hardcoded older jar list |
-| **`AndroidRuntime::setArgv0` without `app_process`** | **Working** | interposed because `getRuntime()` is null when ART is hosted directly; the call would otherwise null-deref during `ActivityThread.main` |
-| **In-process `/dev/binder` device** | **Working (service lookups)** | `memfd`-backed device answering `BINDER_VERSION` (8), `SET_MAX_THREADS`, `SET_CONTEXT_MGR`, `THREAD_EXIT`; `BINDER_WRITE_READ` parses transactions and replies with `flat_binder_object` handles (including the stability field libbinder requires). `ServiceManager.getService` returns a real proxy and `attachApplication` is accepted |
-| **ARM→x86_64 translation (Intel NDK translation)** | **Partial** | the emulator's `libndk_translation.so` loads and initialises (`Initialized NDK translation (aarch64)`), the guest linker resolves the ARM64 runtime and `ExecuteGuest` starts running the real ARM64 `app_process64`; it then dies in the translator's lazy code-translation fault handler. See `docs/LIMITATIONS.md` §2.1 |
-| `pengudroid launch` (Proton-style prefixes) | **Working** | per-app prefix (`~/.local/share/pengudroid/prefixes/<pkg>`) with `files`/`cache`/`code_cache`/`shared_prefs` and `pengudroid.env` overrides; picks `native` or `art` from the APK. The `art` backend now runs the full bind + launch flow, so `pengudroid launch <apk>` opens a window. `--component <class>` overrides the manifest's launcher activity, which is how an app whose splash never starts its real activity (Roblox) can be entered directly |
-| **Play bundles** (`.apkm`, `.xapk`, `.apks`) | **Working** | `pengudroid extract` unpacks base + splits + OBB (with `--abi` filtering); `info`, `doctor` and `launch` read the bundle directly, including native libraries that live in the ABI split rather than in `base.apk` |
-| **Real Bionic/EGL in a guest** | **Not started** | needs the Android userspace `.so`s loaded in-process |
-
-The honest framing of "no `system.img`": the *container/VM* image is gone, but
-Android apps still need ART and Bionic *binaries* from somewhere. PenguDroid's
-design goal is to load those as host libraries under a translation shim rather
-than boot them as a guest OS. See `docs/ARCHITECTURE.md`.
-
----
-
-## Build
-
-Requires a Rust toolchain (stable, 1.75+). No system `-dev` packages are needed
-for the default build — the Wayland client backend is pure Rust.
+Runtime preparation and translation inputs are documented in [ANDROID17.md](docs/ANDROID17.md) and [NATIVE_BRIDGE.md](docs/NATIVE_BRIDGE.md). To assemble the portable release after preparing the bridge and guest bundle:
 
 ```sh
-cargo build --release
+tools/build-appimage.sh --portable --with-bridge
 ```
 
-Binaries land in `target/release/`:
+The build host needs the packaging inputs and `appimagetool`; these are build dependencies, not packages the end user must install. `--with-runtime` is a local testing option and is not used for the downloadable release.
 
-* `pengudroid-daemon` — the resident broker
-* `pengudroid` — the CLI
-* `libpengudroid_shim.so` — the `LD_PRELOAD` Bionic translation shim
-
-## Usage
+### Validation
 
 ```sh
-# Start the daemon (or let `run`/`start` start it for you).
-pengudroid daemon
-
-# Inspect an APK without running it.
-pengudroid info app.apk
-
-# Report how well the shim covers a native library's Bionic imports.
-pengudroid deps lib/arm64-v8a/librtb.so
-
-# Try to load a real Android library on glibc (de-bionic + bionic-compat + dlopen).
-pengudroid nativelib lib/x86_64/librtb.so
-
-# Load every native library an APK ships for an ABI.
-pengudroid nativelib --apk app.apk --abi x86_64
-
-# Print the Bionic-soname compat directory (for LD_LIBRARY_PATH) / strip versioning.
-pengudroid libpath
-pengudroid de-bionic in.so out.so
-
-# See it work with no APK at all: the built-in demo window.
-pengudroid demo
-
-# Run a NativeActivity app (no ART): a real game renders on the host GPU.
-pengudroid native fixtures/native-game/libmain.so --width 1280 --height 720
-
-# Can this APK run? What is missing?
-pengudroid doctor app.apk
-
-# Inspect an extracted Android system tree / try to start ART against it.
-pengudroid sysroot /path/to/android-system
-pengudroid art-test --sysroot /path/to/android-system
-
-# Launch an app as a native Wayland window; Ctrl-C stops the guest.
-pengudroid run app.apk
-
-# Let the daemon fork the guest instead (survives the CLI exiting); `--wait`
-# blocks until it exits and prints the exit status.
-pengudroid start app.apk --wait
-pengudroid start --demo --wait
-
-# Inspect the host GPU and prove the GPU path renders (offscreen + dma-buf).
-pengudroid gpu-info
-pengudroid gpu-test
-
-# Audio: stream PCM (silence by default; --tone is audible).
-pengudroid audio-test --seconds 1
-pengudroid audio-test --tone
-
-# Manage guests, services and properties.
-pengudroid ps
-pengudroid services
-pengudroid getprop                           # every property
-pengudroid getprop ro.build.version.sdk      # -> 37
-pengudroid setprop debug.pengudroid 1
-pengudroid status
-pengudroid stop
+cargo test --workspace --offline
+python3 -B -m unittest discover -s tools
 ```
 
-Health-check the graphics path without opening a window:
+Some integration tests need the local Android runtime, graphics session or pinned native toolchain. Release verification must additionally exercise the packaged artifact from an unrelated working directory with a fresh user cache, verify runtime download/preparation and relaunch, and test real application launch/stop. Source-tree test results alone do not prove that an AppImage contains all of its dependencies.
 
-```sh
-pengudroid-daemon --wayland-selftest
-# OK: connected to the Wayland compositor and bound required globals
-```
+## Documentation and license
 
-Using the shim with a guest process:
+[CLI and protocol](docs/API.md) · [Android runtime](docs/ANDROID17.md) · [Native bridge](docs/NATIVE_BRIDGE.md) · [Hardware video](docs/HARDWARE_VIDEO.md) · [Limitations](docs/LIMITATIONS.md)
 
-```sh
-LD_PRELOAD=$PWD/target/release/libpengudroid_shim.so your-android-binary
-```
-
-## Loading and running native libraries
-
-Android `.so` files are Bionic-linked, and glibc refuses to load them for two
-independent reasons, both found empirically against real APK libraries:
-
-1. **Symbol versioning.** Bionic versions every libc symbol against a single
-   node per library — `libc.so` → `LIBC`, `libm.so` → `LIBM`, `libdl.so` → `LD`
-   — while glibc exports granular `GLIBC_2.x`. So an object both demands
-   `version 'LIBC' not found` and requires `free@LIBC` / `__cxa_finalize@LIBC`,
-   which glibc's versioned `free` cannot satisfy.
-2. **Soname mismatch.** `DT_NEEDED` names like `libc.so`, `libdl.so` do not
-   exist on a modern glibc system (`libc.so` is a linker script; `libdl.so` was
-   merged into libc).
-
-A few Bionic symbols glibc simply lacks (`__strlen_chk`, `__sF`, ...) are the
-third issue, handled by the shim.
-
-```
-$ pengudroid deps lib/x86_64/librtb.so        # measure Bionic coverage vs the shim
-bionic coverage: 2/2 (100%)
-
-$ pengudroid nativelib fixtures/native-demo/lib/libandroid_demo.so \
-      --call pengudroid_demo_run             # strip, load, and call
-library: .../libandroid_demo.so (ELF64, x86-64)
-OK: dlopen succeeded
-CALL pengudroid_demo_run() = 500500
-```
-
-The mechanism has two parts:
-
-* **`pengudroid de-bionic` / `pengudroid_elf::strip_android_versions`** rewrites
-  every non-zero `.gnu.version` entry to *global*, so symbol references become
-  unversioned and resolve normally against glibc (or the shim).
-* **`pengudroid libpath`** materialises a compat directory in which the Bionic
-  sonames (`libc.so`, `libm.so`, `libdl.so`, `liblog.so`, ...) all resolve to
-  the **shim**, which carries the `LIBC`/`LIBM`/`LD` version nodes via a linker
-  version script (`crates/pengudroid-shim/build.rs`) and provides the Bionic
-  symbols. glibc's own `libc.so.6` is already loaded in the process, so
-  unversioned references like `free` resolve from there.
-
-`nativelib` runs both and then actually attempts the load (re-execing as the
-hidden `__dlopen` command under `LD_PRELOAD` + `LD_LIBRARY_PATH`), optionally
-calling a nullary `int`-returning export with `--call`.
-
-### An application's own libraries (`nativelib --apk`)
-
-`pengudroid nativelib --apk app.apk --abi <abi>` extracts every native library
-an APK ships for that ABI, strips them into one scratch directory, and loads
-them as a set — so dependencies *between* the APK's libraries (for example a
-library that `DT_NEEDED`s the APK's own `libc++_shared.so`) resolve inside that
-directory rather than failing. Cross-architecture entries are reported as
-`[SKIP]` with the reason instead of a confusing load failure:
-
-```
-$ pengudroid nativelib --apk droidfish.apk --abi x86_64
-/tmp/droidfish.apk: 3 native libraries for x86_64
-  [ OK ] libgtb.so
-  [ OK ] libnativeutil.so
-  [ OK ] librtb.so
-/tmp/droidfish.apk: 3 loadable, 0 skipped, 0 failed
-```
-
-**Teardown.** Bionic C++ libraries register static destructors that assume Bionic
-runtime state; running them on glibc is what segfaulted `librtb.so` during
-`dlclose`. The shim interposes `__cxa_atexit`/`atexit`/`__cxa_finalize` and,
-when `PENGUDROID_SUPPRESS_DESTRUCTORS=1` (which `nativelib` sets for guests),
-skips registration. Verified: `nativelib --dlclose` on a faulting destructor goes
-from SIGSEGV (139) to a clean exit when suppression is enabled.
-
-**`__sF`.** Bionic's `FILE __sF[3]` is mapped onto glibc's
-`stdin`/`stdout`/`stderr` by interposing `fprintf`/`vfprintf`/`fputs`/`fwrite`/
-`fputc`/`fflush`/`fclose` (the mapping assumes Bionic's LP64 `sizeof(FILE)` =
-152). Only the three standard streams are supported, and `fprintf` does not
-format varargs (use `vfprintf`, which does).
-
-**An application's own libraries.** `nativelib --apk` stages an APK's whole
-`lib/<abi>` set in one directory, so intra-APK dependencies resolve.
-`fixtures/cpp-cascade` proves it: a consumer that `DT_NEEDED`s the bundled
-`libc++_shared.so` loads, and `consumer_run()` returns `42`.
-
-**`pengudroid-elf`** reads ELF32 and ELF64 (armv7, aarch64, x86, x86-64) with no
-external dependencies.
-
-### Reproducible test
-
-`fixtures/native-demo/` builds a small *Android-style versioned* library (a stub
-`libc.so` provides version `LIBC`) with an entry point returning `500500`, and
-`fixtures/native-demo/run-test.sh` loads and calls it through PenguDroid — no
-network or real APK required.
-
-## GPU path (zero-copy)
-
-PenguDroid binds the **host's** EGL/GLES/GBM at runtime (no `-dev` headers —
-everything is `dlopen`'d), so guest graphics drive the real GPU instead of a
-software rasteriser. `pengudroid gpu-info` reports the driver; `pengudroid
-gpu-test` renders offscreen and verifies the pixels, then exports a dma-buf:
-
-```
-$ pengudroid gpu-info
-GL renderer:      NVIDIA GeForce RTX 3080/PCIe/SSE2
-GL version:       OpenGL ES 3.2 NVIDIA 595.99.02
-zero-copy ready:  yes
-
-$ pengudroid gpu-test
-rendered 128x128 on the GPU; corner pixel RGBA = (25,51,229,255)
-pixel verification: OK
-dmabuf: 128x128 stride 512 fourcc 0x34324241 modifier 0x300000000e08014 offset 0 fd 27
-zero-copy hand-off: OK
-```
-
-When a compositor advertises `zwp_linux_dmabuf_v1`, `pengudroid run` uses the
-guest's GPU path: the guest renders into an FBO on the host GPU, exports it as a
-dma-buf, and sends it to the daemon (`PresentDmabuf`, fd via `SCM_RIGHTS`),
-which imports it into the existing Wayland surface and commits — no CPU copy and
-no `wl_shm`. If the GPU or the protocol is unavailable it falls back to the
-`wl_shm` client path.
-
-```
-$ pengudroid run app.apk
-guest pid 9734: rendering on the host GPU via dma-buf
-guest: first dma-buf presented (720x1280, fourcc 0x34324241) — zero-copy
-```
-
-A real game runs through the same path: `fixtures/native-game` is a playable
-NativeActivity game that renders 1280×720 at ~56 fps on an RTX 3080, one dma-buf
-per frame.
-
-Health-check it directly:
-
-```sh
-pengudroid-daemon --wayland-selftest   # reports linux-dmabuf availability
-pengudroid-daemon --dmabuf-selftest    # GPU render -> dma-buf -> compositor
-```
-
-## Audio path
-
-The daemon owns a shared PCM ring (an ashmem region) at 48 kHz / stereo / S16_LE.
-Output goes to the session's **PipeWire** through its own `pw-cat` tool, driven
-over a pipe (with `aplay` as a fallback) — a real stream in the PipeWire graph
-without binding `libpipewire`'s large C ABI.
-
-```
-$ pengudroid audio-test --seconds 1
-audio: pw-cat @ 48000 Hz, 2 ch, 1.00s of silence
-audio: stream completed cleanly
-```
-
-Silence is the default so the check cannot disturb anyone; `--tone` plays a quiet
-440 Hz sine. Add `--via-daemon` to exercise the full architecture — the client
-maps the daemon's ring, fills it, and sends `AudioWrite`:
-
-```
-$ pengudroid audio-test --via-daemon --seconds 1
-audio: sent 192000 bytes through the daemon ring (48000 Hz, 2 ch)
-```
-
-What remains is the broader OpenSL ES surface: the buffer-queue player works, but
-recorders, prefetch, effects and the other interfaces are still
-`SL_RESULT_FEATURE_UNSUPPORTED`.
-
-## Repository layout
-
-```
-crates/
-  pengudroid-proto/    wire protocol, ABI constants, no dependencies
-  pengudroid-socket/   Unix-socket transport with SCM_RIGHTS fd passing
-  pengudroid-elf/      ELF dynamic-symbol reader + Android version stripping
-  pengudroid-daemon/   the resident broker (binder/graphics/audio/props)
-  pengudroid-cli/      the `pengudroid` command, APK/AXML parser, guest runtime
-  pengudroid-shim/     LD_PRELOAD Bionic->glibc translation shim
-fixtures/
-  native-demo/         a reproducible Android-style versioned test library
-  native-activity/     a NativeActivity app that renders a spinning triangle
-  native-vulkan/       a NativeActivity app that enumerates the host GPU via Vulkan
-  native-game/         a playable NativeActivity game (PenguDroid Invaders)
-docs/
-  ARCHITECTURE.md      how each translation layer works
-  API.md               CLI surface and the control protocol, in one place
-  LIMITATIONS.md       the hard problems, stated plainly
-```
-
-## Testing
-
-```sh
-# Rust: protocol, ELF, shim, daemon, CLI and the end-to-end native path.
-cargo test --workspace
-
-# Python: the build/tooling pipeline (linkers, stubs, native bridge, AppImage).
-cd tools
-PENGUDROID_LLVM_DIR=$PWD/../.toolchain/llvm-bin \
-LD_LIBRARY_PATH=$PWD/../.toolchain/llvm-22-root/usr/lib \
-    python3 -m unittest discover -s .
-```
-
-Both suites are green: 390 Rust tests and 242 Python tests. The Python tests
-compile real ARM64 guests and link the native bridge, so they need the pinned
-LLVM 22 toolchain in `.toolchain/`; without it they skip rather than fail.
-
-Unit tests cover the wire protocol round-trips, `SCM_RIGHTS` fd passing, socket
-timeouts, ashmem sealing, binder ioctl-number correctness, the property store,
-service stubs and guest-service ownership, daemon dispatch (including guest
-calls, `RunApk` validation and process bookkeeping), ZIP + AXML parsing, the
-shim's property/ashmem/log-formatting/asset/looper entry points, and the seccomp
-filter.
-
-End-to-end tests drive a real daemon: the CLI commands, detached launches, and
-the NativeActivity path (`tests/native_e2e.rs`, which renders the game fixture
-and skips cleanly when there is no Wayland session or the C fixture was not
-built).
-
-The shim's variadic `__android_log_print` / `__android_log_assert` are compiled
-from a small C file generated by `crates/pengudroid-shim/build.rs` (Rust cannot
-define C-variadic functions on stable). Without a C compiler the crate still
-builds, minus those two entry points, and says so with a cargo warning.
-
-### Debug hooks
-
-Environment variables read by the shim, the CLI and the daemon. They are all
-opt-in and cost nothing when unset.
-
-| Variable | What it does |
-| --- | --- |
-| `PENGUDROID_TRACE_BT=<substring>` | print a `dladdr`-symbolised backtrace for every log line containing the substring (the only way to answer "who logged this": gdb cannot follow the libraries this process `dlopen`s). Prints *before* the matching line, at most 8 times |
-| `PENGUDROID_TRACE_AHB` | trace the gralloc shim: `AHardwareBuffer` allocations, `GraphicBufferAllocator` allocations (with `fd`, stride, format), mapper `lock`/`unlock` and any rejection reason |
-| `PENGUDROID_DUMP_GBUF=<dir>` | write every graphic block's contents to `<dir>/gbuf-<fd>.bin` on `unlock`; shows which block actually received pixels |
-| `PENGUDROID_PROBE_MEDIA=1` | drive `MediaCodecList` + decode a stream through `MediaCodec` and report the decoded bytes (`PENGUDROID_H264` picks the stream, default `/tmp/test.h264`); add `PENGUDROID_PROBE_SURFACE=1` to decode into an `ImageReader` surface instead of a ByteBuffer |
-| `PENGUDROID_PROBE_AUDIO=1` | build an `AudioTrack`, play half a second of a 440 Hz tone and report the playback head twice — a non-zero delta means the PCM really reached `pw-cat` |
-| `PENGUDROID_TRACE_CODEC2` | dump every codec2 HIDL transaction (request, reply, object offsets) |
-| `PENGUDROID_TRACE_BINDER` | trace broker transactions by interface and code |
-| `PENGUDROID_TRACE_GLESHIM`, `PENGUDROID_TRACE_GLES`, `PENGUDROID_TRACE_DRAW` | trace the EGL/GLES translation layer and hwui draw calls |
-| `PENGUDROID_DUMP_FRAME=<prefix>` / `_AT=<n>` / `_NOFLIP=1` | write frame *n* as a PPM (`tools/art/ppm2png.py` converts it) |
-| `PENGUDROID_MAX_FPS=<n>` | cap `eglSwapBuffers` at *n* fps (default **60**, `0` = unthrottled). The daemon acks a present as soon as it is queued, so without this a game free-runs at hundreds of fps and burns a core on frames the compositor drops |
-| `PENGUDROID_NO_CODEC2_SERVICE=1` | fall back to the hand-written codec2 stub replies |
-| `PENGUDROID_PROBE_VIEWS=1` | walk the window hierarchy and print every view's class and measured size, plus the `SurfaceView` fields that decide whether the video layer exists (`mHaveFrame`, `mSurfaceControl`, `mBlastBufferQueue`, `mSurface`'s native pointer, `mSurfaceCreated`, `mVisible`) |
-| `PENGUDROID_FORCE_SURFACE=1` | give a zero-width `SurfaceView` a real frame (`PENGUDROID_VIDEO_W`/`_H`, default 720×405) and let the framework's own main-thread pre-draw listener create the surface. Never call `updateSurface()` yourself: it ends in `ExoPlayer.setVideoSurface`, which asserts the main thread |
-| `PENGUDROID_TRACE_VIDEO=1` | trace the `BLASTBufferQueue` consumer: created queue, geometry updates, the daemon subsurface, and every 30th presented frame |
-| `PENGUDROID_VIDEO_X` / `_Y` | where the video subsurface sits inside the app window (default `0,0`) |
-| `PENGUDROID_SYNTH_CLICK="x,y[@ms][;x,y[@ms]]…"` | inject a timed sequence of taps into the app's own `ViewRootImpl` (there is no way to click a window from a sandboxed session). `@ms` is the wait before that tap, default 8000. Example: `"665,682;145,300@12000"` dismisses NewPipe's first-run dialog, then opens the first feed item. With `PENGUDROID_PROBE_VIEWS` the view tree is dumped 12 s after the last tap |
-| `PENGUDROID_CLICK_TEXT="<text>[@ms]"` | click the first `TextView` whose text contains `<text>`, using its global visible rectangle. Deterministic where coordinates are not: a feed scrolls and rows move as items load |
-| `PENGUDROID_PROBE_DELAY=<ms>` | how long the view probe waits before it walks (default 12000). A playing screen can die within seconds |
-| `PENGUDROID_TRACE_ROOTS=<ms>` | print every window's `mWidth`/`mWinFrame`/`mTraversalScheduled`/`mIsInTraversal` on a timer — a timeline says *when* state changed, which a single dump cannot |
-| `PENGUDROID_BLAST=1` | leave BLAST enabled on the window root instead of forcing `mForceDisableBLAST := true`, so `relayoutWindow` builds a `BLASTBufferQueue` the way a device does. The default stays on the legacy `Surface.copyFrom` path |
-| `PENGUDROID_INTENT_DATA=<uri>` | attach a `Uri` and `ACTION_VIEW` to the launch intent, the way a share/opener intent arrives. With `--component org.schabi.newpipe.RouterActivity` this points an URL-handling activity at a specific link |
-| `PENGUDROID_DUMP_FRAME=/path/f.ppm` (+ `_AT`, `_EVERY`) | read the swapped FBO back with `glReadPixels` and write it as a binary PPM. Without a screenshot tool this is how the render output is inspected; `_EVERY=<n>` dumps every n-th frame (a playing video needs a sequence, one frame cannot tell "the video is on screen" from "the last frame was static") |
-| `PENGUDROID_PUMP_RESIZED=1` | play the window manager's `IWindow.resized` by calling `ViewRootImpl.dispatchResized` directly (experimental; replaying it through the emulated binder returns `UNKNOWN_TRANSACTION` in this tree) |
-| `PENGUDROID_TRACE_OPEN=1` | log every failed `open`/`openat` once, with `errno` and the path after rootfs rewriting — the fastest way to see which resource a guest gave up on |
-| `PENGUDROID_TRACE_ROOTFS` | log every Android→host path rewrite (`/system/…` → `<sysroot>/system/…`) |
-| `PENGUDROID_DEBUG_WRAP='gdb -x script.gdb --args'` | prefix the ART helper with a wrapper (`art-test` only) |
-
-`tools/make_h264.py <path> [width_mb] [height_mb]` generates the test stream:
-every macroblock is `I_PCM`, so the samples are exactly what the script wrote and
-a decoded frame can be checked byte for byte against `ffmpeg`'s output.
-
-### Per-app settings overrides (`ClientAppSettings.json`)
-
-Roblox-style guests read a debug override file from `/data/local/tmp`. Because
-`/data` is rewritten to the sysroot, dropping the file at
-`<sysroot>/data/local/tmp/ClientAppSettings.json` makes the guest see it at the
-Android path — no root, no mount, no container. Verified with Roblox 2.743: the
-`FileNotFoundException` in `rbx.settings.local` disappears and the keys are
-queryable afterwards. This is how a fastflag can be tried without patching the
-APK.
-
-## License
-
-Apache-2.0.
+PenguDroid is licensed under [Apache-2.0](LICENSE). Bundled third-party components retain their own licenses. Android runtime downloads are obtained separately from their official source. Genshin Impact, Beach Buggy Racing 2, NewPipe and their respective marks belong to their owners; the screenshots demonstrate compatibility and do not imply endorsement.

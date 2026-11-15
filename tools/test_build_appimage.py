@@ -17,6 +17,7 @@ RELEASE = REPO / "target" / "release"
 ARTIFACTS = (
     "pengudroid",
     "pengudroid-gui",
+    "pengudroid-daemon",
     "libpengudroid_shim.so",
     "libpengudroid_gleshim.so",
 )
@@ -77,7 +78,7 @@ class AppDirTests(unittest.TestCase):
         self.assertIn('exec "$HERE/usr/bin/pengudroid-gui"', apprun)
         # An explicit choice must survive the AppRun defaults: a developer
         # testing a freshly prepared translator relies on it.
-        self.assertIn('[ -z "${PENGUDROID_NATIVE_BRIDGE_LIB:-}" ]', apprun)
+        self.assertIn('PENGUDROID_NATIVE_BRIDGE_LIB:=$HERE/usr/lib/pengudroid/bridge', apprun)
         self.assertIn('[ -z "${PENGUDROID_SYSROOT:-}" ]', apprun)
 
     def test_desktop_entry_launches_the_shell_and_accepts_apk_files(self):

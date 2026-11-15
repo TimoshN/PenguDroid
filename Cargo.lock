@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "miniz_oxide 0.8.9",
@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "pengudroid-device",
@@ -3016,15 +3016,15 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-device"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "pengudroid-elf"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "pengudroid-gleshim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "pengudroid-proto",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "pengudroid-input",
@@ -3043,35 +3043,35 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-hostgpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "pengudroid-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "pengudroid-nativebridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "pengudroid-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pengudroid-device",
 ]
 
 [[package]]
 name = "pengudroid-shim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "miniz_oxide 0.8.9",
@@ -3082,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-socket"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "pengudroid-proto",

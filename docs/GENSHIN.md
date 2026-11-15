@@ -1,10 +1,6 @@
 # Genshin Impact: where the target stands
 
-Genshin Impact is the project's stated end goal. **It has not been launched
-under PenguDroid, and nothing in this document claims that it runs.** This is
-the gap list between what the tree does today and a playable session, in the
-order the game would hit each gap, with what was done about it and what is
-still open.
+**Current evidence — 2026-11-15:** Genshin Impact 7.2.0 reaches in-world gameplay on an NVIDIA RTX 3080 Founders Edition and Intel Core i3-12100F using the ARM64 Digitalis bridge. See the [gameplay screenshot](screenshots/genshin-impact-7.2.0-rtx3080.png) and the [README](../README.md) for the release path. The checklist below is the historical engineering plan; its “missing” and “not yet run” labels describe the earlier investigation, not the current demonstrated gameplay. General compatibility and performance remain hardware/version dependent.
 
 Check any build of the game (or any other title) yourself:
 

@@ -416,7 +416,7 @@ pub fn nativelib(args: &[String]) -> i32 {
         }
     }
     cmd.env("LD_PRELOAD", &shim)
-        .env("LD_LIBRARY_PATH", ld_path)
+        .env("LD_LIBRARY_PATH", crate::runtime::host_library_path(&ld_path))
         .env("PENGUDROID_SUPPRESS_DESTRUCTORS", if na.suppress_destructors { "1" } else { "0" });
     if na.dlclose {
         cmd.env("PENGUDROID_DLCLOSE", "1");
@@ -616,7 +616,7 @@ fn run_apk(na: &NativeArgs) -> i32 {
             .arg("__dlopen")
             .arg(target)
             .env("LD_PRELOAD", &shim)
-            .env("LD_LIBRARY_PATH", &ld_path)
+            .env("LD_LIBRARY_PATH", crate::runtime::host_library_path(&ld_path))
             .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1")
             .output();
         match output {

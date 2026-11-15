@@ -17,22 +17,58 @@ struct State {
     stopping: HashSet<String>,
     events: std::sync::mpsc::Receiver<WorkerEvent>,
     sender: std::sync::mpsc::Sender<WorkerEvent>,
+    runtime_busy: bool,
 }
 
 enum WorkerEvent {
+    RuntimeProgress(String),
+    RuntimeReady(Result<(), String>),
     Installed(Result<Vec<Result<registry::Entry, String>>, String>),
     Stopped { package: String, uninstall: bool, result: Result<(), String> },
 }
 
 type Shared = Rc<RefCell<State>>;
 
+fn prepare_runtime(ui: &MainWindow, state: Shared) {
+    use std::io::BufRead;
+    state.borrow_mut().runtime_busy = true;
+    ui.set_status("Downloading and preparing Android runtime (first launch only)…".into());
+    let sender = state.borrow().sender.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let mut child = std::process::Command::new(registry::pengudroid_binary())
+                .args(["runtime", "--download"])
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+                .spawn().map_err(|e| e.to_string())?;
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let progress = sender.clone();
+            let reader = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let _ = progress.send(WorkerEvent::RuntimeProgress(line));
+                }
+            });
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = sender.send(WorkerEvent::RuntimeProgress(line));
+            }
+            let status = child.wait().map_err(|e| e.to_string())?;
+            let _ = reader.join();
+            if status.success() { Ok(()) } else { Err(status.to_string()) }
+        })();
+        let _ = sender.send(WorkerEvent::RuntimeReady(result));
+    });
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let (sender, events) = std::sync::mpsc::channel();
     let state = Rc::new(RefCell::new(State {
-        registry: Registry::load(), running: HashMap::new(), stopping: HashSet::new(), events, sender,
+        registry: Registry::load(), running: HashMap::new(), stopping: HashSet::new(), events, sender, runtime_busy: false,
     }));
     refresh(&ui, &state.borrow());
+    if std::env::var("PENGUDROID_AUTO_RUNTIME").as_deref() == Ok("1") && runner::sysroot().is_none() {
+        prepare_runtime(&ui, Rc::clone(&state));
+    }
     let editor = Rc::new(RefCell::new(None::<KeymapWindow>));
 
     // Installation (including manifest inspection) is performed on a worker.
@@ -54,6 +90,14 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak(); let state = Rc::clone(&state);
         ui.on_launch_requested(move |index| {
             let Some(ui) = weak.upgrade() else { return };
+            if state.borrow().runtime_busy {
+                ui.set_status("Android runtime setup is still running…".into());
+                return;
+            }
+            if std::env::var("PENGUDROID_AUTO_RUNTIME").as_deref() == Ok("1") && runner::sysroot().is_none() {
+                prepare_runtime(&ui, Rc::clone(&state));
+                return;
+            }
             let mut state = state.borrow_mut();
             let Some(entry) = state.registry.get(index as usize).cloned() else { return };
             if state.running.contains_key(&entry.package) || state.stopping.contains(&entry.package) { return; }
@@ -182,6 +226,14 @@ fn main() -> Result<(), slint::PlatformError> {
             while let Ok(event) = state.events.try_recv() {
                 changed = true;
                 match event {
+                    WorkerEvent::RuntimeProgress(line) => ui.set_status(line.into()),
+                    WorkerEvent::RuntimeReady(result) => {
+                        state.runtime_busy = false;
+                        ui.set_status(match result {
+                            Ok(()) => "Android runtime is ready. Install or launch an app.".into(),
+                            Err(error) => format!("Runtime setup failed: {error}. Launch retries setup.").into(),
+                        });
+                    }
                     WorkerEvent::Installed(result) => {
                         match result {
                             Ok(results) => {

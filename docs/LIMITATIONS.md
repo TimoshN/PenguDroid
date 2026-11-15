@@ -288,13 +288,7 @@ the image boot all the way into app startup, which confirms the diagnosis. See
   `pengudroid native`, with `AAssetManager`, `ALooper`, EGL/GLES and Vulkan. This
   is the path `pengudroid launch` picks, and `fixtures/native-game` is a playable
   game at ~56 fps on an RTX 3080.
-* **Genshin Impact gameplay is unverified** (2026-11-11). The ARM64 Android
-  build now renders the HoYoverse splash and interactive login form through
-  the native bridge. Missing service metadata had prevented Firebase component
-  discovery; the resulting Java exception started host teardown while Unity
-  was still rendering, causing the previously reported driver crash. That
-  metadata path is fixed; see STATUS.md. Account login, resource downloads,
-  in-world rendering, controls and sustained gameplay still require validation.
+* **Genshin Impact 7.2.0 reaches gameplay on the tested machine** (2026-11-15): RTX 3080 Founders Edition, Core i3-12100F, ARM64 Digitalis translation. The [captured gameplay](screenshots/genshin-impact-7.2.0-rtx3080.png) supersedes the earlier login-only status. This does not establish compatibility with every game update, GPU, account verification flow or Linux desktop. WebView uses an in-process compatibility configuration; Android renderer-process isolation remains incomplete.
 
 ## 3. Native `.so` compatibility
 
@@ -672,3 +666,7 @@ hanging forever, so a wedged guest cannot freeze its peers.
 13. Input dispatch (touch/key) from the Wayland seat into the app's window.
 14. Guest ARM code execution, so arm64-only apps (Beach Buggy Racing 2,
     Genshin Impact) can run at all — see §2.1.
+
+## Release 0.2.0 package-specific regression
+
+Beach Buggy Racing 2 2026.10.05 APKM aborts during native startup with a pending `VuAgeHelper.isKidsProfile()` JNI lookup error in the clean AppImage test. Use the tested 2026.10.26 ARM64 XAPK; compatibility does not extend to every package revision.

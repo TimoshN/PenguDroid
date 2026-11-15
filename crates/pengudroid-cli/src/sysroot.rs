@@ -414,6 +414,23 @@ pub fn sysroot(args: &[String]) -> i32 {
     }
 }
 
+/// `ANDROID_DATA` for ART (its `dalvik-cache`): the runtime's own `data`
+/// directory when it is writable, else a per-user one. A runtime embedded in
+/// the AppImage is a read-only mount.
+fn android_data_dir(root: &Path) -> PathBuf {
+    let own = root.join("data");
+    let probe = own.join(format!(".pengudroid-write-{}", std::process::id()));
+    if std::fs::create_dir_all(own.join("dalvik-cache/x86_64")).is_ok() && std::fs::write(&probe, b"").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        return own;
+    }
+    let fallback = crate::runtime::cache_root()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("android-data");
+    let _ = std::fs::create_dir_all(fallback.join("dalvik-cache/x86_64"));
+    fallback
+}
+
 /// Sonames the shim provides itself; the Android copies must not shadow them.
 /// Bionic sonames the shim stands in for, so the real library is never copied
 /// into the scratch tree.
@@ -1040,10 +1057,10 @@ pub fn art_test(args: &[String]) -> i32 {
         cmd.env("PENGUDROID_GLESHIM", g);
     }
     cmd.env("LD_PRELOAD", &preload)
-        .env("LD_LIBRARY_PATH", &ld_path)
+        .env("LD_LIBRARY_PATH", crate::runtime::host_library_path(&ld_path))
         .env("ANDROID_ROOT", &layout.android_root)
         .env("ANDROID_ART_ROOT", &layout.art_root)
-        .env("ANDROID_DATA", layout.root.join("data"))
+        .env("ANDROID_DATA", android_data_dir(&layout.root))
         .env("ANDROID_TZDATA_ROOT", layout.root.join("system/apex/com.android.tzdata"))
         .env("ANDROID_RUNTIME_ROOT", layout.root.join("system/apex/com.android.runtime"))
         .env("ANDROID_I18N_ROOT", layout.root.join("system/apex/com.android.i18n"))

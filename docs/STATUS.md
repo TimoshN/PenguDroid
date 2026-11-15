@@ -2,7 +2,18 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Where we left off — Play Billing reply framing fixed; Genshin launches clean, billing connect loop gone (2026-11-14, `1b7dd75`)
+## Current — 0.2.0 portable release and Genshin gameplay (2026-11-15)
+
+Genshin Impact 7.2.0 now has user-supplied in-world gameplay evidence on RTX 3080
+Founders Edition / Core i3-12100F with ARM64 Digitalis. The README includes that
+screenshot alongside BBR2 and NewPipe evidence. The AppImage includes the host
+userspace dependencies and automatically downloads/verifies/prepares the Android
+runtime on first GUI launch. Clean-environment release checks and the known
+BBR2 package-version limitation are documented in [RELEASE-0.2.0.md](RELEASE-0.2.0.md).
+
+The entries below are historical debugging notes, not the current handoff.
+
+## Previous — Play Billing reply framing fixed; Genshin launches clean, billing connect loop gone (2026-11-14, `1b7dd75`)
 
 Pick up here. The hosted `IInAppBillingService` replies were mis-framed and
 that had two visible effects in Genshin 7.2.0: `isBillingSupported` echoed the
