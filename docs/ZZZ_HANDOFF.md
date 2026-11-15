@@ -19,8 +19,10 @@ Vulkan surface creation now invokes gleshim's exported
 of pointer coordinates into the Android input queue without a GL window.
 
 Validation: 486 Rust workspace tests and 258 Python tool tests passed after the
-merge; the added Vulkan input integration test also passes. A real ZZZ 3.3.0
-run is under verification; reaching startup is not yet a gameplay claim.
+merge; the added Vulkan input integration test also passes. The Xbox One and Xbox 360 profiles also pass a live ART/InputManager
+CheckJNI test. ZZZ 3.3.0 reaches the login screen on the RTX 3080 after the
+DRM-modifier allocation fix below; login interaction remains under investigation.
+This is not a gameplay claim.
 The old local ARM bridge omitted Vulkan. For this run the bridge and ARM guest
 bundle come from the SHA-256-verified project v0.2.1 release AppImage, while
 host CLI/shims/daemon are built from the merged source. Rebuilding Vulkan
@@ -45,14 +47,39 @@ bridge artifacts from the older local dependency slice remains separate work.
 
 ## Open Issues to Solve Next
 
-### 1. Touch / Mouse Input Not Reaching Vulkan Games (High Priority)
-- **Root cause already identified**:
-  - `apphost.rs` (`spawn_input_pump`) polls `pengudroid_input_poll` (resolved via `dlsym(RTLD_DEFAULT, ...)` from `libpengudroid_gleshim.so`) and injects `MotionEvent` into `ViewRootImpl.dispatchInputEvent`.
-  - However, `subscribe_input(surface_id)` in `crates/pengudroid-gleshim/src/lib.rs` (line 1208) is only called when **gleshim** creates a window surface!
-  - In Vulkan apps like ZZZ, **vkshim** (`ensure_daemon_surface_id` in `crates/pengudroid-vkshim/src/lib.rs`) creates the daemon surface (`Message::CreateSurface`), while `gleshim` never creates a window surface — so `Message::SubscribeInput { surface_id }` is never sent and `INPUT_QUEUE` stays empty.
-- **Fix direction**:
-  - Export/call a shared input subscription hook (e.g. `pengudroid_subscribe_input(surface_id)` in `gleshim`, or move/mirror `SubscribeInput` into `vkshim` feeding `pengudroid_input_inject_*` / a shared input queue, and also set `PENGUDROID_LAST_SURFACE_ID` from `vkshim::ensure_daemon_surface_id` for resize-following).
-  - Verify `PENGUDROID_TRACE_INPUT=1` shows `PointerDown` / `PointerUp` / `PointerMotion` reaching `ViewRootImpl.dispatchInputEvent`.
+### 1. Login screen stops responding (RTX 3080 follow-up)
+
+The Vulkan input subscription defect is fixed and covered by the socket/input
+queue integration test. Live traces show pointer button DOWN/UP arriving at the
+Android input pump and dispatching to a root. The user sees the login screen but
+reports that clicking does not work. Vulkan presentation stopped after 375
+frames in this run; receiving input alone does not establish a responsive UI.
+Investigate the stopped render thread / login overlay before claiming success.
+
+### NVIDIA swapchain allocation — fixed
+
+ZZZ requests SRGB format 43 and image usage `0x93`. The previous unconditional
+`VK_IMAGE_TILING_LINEAR` allocation returned `VK_ERROR_FORMAT_NOT_SUPPORTED`
+(-11) on RTX 3080 / driver 595.99.02, and Unity immediately called `exit_group(0)`.
+The host reports no color-attachment support for linear RGBA/SRGB images.
+
+The shim now enables the supported DRM modifier extension, enumerates one-plane
+color-attachment modifiers, validates DMA-BUF export for the exact format/usage,
+and creates images with a single validated modifier. The exported plane uses the
+real modifier, row pitch and offset. Hosts without the extension retain the linear
+path. On this NVIDIA host modifier `216172782120099861` allocates successfully;
+ZZZ renders and the user confirms the login screen.
+
+Hardware regression (requires Vulkan DMA-BUF support):
+
+```sh
+cargo test -p pengudroid-vkshim gpu_srgb_swapchain_exports_color_attachments -- --ignored --nocapture
+```
+
+This allocates and exports all three SRGB color-attachment swapchain images on
+the real GPU, without requiring a compositor window. It passes on the RTX 3080.
+Both Berberis `two-gear` and `lite-translate-or-interpret` failed before the image
+fix; the translator mode was not the cause of that exit.
 
 ### 2. Slow Cold-Start Time
 - **Observation**: Berberis (`libberberis_arm64.so`) translates ~350k–550k ARM64 basic blocks on cold start (`libil2cpp.so` `dlopen` ~17 s, total ~100–480 s to continuous rendering).

@@ -29,7 +29,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use pengudroid_proto::{default_socket_path, Message, PROTO_VERSION, Role};
+use pengudroid_proto::{Message, PROTO_VERSION, Role, default_socket_path};
 use pengudroid_socket::Connection;
 
 // ---------------------------------------------------------------------------
@@ -368,10 +368,8 @@ struct VkSubmitInfo {
 // Host Vulkan Loader FFI
 // ---------------------------------------------------------------------------
 
-type PfnGetInstanceProcAddr =
-    unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction;
-type PfnGetDeviceProcAddr =
-    unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction;
+type PfnGetInstanceProcAddr = unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction;
+type PfnGetDeviceProcAddr = unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction;
 type PfnEnumerateInstanceExtensionProperties =
     unsafe extern "C" fn(*const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult;
 type PfnEnumerateDeviceExtensionProperties = unsafe extern "C" fn(
@@ -396,8 +394,12 @@ type PfnQueueWaitIdle = unsafe extern "C" fn(VkQueue) -> VkResult;
 type PfnDeviceWaitIdle = unsafe extern "C" fn(VkDevice) -> VkResult;
 type PfnGetPhysicalDeviceMemoryProperties =
     unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceMemoryProperties);
-type PfnCreateImage =
-    unsafe extern "C" fn(VkDevice, *const VkImageCreateInfo, *const c_void, *mut VkImage) -> VkResult;
+type PfnCreateImage = unsafe extern "C" fn(
+    VkDevice,
+    *const VkImageCreateInfo,
+    *const c_void,
+    *mut VkImage,
+) -> VkResult;
 type PfnDestroyImage = unsafe extern "C" fn(VkDevice, VkImage, *const c_void);
 type PfnGetImageMemoryRequirements =
     unsafe extern "C" fn(VkDevice, VkImage, *mut VkMemoryRequirements);
@@ -414,6 +416,169 @@ type PfnGetImageSubresourceLayout =
     unsafe extern "C" fn(VkDevice, VkImage, *const VkImageSubresource, *mut VkSubresourceLayout);
 type PfnGetMemoryFdKHR =
     unsafe extern "C" fn(VkDevice, *const VkMemoryGetFdInfoKHR, *mut c_int) -> VkResult;
+
+// DRM modifier images preserve the driver's native tiling. In particular,
+// NVIDIA does not support linear images as color attachments.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DrmModifierProperties {
+    modifier: u64,
+    planes: u32,
+    features: u32,
+}
+#[repr(C)]
+struct DrmModifierList {
+    s_type: i32,
+    next: *mut c_void,
+    count: u32,
+    properties: *mut DrmModifierProperties,
+}
+#[repr(C)]
+struct FormatProperties2 {
+    s_type: i32,
+    next: *mut c_void,
+    properties: [u32; 3],
+}
+#[repr(C)]
+struct DrmImageInfo {
+    s_type: i32,
+    next: *const c_void,
+    modifier: u64,
+    sharing: i32,
+    family_count: u32,
+    families: *const u32,
+}
+#[repr(C)]
+struct ExternalImageInfo {
+    s_type: i32,
+    next: *const c_void,
+    handle_type: u32,
+}
+#[repr(C)]
+struct ImageFormatInfo2 {
+    s_type: i32,
+    next: *const c_void,
+    format: i32,
+    image_type: i32,
+    tiling: i32,
+    usage: u32,
+    flags: u32,
+}
+#[repr(C)]
+struct ExternalImageProperties {
+    s_type: i32,
+    next: *mut c_void,
+    features: u32,
+    export_types: u32,
+    compatible_types: u32,
+}
+#[repr(C)]
+struct ImageFormatProperties {
+    extent: VkExtent3D,
+    mip_levels: u32,
+    layers: u32,
+    samples: u32,
+    max_resource_size: u64,
+}
+#[repr(C)]
+struct ImageFormatProperties2 {
+    s_type: i32,
+    next: *mut c_void,
+    properties: ImageFormatProperties,
+}
+#[repr(C)]
+struct DrmImageList {
+    s_type: i32,
+    next: *const c_void,
+    count: u32,
+    modifiers: *const u64,
+}
+
+unsafe fn exportable_drm_modifier(
+    instance: VkInstance,
+    physical: VkPhysicalDevice,
+    format: i32,
+    usage: u32,
+) -> Option<u64> {
+    type GetFormats = unsafe extern "C" fn(VkPhysicalDevice, i32, *mut FormatProperties2);
+    type GetImages = unsafe extern "C" fn(
+        VkPhysicalDevice,
+        *const ImageFormatInfo2,
+        *mut ImageFormatProperties2,
+    ) -> VkResult;
+    let formats: GetFormats = std::mem::transmute(
+        host_instance_fn(instance, b"vkGetPhysicalDeviceFormatProperties2\0")
+            .or_else(|| host_instance_fn(instance, b"vkGetPhysicalDeviceFormatProperties2KHR\0"))?,
+    );
+    let images: GetImages = std::mem::transmute(
+        host_instance_fn(instance, b"vkGetPhysicalDeviceImageFormatProperties2\0").or_else(
+            || host_instance_fn(instance, b"vkGetPhysicalDeviceImageFormatProperties2KHR\0"),
+        )?,
+    );
+    let mut list = DrmModifierList {
+        s_type: 1000158000,
+        next: std::ptr::null_mut(),
+        count: 0,
+        properties: std::ptr::null_mut(),
+    };
+    let mut properties = FormatProperties2 {
+        s_type: 1000059002,
+        next: (&mut list as *mut DrmModifierList).cast(),
+        properties: [0; 3],
+    };
+    formats(physical, format, &mut properties);
+    if list.count == 0 || list.count > 4096 {
+        return None;
+    }
+    let mut candidates = vec![DrmModifierProperties::default(); list.count as usize];
+    list.properties = candidates.as_mut_ptr();
+    formats(physical, format, &mut properties);
+    for candidate in candidates.iter().take(list.count as usize) {
+        // The daemon currently imports one DMA-BUF plane for RGBA images.
+        if candidate.planes != 1 || candidate.features & 0x80 == 0 {
+            continue;
+        }
+        let drm = DrmImageInfo {
+            s_type: 1000158002,
+            next: std::ptr::null(),
+            modifier: candidate.modifier,
+            sharing: 0,
+            family_count: 0,
+            families: std::ptr::null(),
+        };
+        let external = ExternalImageInfo {
+            s_type: 1000071000,
+            next: (&drm as *const DrmImageInfo).cast(),
+            handle_type: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        };
+        let info = ImageFormatInfo2 {
+            s_type: 1000059004,
+            next: (&external as *const ExternalImageInfo).cast(),
+            format,
+            image_type: VK_IMAGE_TYPE_2D,
+            tiling: 1000158000,
+            usage,
+            flags: 0,
+        };
+        let mut exported = ExternalImageProperties {
+            s_type: 1000071001,
+            next: std::ptr::null_mut(),
+            features: 0,
+            export_types: 0,
+            compatible_types: 0,
+        };
+        let mut out: ImageFormatProperties2 = std::mem::zeroed();
+        out.s_type = 1000059003;
+        out.next = (&mut exported as *mut ExternalImageProperties).cast();
+        if images(physical, &info, &mut out) == VK_SUCCESS
+            && exported.features & 2 != 0
+            && exported.compatible_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT != 0
+        {
+            return Some(candidate.modifier);
+        }
+    }
+    None
+}
 
 struct HostLoader {
     get_instance_proc_addr: PfnGetInstanceProcAddr,
@@ -435,7 +600,10 @@ fn trace_enabled() -> bool {
 fn host() -> Result<&'static HostLoader, String> {
     HOST.get_or_init(|| unsafe {
         let name = b"libvulkan.so.1\0";
-        let handle = libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_LOCAL);
+        let handle = libc::dlopen(
+            name.as_ptr() as *const c_char,
+            libc::RTLD_NOW | libc::RTLD_LOCAL,
+        );
         if handle.is_null() {
             return Err("dlopen(libvulkan.so.1) failed".into());
         }
@@ -497,6 +665,7 @@ unsafe impl Send for SurfaceRec {}
 struct DeviceRec {
     instance: VkInstance,
     physical_device: VkPhysicalDevice,
+    drm_modifiers: bool,
     queue: VkQueue,
 }
 unsafe impl Send for DeviceRec {}
@@ -536,7 +705,10 @@ struct VkState {
 static STATE: OnceLock<Mutex<VkState>> = OnceLock::new();
 
 fn lock_state() -> std::sync::MutexGuard<'static, VkState> {
-    STATE.get_or_init(|| Mutex::new(VkState::default())).lock().unwrap()
+    STATE
+        .get_or_init(|| Mutex::new(VkState::default()))
+        .lock()
+        .unwrap()
 }
 
 unsafe fn query_native_window_size(window: *mut c_void) -> (u32, u32) {
@@ -550,8 +722,12 @@ unsafe fn query_native_window_size(window: *mut c_void) -> (u32, u32) {
                 Some(std::mem::transmute::<*mut c_void, GetDim>(sym))
             }
         };
-        let w = resolve(b"ANativeWindow_getWidth\0").map(|f| f(window)).unwrap_or(0);
-        let h = resolve(b"ANativeWindow_getHeight\0").map(|f| f(window)).unwrap_or(0);
+        let w = resolve(b"ANativeWindow_getWidth\0")
+            .map(|f| f(window))
+            .unwrap_or(0);
+        let h = resolve(b"ANativeWindow_getHeight\0")
+            .map(|f| f(window))
+            .unwrap_or(0);
         if w > 0 && h > 0 {
             return (w as u32, h as u32);
         }
@@ -828,7 +1004,11 @@ pub unsafe extern "C" fn vkCreateInstance(
             }
         }
     }
-    if need_surface && !filtered_exts.iter().any(|s| s.as_bytes() == b"VK_KHR_surface") {
+    if need_surface
+        && !filtered_exts
+            .iter()
+            .any(|s| s.as_bytes() == b"VK_KHR_surface")
+    {
         filtered_exts.push(CString::new("VK_KHR_surface").unwrap());
     }
     let ext_ptrs: Vec<*const c_char> = filtered_exts.iter().map(|s| s.as_ptr()).collect();
@@ -851,7 +1031,10 @@ pub unsafe extern "C" fn vkCreateInstance(
         eprintln!(
             "[vkshim] vkCreateInstance res={res} instance={:p} exts={:?}",
             *pInstance,
-            filtered_exts.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>()
+            filtered_exts
+                .iter()
+                .map(|s| s.to_string_lossy())
+                .collect::<Vec<_>>()
         );
     }
     if res == VK_SUCCESS && !(*pInstance).is_null() {
@@ -885,7 +1068,12 @@ pub unsafe extern "C" fn vkEnumerateDeviceExtensionProperties(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let mut host_count = 0u32;
-    let res = f(physicalDevice, pLayerName, &mut host_count, std::ptr::null_mut());
+    let res = f(
+        physicalDevice,
+        pLayerName,
+        &mut host_count,
+        std::ptr::null_mut(),
+    );
     if res != VK_SUCCESS {
         return res;
     }
@@ -897,7 +1085,12 @@ pub unsafe extern "C" fn vkEnumerateDeviceExtensionProperties(
         host_count as usize
     ];
     if host_count > 0 {
-        let res = f(physicalDevice, pLayerName, &mut host_count, list.as_mut_ptr());
+        let res = f(
+            physicalDevice,
+            pLayerName,
+            &mut host_count,
+            list.as_mut_ptr(),
+        );
         if res < 0 {
             return res;
         }
@@ -946,7 +1139,12 @@ pub unsafe extern "C" fn vkCreateDevice(
     {
         let enum_dev = h.enum_device_exts;
         let mut cnt = 0u32;
-        if enum_dev(physicalDevice, std::ptr::null(), &mut cnt, std::ptr::null_mut()) == VK_SUCCESS
+        if enum_dev(
+            physicalDevice,
+            std::ptr::null(),
+            &mut cnt,
+            std::ptr::null_mut(),
+        ) == VK_SUCCESS
             && cnt > 0
         {
             let mut props = vec![
@@ -956,7 +1154,13 @@ pub unsafe extern "C" fn vkCreateDevice(
                 };
                 cnt as usize
             ];
-            if enum_dev(physicalDevice, std::ptr::null(), &mut cnt, props.as_mut_ptr()) >= 0 {
+            if enum_dev(
+                physicalDevice,
+                std::ptr::null(),
+                &mut cnt,
+                props.as_mut_ptr(),
+            ) >= 0
+            {
                 for p in props.iter().take(cnt as usize) {
                     supported.insert(ext_name(p).to_string());
                 }
@@ -991,6 +1195,8 @@ pub unsafe extern "C" fn vkCreateDevice(
         "VK_KHR_external_memory",
         "VK_KHR_external_memory_fd",
         "VK_EXT_external_memory_dma_buf",
+        "VK_EXT_image_drm_format_modifier",
+        "VK_KHR_image_format_list",
     ] {
         if supported.contains(extra) && !exts.iter().any(|s| s.to_str() == Ok(extra)) {
             exts.push(CString::new(extra).unwrap());
@@ -1032,6 +1238,7 @@ pub unsafe extern "C" fn vkCreateDevice(
             DeviceRec {
                 instance,
                 physical_device: physicalDevice,
+                drm_modifiers: supported.contains("VK_EXT_image_drm_format_modifier"),
                 queue,
             },
         );
@@ -1079,7 +1286,9 @@ pub unsafe extern "C" fn vkCreateAndroidSurfaceKHR(
     );
     *pSurface = handle;
     if trace_enabled() {
-        eprintln!("[vkshim] vkCreateAndroidSurfaceKHR window={window:p} -> 0x{handle:x} ({w}x{h}, sid={sid})");
+        eprintln!(
+            "[vkshim] vkCreateAndroidSurfaceKHR window={window:p} -> 0x{handle:x} ({w}x{h}, sid={sid})"
+        );
     }
     VK_SUCCESS
 }
@@ -1123,11 +1332,17 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     surface: VkSurfaceKHR,
     pSurfaceCapabilities: *mut VkSurfaceCapabilitiesKHR,
 ) -> VkResult {
+    if trace_enabled() {
+        eprintln!("[vkshim] surface capabilities query handle=0x{surface:x}");
+    }
     if pSurfaceCapabilities.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let rec = lock_state().surfaces.get(&surface).copied();
     let Some(mut rec) = rec else {
+        if trace_enabled() {
+            eprintln!("[vkshim] surface capabilities: unknown handle");
+        }
         return VK_ERROR_SURFACE_LOST_KHR;
     };
     let (w, h) = query_native_window_size(rec.window);
@@ -1152,10 +1367,10 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
             height: 16384,
         },
         maxImageArrayLayers: 1,
-        supportedTransforms: 0x1,      // IDENTITY
-        currentTransform: 0x1,         // IDENTITY
-        supportedCompositeAlpha: 0x9,  // OPAQUE | INHERIT
-        supportedUsageFlags: 0x1F,     // TRANSFER_SRC | TRANSFER_DST | SAMPLED | STORAGE | COLOR_ATTACHMENT
+        supportedTransforms: 0x1,     // IDENTITY
+        currentTransform: 0x1,        // IDENTITY
+        supportedCompositeAlpha: 0x9, // OPAQUE | INHERIT
+        supportedUsageFlags: 0x1F, // TRANSFER_SRC | TRANSFER_DST | SAMPLED | STORAGE | COLOR_ATTACHMENT
     };
     VK_SUCCESS
 }
@@ -1191,6 +1406,12 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceFormatsKHR(
     pSurfaceFormatCount: *mut u32,
     pSurfaceFormats: *mut VkSurfaceFormatKHR,
 ) -> VkResult {
+    if trace_enabled() && !pSurfaceFormatCount.is_null() {
+        eprintln!(
+            "[vkshim] surface formats: capacity={} output={pSurfaceFormats:p}",
+            *pSurfaceFormatCount
+        );
+    }
     if pSurfaceFormatCount.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -1325,10 +1546,16 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let info = &*pCreateInfo;
-    let (instance, physical_device) = {
+    if trace_enabled() {
+        eprintln!(
+            "[vkshim] create swapchain device={device:p} extent={}x{} format={} usage=0x{:x}",
+            info.imageExtent.width, info.imageExtent.height, info.imageFormat, info.imageUsage
+        );
+    }
+    let (instance, physical_device, drm_modifiers) = {
         let st = lock_state();
         match st.devices.get(&(device as usize)) {
-            Some(d) => (d.instance, d.physical_device),
+            Some(d) => (d.instance, d.physical_device, d.drm_modifiers),
             None => return VK_ERROR_DEVICE_LOST,
         }
     };
@@ -1343,7 +1570,10 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
     }
     let create_image = dev_fn!("vkCreateImage", PfnCreateImage);
     let destroy_image = dev_fn!("vkDestroyImage", PfnDestroyImage);
-    let get_img_reqs = dev_fn!("vkGetImageMemoryRequirements", PfnGetImageMemoryRequirements);
+    let get_img_reqs = dev_fn!(
+        "vkGetImageMemoryRequirements",
+        PfnGetImageMemoryRequirements
+    );
     let alloc_mem = dev_fn!("vkAllocateMemory", PfnAllocateMemory);
     let free_mem = dev_fn!("vkFreeMemory", PfnFreeMemory);
     let bind_img_mem = dev_fn!("vkBindImageMemory", PfnBindImageMemory);
@@ -1355,11 +1585,30 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
     let height = info.imageExtent.height.max(1);
     let fourcc = format_to_fourcc(info.imageFormat);
     let mut images: Vec<SwapchainImage> = Vec::with_capacity(count);
+    let modifier = if drm_modifiers {
+        exportable_drm_modifier(instance, physical_device, info.imageFormat, info.imageUsage)
+    } else {
+        None
+    };
+    if trace_enabled() {
+        eprintln!("[vkshim] swapchain DRM modifier: {modifier:?}");
+    }
 
     for _ in 0..count {
+        let selected_modifier = modifier.unwrap_or(0);
+        let drm_list = DrmImageList {
+            s_type: 1000158003,
+            next: std::ptr::null(),
+            count: 1,
+            modifiers: &selected_modifier,
+        };
         let ext_img = VkExternalMemoryImageCreateInfo {
             sType: VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-            pNext: std::ptr::null(),
+            pNext: if modifier.is_some() {
+                (&drm_list as *const DrmImageList).cast()
+            } else {
+                std::ptr::null()
+            },
             handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
         };
         let img_info = VkImageCreateInfo {
@@ -1376,7 +1625,11 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
             mipLevels: 1,
             arrayLayers: info.imageArrayLayers.max(1),
             samples: VK_SAMPLE_COUNT_1_BIT,
-            tiling: VK_IMAGE_TILING_LINEAR,
+            tiling: if modifier.is_some() {
+                1000158000
+            } else {
+                VK_IMAGE_TILING_LINEAR
+            },
             usage: info.imageUsage,
             sharingMode: VK_SHARING_MODE_EXCLUSIVE,
             queueFamilyIndexCount: 0,
@@ -1386,6 +1639,7 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
         let mut image: VkImage = 0;
         let r = create_image(device, &img_info, std::ptr::null(), &mut image);
         if r != VK_SUCCESS {
+            eprintln!("[vkshim] swapchain vkCreateImage failed: {r}");
             for prev in images {
                 destroy_image(device, prev.image, std::ptr::null());
                 free_mem(device, prev.memory, std::ptr::null());
@@ -1432,18 +1686,24 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
         let mut memory: VkDeviceMemory = 0;
         let r = alloc_mem(device, &alloc_info, std::ptr::null(), &mut memory);
         if r != VK_SUCCESS {
+            eprintln!("[vkshim] swapchain vkAllocateMemory failed: {r}");
             destroy_image(device, image, std::ptr::null());
             return r;
         }
         let r = bind_img_mem(device, image, memory, 0);
         if r != VK_SUCCESS {
+            eprintln!("[vkshim] swapchain vkBindImageMemory failed: {r}");
             destroy_image(device, image, std::ptr::null());
             free_mem(device, memory, std::ptr::null());
             return r;
         }
 
         let sub = VkImageSubresource {
-            aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+            aspectMask: if modifier.is_some() {
+                0x80
+            } else {
+                VK_IMAGE_ASPECT_COLOR_BIT
+            },
             mipLevel: 0,
             arrayLayer: 0,
         };
@@ -1459,6 +1719,7 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
         let mut raw_fd: c_int = -1;
         let r = get_mem_fd(device, &fd_info, &mut raw_fd);
         if r != VK_SUCCESS || raw_fd < 0 {
+            eprintln!("[vkshim] swapchain vkGetMemoryFdKHR failed: {r}, fd={raw_fd}");
             destroy_image(device, image, std::ptr::null());
             free_mem(device, memory, std::ptr::null());
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -1471,7 +1732,7 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
             stride: layout.rowPitch as u32,
             offset: layout.offset as u32,
             fourcc,
-            modifier: DRM_FORMAT_MOD_LINEAR,
+            modifier: modifier.unwrap_or(DRM_FORMAT_MOD_LINEAR),
         });
     }
 
@@ -1491,7 +1752,9 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
     );
     *pSwapchain = handle;
     if trace_enabled() {
-        eprintln!("[vkshim] vkCreateSwapchainKHR -> 0x{handle:x} ({width}x{height}, {count} images)");
+        eprintln!(
+            "[vkshim] vkCreateSwapchainKHR -> 0x{handle:x} ({width}x{height}, {count} images)"
+        );
     }
     VK_SUCCESS
 }
@@ -1637,20 +1900,19 @@ pub unsafe extern "C" fn vkQueuePresentKHR(
     // Ensure GPU rendering into the presented image(s) has completed.
     if let Some(device) = {
         let st = lock_state();
-        info.swapchainCount
-            .checked_sub(1)
-            .and_then(|_| {
-                if !info.pSwapchains.is_null() {
-                    st.swapchains.get(&*info.pSwapchains).map(|s| s.device)
-                } else {
-                    None
-                }
-            })
+        info.swapchainCount.checked_sub(1).and_then(|_| {
+            if !info.pSwapchains.is_null() {
+                st.swapchains.get(&*info.pSwapchains).map(|s| s.device)
+            } else {
+                None
+            }
+        })
     } {
         if info.waitSemaphoreCount > 0 && !info.pWaitSemaphores.is_null() {
             if let Some(qs) = host_device_fn(device, b"vkQueueSubmit\0") {
                 let queue_submit: PfnQueueSubmit = std::mem::transmute(qs);
-                let stages = vec![VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT; info.waitSemaphoreCount as usize];
+                let stages =
+                    vec![VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT; info.waitSemaphoreCount as usize];
                 let submit = VkSubmitInfo {
                     sType: VK_STRUCTURE_TYPE_SUBMIT_INFO,
                     pNext: std::ptr::null(),
@@ -1783,7 +2045,12 @@ pub unsafe extern "C" fn vkGetInstanceProcAddr(
         _ => std::ptr::null(),
     };
     if !intercepted.is_null() {
-        if trace_enabled() && (name == "vkCreateInstance" || name == "vkCreateAndroidSurfaceKHR" || name == "vkCreateSwapchainKHR" || name == "vkEnumerateInstanceExtensionProperties") {
+        if trace_enabled()
+            && (name == "vkCreateInstance"
+                || name == "vkCreateAndroidSurfaceKHR"
+                || name == "vkCreateSwapchainKHR"
+                || name == "vkEnumerateInstanceExtensionProperties")
+        {
             eprintln!("[vkshim] vkGetInstanceProcAddr({instance:p}, {name}) -> intercepted");
         }
         return Some(std::mem::transmute::<*const c_void, unsafe extern "C" fn()>(intercepted));
@@ -1825,4 +2092,103 @@ pub unsafe extern "C" fn vkGetDeviceProcAddr(
         return None;
     };
     (h.get_device_proc_addr)(device, pName)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Requires a real Vulkan GPU with DMA-BUF export. This exercises the same
+    /// SRGB color-attachment allocation that returned -11 on the RTX 3080.
+    #[test]
+    #[ignore = "requires a Vulkan GPU with external DMA-BUF support"]
+    fn gpu_srgb_swapchain_exports_color_attachments() {
+        unsafe {
+            let extension = c"VK_KHR_get_physical_device_properties2".as_ptr();
+            let mut info: VkInstanceCreateInfo = std::mem::zeroed();
+            info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+            info.enabledExtensionCount = 1;
+            info.ppEnabledExtensionNames = &extension;
+            let mut instance = std::ptr::null_mut();
+            assert_eq!(
+                vkCreateInstance(&info, std::ptr::null(), &mut instance),
+                VK_SUCCESS
+            );
+            type Enumerate =
+                unsafe extern "C" fn(VkInstance, *mut u32, *mut VkPhysicalDevice) -> VkResult;
+            let enumerate: Enumerate = std::mem::transmute(
+                host_instance_fn(instance, b"vkEnumeratePhysicalDevices\0").unwrap(),
+            );
+            let mut count = 0;
+            assert_eq!(
+                enumerate(instance, &mut count, std::ptr::null_mut()),
+                VK_SUCCESS
+            );
+            assert!(count > 0);
+            let mut physical = vec![std::ptr::null_mut(); count as usize];
+            assert_eq!(
+                enumerate(instance, &mut count, physical.as_mut_ptr()),
+                VK_SUCCESS
+            );
+            type GetQueues = unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut [u32; 6]);
+            let get_queues: GetQueues = std::mem::transmute(
+                host_instance_fn(instance, b"vkGetPhysicalDeviceQueueFamilyProperties\0").unwrap(),
+            );
+            count = 0;
+            get_queues(physical[0], &mut count, std::ptr::null_mut());
+            let mut queues = vec![[0; 6]; count as usize];
+            get_queues(physical[0], &mut count, queues.as_mut_ptr());
+            let family = queues
+                .iter()
+                .position(|q| q[0] & 1 != 0 && q[1] > 0)
+                .unwrap() as u32;
+            let priority = 1.0;
+            let queue = VkDeviceQueueCreateInfo {
+                sType: 2,
+                pNext: std::ptr::null(),
+                flags: 0,
+                queueFamilyIndex: family,
+                queueCount: 1,
+                pQueuePriorities: &priority,
+            };
+            let mut info: VkDeviceCreateInfo = std::mem::zeroed();
+            info.sType = 3;
+            info.queueCreateInfoCount = 1;
+            info.pQueueCreateInfos = &queue;
+            let mut device = std::ptr::null_mut();
+            assert_eq!(
+                vkCreateDevice(physical[0], &info, std::ptr::null(), &mut device),
+                VK_SUCCESS
+            );
+            let mut info: VkSwapchainCreateInfoKHR = std::mem::zeroed();
+            info.sType = 1000001000;
+            info.minImageCount = 3;
+            info.imageFormat = 43; // VK_FORMAT_R8G8B8A8_SRGB
+            info.imageExtent = VkExtent2D {
+                width: 64,
+                height: 64,
+            };
+            info.imageArrayLayers = 1;
+            info.imageUsage = 0x93; // ZZZ's transfer/src/dst + color + input usage
+            let mut swapchain = 0;
+            let result = vkCreateSwapchainKHR(device, &info, std::ptr::null(), &mut swapchain);
+            if result == VK_SUCCESS {
+                let state = lock_state();
+                let images = &state.swapchains.get(&swapchain).unwrap().images;
+                assert_eq!(images.len(), 3);
+                for image in images {
+                    assert!(image.dmabuf_fd.as_raw_fd() >= 0);
+                    assert!(image.stride >= 64 * 4);
+                }
+                drop(state);
+                vkDestroySwapchainKHR(device, swapchain, std::ptr::null());
+            }
+            vkDestroyDevice(device, std::ptr::null());
+            vkDestroyInstance(instance, std::ptr::null());
+            assert_eq!(
+                result, VK_SUCCESS,
+                "SRGB renderable DMA-BUF allocation failed"
+            );
+        }
+    }
 }
