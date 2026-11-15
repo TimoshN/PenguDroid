@@ -1394,6 +1394,16 @@ fn resolve_app_library_path(name: String) -> String {
     for dir in std::env::split_paths(&dirs) {
         let candidate = dir.join(&name);
         if candidate.is_file() {
+            // This resolver feeds host dlopen. ARM APK libraries are loaded by
+            // the native bridge, never by glibc (even for public names like z).
+            if let Ok(mut file) = std::fs::File::open(&candidate) {
+                use std::io::Read;
+                let mut header = [0u8; 20];
+                if file.read_exact(&mut header).is_ok() && &header[..4] == b"\x7fELF"
+                    && header[5] == 1 && u16::from_le_bytes([header[18], header[19]]) != 62 {
+                    continue;
+                }
+            }
             return candidate.to_string_lossy().into_owned();
         }
     }
@@ -4970,8 +4980,10 @@ unsafe fn alloc_itf(owner: *mut Obj, vtable: *const c_void) -> *mut c_void {
     p
 }
 
-fn iid_matches(iid: *const c_void, value: usize) -> bool {
-    !iid.is_null() && iid as usize == value
+fn iid_matches(iid: *const c_void, value: SlInterfaceId) -> bool {
+    !iid.is_null() && (iid == value.0.cast() || unsafe {
+        std::slice::from_raw_parts(iid.cast::<u8>(), 16) == std::slice::from_raw_parts(value.0, 16)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5543,84 +5555,134 @@ static BQ_VTABLE: SLAndroidSimpleBufferQueueItf_ = SLAndroidSimpleBufferQueueItf
     RegisterCallback: Some(bq_register_callback),
 };
 
-/// Export a batch of OpenSL ES interface-ID data symbols. Apps compare these
-/// opaque values and pass them back to us; they are never dereferenced, so
-/// unique non-null integers are sufficient.
-macro_rules! sl_iids {
-    ($($name:ident = $value:expr),* $(,)?) => {
-        $(
-            #[no_mangle]
-            pub static $name: usize = $value;
-        )*
-    };
-}
+/// OpenSL ES interface IDs point to readable UUIDs, not integer sentinels.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct SlInterfaceId(pub *const u8);
+unsafe impl Sync for SlInterfaceId {}
+#[no_mangle]
+pub static SL_IID_ENGINE: SlInterfaceId = SlInterfaceId((&[96, 194, 151, 141, 212, 221, 219, 17, 143, 149, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_BUFFERQUEUE: SlInterfaceId = SlInterfaceId((&[192, 156, 201, 43, 212, 221, 219, 17, 153, 141, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_VOLUME: SlInterfaceId = SlInterfaceId((&[224, 237, 232, 9, 222, 221, 219, 17, 246, 180, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_PLAY: SlInterfaceId = SlInterfaceId((&[192, 217, 11, 239, 215, 221, 219, 17, 73, 191, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_RECORD: SlInterfaceId = SlInterfaceId((&[160, 122, 101, 197, 219, 221, 219, 17, 247, 130, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_SEEK: SlInterfaceId = SlInterfaceId((&[160, 53, 49, 212, 220, 221, 219, 17, 88, 180, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_MUTESOLO: SlInterfaceId = SlInterfaceId((&[224, 235, 40, 90, 215, 221, 219, 17, 32, 130, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_PRELOADSTATUS: SlInterfaceId = SlInterfaceId((&[8, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDSIMPLEBUFFERQUEUE: SlInterfaceId = SlInterfaceId((&[9, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDCONFIGURATION: SlInterfaceId = SlInterfaceId((&[224, 167, 246, 137, 172, 190, 223, 17, 92, 139, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDEFFECT: SlInterfaceId = SlInterfaceId((&[96, 218, 18, 174, 172, 153, 223, 17, 86, 180, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDEFFECTSEND: SlInterfaceId = SlInterfaceId((&[192, 98, 228, 123, 67, 188, 223, 17, 112, 134, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDEFFECTCAPABILITIES: SlInterfaceId = SlInterfaceId((&[96, 109, 79, 106, 230, 181, 223, 17, 59, 187, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_EQUALIZER: SlInterfaceId = SlInterfaceId((&[0, 67, 237, 11, 214, 221, 219, 17, 52, 143, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ENVIRONMENTALREVERB: SlInterfaceId = SlInterfaceId((&[240, 213, 229, 194, 189, 148, 99, 71, 172, 156, 78, 35, 77, 6, 131, 158]).as_ptr());
+#[no_mangle]
+pub static SL_IID_PRESETREVERB: SlInterfaceId = SlInterfaceId((&[96, 45, 56, 71, 216, 221, 219, 17, 58, 191, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_VIRTUALIZER: SlInterfaceId = SlInterfaceId((&[0, 44, 204, 55, 221, 221, 219, 17, 119, 133, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_BASSBOOST: SlInterfaceId = SlInterfaceId((&[32, 242, 52, 6, 212, 221, 219, 17, 252, 160, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_OUTPUTMIX: SlInterfaceId = SlInterfaceId((&[96, 15, 117, 151, 215, 221, 219, 17, 177, 146, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_AUDIODECODERCAPABILITIES: SlInterfaceId = SlInterfaceId((&[160, 163, 229, 63, 198, 252, 219, 17, 172, 148, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_AUDIOENCODERCAPABILITIES: SlInterfaceId = SlInterfaceId((&[64, 163, 82, 15, 209, 252, 219, 17, 147, 169, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_AUDIOENCODER: SlInterfaceId = SlInterfaceId((&[122, 175, 213, 215, 28, 53, 166, 65, 236, 148, 26, 201, 92, 113, 130, 44]).as_ptr());
+#[no_mangle]
+pub static SL_IID_AUDIOIODEVICECAPABILITIES: SlInterfaceId = SlInterfaceId((&[192, 77, 86, 178, 211, 221, 219, 17, 98, 189, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_DEVICEVOLUME: SlInterfaceId = SlInterfaceId((&[96, 71, 99, 225, 226, 243, 219, 17, 169, 156, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_DYNAMICINTERFACEMANAGEMENT: SlInterfaceId = SlInterfaceId((&[64, 101, 147, 99, 117, 247, 219, 17, 196, 156, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_EFFECTSEND: SlInterfaceId = SlInterfaceId((&[0, 210, 231, 86, 212, 221, 219, 17, 251, 174, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_LED: SlInterfaceId = SlInterfaceId((&[128, 205, 193, 44, 214, 221, 219, 17, 126, 128, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_METADATAEXTRACTION: SlInterfaceId = SlInterfaceId((&[128, 31, 91, 170, 214, 221, 219, 17, 142, 172, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_METADATATRAVERSAL: SlInterfaceId = SlInterfaceId((&[192, 98, 54, 196, 214, 221, 219, 17, 171, 167, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_NULL: SlInterfaceId = SlInterfaceId((&[236, 120, 113, 236, 225, 229, 50, 68, 244, 163, 70, 87, 230, 121, 82, 16]).as_ptr());
+#[no_mangle]
+pub static SL_IID_OBJECT: SlInterfaceId = SlInterfaceId((&[96, 99, 33, 121, 215, 221, 219, 17, 22, 172, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_PLAYBACKRATE: SlInterfaceId = SlInterfaceId((&[64, 42, 59, 46, 218, 221, 219, 17, 73, 163, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_RATEPITCH: SlInterfaceId = SlInterfaceId((&[96, 46, 182, 97, 218, 221, 219, 17, 184, 158, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_STREAMINFORMATION: SlInterfaceId = SlInterfaceId((&[224, 143, 98, 58, 56, 18, 222, 17, 159, 173, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_VIBRA: SlInterfaceId = SlInterfaceId((&[96, 141, 154, 22, 221, 221, 219, 17, 61, 146, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_VISUALIZATION: SlInterfaceId = SlInterfaceId((&[160, 38, 107, 228, 221, 221, 219, 17, 253, 138, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_XAUDIO2EFFECTSEND: SlInterfaceId = SlInterfaceId((&[37, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+#[no_mangle]
+pub static SL_IID_AUDIOPLAYER: SlInterfaceId = SlInterfaceId((&[38, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+#[no_mangle]
+pub static SL_IID_AUDIORECORDER: SlInterfaceId = SlInterfaceId((&[39, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DDOPPLER: SlInterfaceId = SlInterfaceId((&[128, 154, 92, 180, 210, 221, 219, 17, 40, 176, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DGROUPING: SlInterfaceId = SlInterfaceId((&[224, 68, 232, 235, 210, 221, 219, 17, 16, 181, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DHEADPHONEREFLECTIONS: SlInterfaceId = SlInterfaceId((&[42, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DLOCATION: SlInterfaceId = SlInterfaceId((&[32, 128, 135, 43, 211, 221, 219, 17, 1, 138, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DMACROSCOPIC: SlInterfaceId = SlInterfaceId((&[192, 174, 137, 80, 211, 221, 219, 17, 211, 154, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DSOURCE: SlInterfaceId = SlInterfaceId((&[0, 123, 188, 112, 211, 221, 219, 17, 115, 168, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DDISTANCEDAMPING: SlInterfaceId = SlInterfaceId((&[46, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DDISTANCEATTENUATION: SlInterfaceId = SlInterfaceId((&[47, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+#[no_mangle]
+pub static SL_IID_3DCOMMIT: SlInterfaceId = SlInterfaceId((&[128, 173, 100, 53, 15, 221, 219, 17, 25, 158, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_DYNAMICSOURCE: SlInterfaceId = SlInterfaceId((&[0, 193, 92, 197, 139, 3, 220, 17, 69, 187, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ENGINECAPABILITIES: SlInterfaceId = SlInterfaceId((&[160, 208, 32, 131, 213, 221, 219, 17, 177, 161, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_MIDIMESSAGE: SlInterfaceId = SlInterfaceId((&[32, 168, 244, 221, 214, 221, 219, 17, 116, 177, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_MIDIMUTESOLO: SlInterfaceId = SlInterfaceId((&[128, 175, 158, 3, 215, 221, 219, 17, 2, 154, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_MIDITEMPO: SlInterfaceId = SlInterfaceId((&[0, 116, 52, 31, 215, 221, 219, 17, 206, 167, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_MIDITIME: SlInterfaceId = SlInterfaceId((&[224, 29, 165, 61, 215, 221, 219, 17, 112, 175, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_PITCH: SlInterfaceId = SlInterfaceId((&[0, 238, 232, 199, 215, 221, 219, 17, 44, 164, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_PREFETCHSTATUS: SlInterfaceId = SlInterfaceId((&[128, 238, 65, 42, 216, 221, 219, 17, 31, 164, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_THREADSYNC: SlInterfaceId = SlInterfaceId((&[64, 107, 172, 246, 220, 221, 219, 17, 46, 166, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDBUFFERQUEUESOURCE: SlInterfaceId = SlInterfaceId((&[96, 164, 193, 127, 193, 238, 223, 17, 6, 163, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDACOUSTICECHOCANCELLATION: SlInterfaceId = SlInterfaceId((&[96, 20, 73, 123, 77, 141, 224, 17, 97, 189, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDAUTOMATICGAINCONTROL: SlInterfaceId = SlInterfaceId((&[224, 191, 138, 10, 76, 101, 224, 17, 38, 186, 0, 2, 165, 213, 197, 27]).as_ptr());
+#[no_mangle]
+pub static SL_IID_ANDROIDNOISESUPPRESSION: SlInterfaceId = SlInterfaceId((&[96, 178, 180, 88, 6, 142, 224, 17, 142, 170, 0, 2, 165, 213, 197, 27]).as_ptr());
 
-sl_iids! {
-    SL_IID_ENGINE = 0x5044_0001,
-    SL_IID_BUFFERQUEUE = 0x5044_0002,
-    SL_IID_VOLUME = 0x5044_0003,
-    SL_IID_PLAY = 0x5044_0004,
-    SL_IID_RECORD = 0x5044_0005,
-    SL_IID_SEEK = 0x5044_0006,
-    SL_IID_MUTESOLO = 0x5044_0007,
-    SL_IID_PRELOADSTATUS = 0x5044_0008,
-    SL_IID_ANDROIDSIMPLEBUFFERQUEUE = 0x5044_0009,
-    SL_IID_ANDROIDCONFIGURATION = 0x5044_000a,
-    SL_IID_ANDROIDEFFECT = 0x5044_000b,
-    SL_IID_ANDROIDEFFECTSEND = 0x5044_000c,
-    SL_IID_ANDROIDEFFECTCAPABILITIES = 0x5044_000d,
-    SL_IID_EQUALIZER = 0x5044_000e,
-    SL_IID_ENVIRONMENTALREVERB = 0x5044_000f,
-    SL_IID_PRESETREVERB = 0x5044_0010,
-    SL_IID_VIRTUALIZER = 0x5044_0011,
-    SL_IID_BASSBOOST = 0x5044_0012,
-    SL_IID_OUTPUTMIX = 0x5044_0013,
-    SL_IID_AUDIODECODERCAPABILITIES = 0x5044_0014,
-    SL_IID_AUDIOENCODERCAPABILITIES = 0x5044_0015,
-    SL_IID_AUDIOENCODER = 0x5044_0016,
-    SL_IID_AUDIOIODEVICECAPABILITIES = 0x5044_0017,
-    SL_IID_DEVICEVOLUME = 0x5044_0018,
-    SL_IID_DYNAMICINTERFACEMANAGEMENT = 0x5044_0019,
-    SL_IID_EFFECTSEND = 0x5044_001a,
-    SL_IID_LED = 0x5044_001b,
-    SL_IID_METADATAEXTRACTION = 0x5044_001c,
-    SL_IID_METADATATRAVERSAL = 0x5044_001d,
-    SL_IID_NULL = 0x5044_001e,
-    SL_IID_OBJECT = 0x5044_001f,
-    SL_IID_PLAYBACKRATE = 0x5044_0020,
-    SL_IID_RATEPITCH = 0x5044_0021,
-    SL_IID_STREAMINFORMATION = 0x5044_0022,
-    SL_IID_VIBRA = 0x5044_0023,
-    SL_IID_VISUALIZATION = 0x5044_0024,
-    SL_IID_XAUDIO2EFFECTSEND = 0x5044_0025,
-    SL_IID_AUDIOPLAYER = 0x5044_0026,
-    SL_IID_AUDIORECORDER = 0x5044_0027,
-    SL_IID_3DDOPPLER = 0x5044_0028,
-    SL_IID_3DGROUPING = 0x5044_0029,
-    SL_IID_3DHEADPHONEREFLECTIONS = 0x5044_002a,
-    SL_IID_3DLOCATION = 0x5044_002b,
-    SL_IID_3DMACROSCOPIC = 0x5044_002c,
-    SL_IID_3DSOURCE = 0x5044_002d,
-    SL_IID_3DDISTANCEDAMPING = 0x5044_002e,
-    SL_IID_3DDISTANCEATTENUATION = 0x5044_002f,
-    // The rest of the OpenSL ES 1.0.1 and Android set: the native-bridge proxy
-    // for libOpenSLES binds every interface id the platform library exports,
-    // and refuses to load (aborting the guest) if one is missing.
-    SL_IID_3DCOMMIT = 0x5044_0030,
-    SL_IID_DYNAMICSOURCE = 0x5044_0031,
-    SL_IID_ENGINECAPABILITIES = 0x5044_0032,
-    SL_IID_MIDIMESSAGE = 0x5044_0033,
-    SL_IID_MIDIMUTESOLO = 0x5044_0034,
-    SL_IID_MIDITEMPO = 0x5044_0035,
-    SL_IID_MIDITIME = 0x5044_0036,
-    SL_IID_PITCH = 0x5044_0037,
-    SL_IID_PREFETCHSTATUS = 0x5044_0038,
-    SL_IID_THREADSYNC = 0x5044_0039,
-    SL_IID_ANDROIDBUFFERQUEUESOURCE = 0x5044_003a,
-    SL_IID_ANDROIDACOUSTICECHOCANCELLATION = 0x5044_003b,
-    SL_IID_ANDROIDAUTOMATICGAINCONTROL = 0x5044_003c,
-    SL_IID_ANDROIDNOISESUPPRESSION = 0x5044_003d,
-}
 
 /// `SLresult slCreateEngine(SLObjectItf*, ...)` — create a usable engine.
 #[no_mangle]
@@ -5688,6 +5750,15 @@ pub static __pengudroid_ver_ld: u8 = 0;
 mod tests {
     use super::*;
     use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn opensles_ids_are_readable_and_match_copied_uuids() {
+        let uuid = unsafe { std::slice::from_raw_parts(SL_IID_ENGINE.0, 16) };
+        assert_eq!(&uuid[..4], &[0x60, 0xc2, 0x97, 0x8d]);
+        let copied = uuid.to_vec();
+        assert!(iid_matches(copied.as_ptr().cast(), SL_IID_ENGINE));
+        assert!(!iid_matches(copied.as_ptr().cast(), SL_IID_PLAY));
+    }
 
     #[test]
     fn memset_explicit_returns_destination_and_fills_only_requested_bytes() {
@@ -6396,7 +6467,7 @@ mod tests {
             assert_eq!(
                 (object_vt.GetInterface.unwrap())(
                     engine,
-                    SL_IID_ENGINE as *const c_void,
+                    SL_IID_ENGINE.0 as *const c_void,
                     &mut engine_itf,
                 ),
                 SL_RESULT_SUCCESS
@@ -6462,7 +6533,7 @@ mod tests {
             assert_eq!(
                 (player_vt.GetInterface.unwrap())(
                     player,
-                    SL_IID_PLAY as *const c_void,
+                    SL_IID_PLAY.0 as *const c_void,
                     &mut play_itf,
                 ),
                 SL_RESULT_SUCCESS
@@ -6483,7 +6554,7 @@ mod tests {
             assert_eq!(
                 (player_vt.GetInterface.unwrap())(
                     player,
-                    SL_IID_ANDROIDSIMPLEBUFFERQUEUE as *const c_void,
+                    SL_IID_ANDROIDSIMPLEBUFFERQUEUE.0 as *const c_void,
                     &mut bq_itf,
                 ),
                 SL_RESULT_SUCCESS
@@ -6500,7 +6571,7 @@ mod tests {
             assert_eq!(
                 (player_vt.GetInterface.unwrap())(
                     player,
-                    SL_IID_RECORD as *const c_void,
+                    SL_IID_RECORD.0 as *const c_void,
                     &mut unsupported,
                 ),
                 SL_RESULT_FEATURE_UNSUPPORTED

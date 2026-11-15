@@ -86,6 +86,7 @@ def package(appdir, repo):
     notices.mkdir(parents=True, exist_ok=True)
     shutil.copy2(repo / "LICENSE", notices / "PenguDroid-Apache-2.0.txt")
     shutil.copy2(repo / "tools/licenses/uruntime-MIT.txt", notices / "uruntime-MIT.txt")
+    shutil.copy2(repo / "tools/licenses/OpenSLES-IID.txt", notices / "OpenSLES-IID.txt")
     # Retain installed distribution copyright/license notices with the closure.
     for path in Path("/usr/share/doc").glob("*/copyright"):
         if path.is_file():
