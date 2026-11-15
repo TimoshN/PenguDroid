@@ -68,11 +68,7 @@ The release carries its own userspace libraries, loader, Python, image-extractio
 
 **System requirements still apply:** an x86_64 Linux machine, a compatible Linux kernel, a Wayland desktop and working host graphics drivers. The AppImage cannot supply a kernel, compositor or a GPU's kernel driver. Other architectures and every Linux distribution have not been verified.
 
-If FUSE is unavailable, run without installing it:
-
-```sh
-./PenguDroid-x86_64.AppImage --appimage-extract-and-run
-```
+The release uses a pinned [static uruntime launcher](https://github.com/VHSgunzo/uruntime) configured to extract and run by default. **FUSE and `fusermount` are not required**, including for normal double-click startup. The first launch also caches the bundled userspace runtime; later starts reuse it.
 
 ### Your app library
 
@@ -93,7 +89,7 @@ Android apps keep their data under the per-user PenguDroid data directory. The r
 ./PenguDroid-x86_64.AppImage --cli stop
 ```
 
-Use `--appimage-extract-and-run` before `--cli` if you need the FUSE-free path. `PENGUDROID_SYSROOT` and `PENGUDROID_ARM64_GUEST_ROOT` remain available for explicit developer overrides.
+`PENGUDROID_SYSROOT` and `PENGUDROID_ARM64_GUEST_ROOT` remain available for explicit developer overrides.
 
 ## What runs underneath
 

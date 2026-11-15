@@ -7,6 +7,7 @@ NVIDIA GeForce RTX 3080 Founders Edition (driver 595.99.02), Wayland.
 
 - Genshin Impact 7.2.0 gameplay screenshot supplied from the working local build;
   README rebuilt around application evidence and practical setup instructions.
+- Pinned static uruntime 0.8.3 starts in extraction mode by default, without FUSE or fusermount.
 - Portable AppImage includes a private ELF loader/libc and dependency closure,
   Python, image extraction tools, PipeWire helpers, native bridge and ARM64 guest
   bundle. Android GSI is downloaded separately from Google's official server.
@@ -24,7 +25,7 @@ NVIDIA GeForce RTX 3080 Founders Edition (driver 595.99.02), Wayland.
 | Release workspace build | Passed |
 | Official GSI download into an empty cache | Downloaded, SHA-256 verified, extracted and prepared |
 | Actual compressed AppImage, FUSE-free mode, unrelated working directory | Passed |
-| AppImage CLI with `PATH=/nonexistent`, no developer environment | Passed |
+| Normal AppImage CLI startup with `PATH=/nonexistent`, no FUSE helper or developer environment | Passed |
 | Runtime discovery without an explicit sysroot | Passed |
 | GUI with an empty runtime cache and a previously verified download archive | Automatically prepared runtime; GUI remained alive (36 s) |
 | NewPipe 0.29.1, fresh app data | ART/WebView/network activity; alive for 40 s, then stopped by harness |

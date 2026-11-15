@@ -234,7 +234,12 @@ run_tool() {
 rm -f "$OUT"
 # zstd keeps a runtime-carrying image well under GitHub's 2 GiB asset limit
 # and decompresses fast at launch; PENGUDROID_APPIMAGE_COMP=xz is smaller.
-ARCH=x86_64 run_tool --comp "${PENGUDROID_APPIMAGE_COMP:-zstd}" "$APPDIR" "$OUT"
+if [ "$PORTABLE" -eq 1 ]; then
+    runtime=$(python3 -B "$ROOT/tools/prepare-appimage-runtime.py")
+    ARCH=x86_64 run_tool --runtime-file "$runtime" --comp "${PENGUDROID_APPIMAGE_COMP:-zstd}" "$APPDIR" "$OUT"
+else
+    ARCH=x86_64 run_tool --comp "${PENGUDROID_APPIMAGE_COMP:-zstd}" "$APPDIR" "$OUT"
+fi
 
 if [ ! -s "$OUT" ]; then
     echo "error: appimagetool did not produce $OUT" >&2
