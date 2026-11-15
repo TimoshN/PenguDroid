@@ -2482,6 +2482,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         version_code: info.version_code.unwrap_or(1),
         application_meta: &info.application_meta,
         services: &info.services,
+        uses_libraries: &info.uses_libraries,
     };
     crate::apphost::bind_application(env, thread, &spec)
 }

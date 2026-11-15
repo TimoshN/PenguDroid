@@ -71,6 +71,8 @@ pub struct ApkInfo {
     pub providers: Vec<Component>,
     pub permissions: Vec<String>,
     pub uses_features: Vec<String>,
+    /// `<application><uses-library android:name>` entries (required or not).
+    pub uses_libraries: Vec<String>,
     /// The MAIN/LAUNCHER activity, if one is declared.
     pub main_activity: Option<String>,
 }
@@ -773,6 +775,13 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                         if let Some(n) = attr_str(&pool, &attrs, "name") {
                             if !info.permissions.contains(&n) {
                                 info.permissions.push(n);
+                            }
+                        }
+                    }
+                    "uses-library" => {
+                        if let Some(n) = attr_str(&pool, &attrs, "name") {
+                            if !info.uses_libraries.contains(&n) {
+                                info.uses_libraries.push(n);
                             }
                         }
                     }

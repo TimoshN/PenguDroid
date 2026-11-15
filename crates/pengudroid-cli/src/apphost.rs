@@ -153,6 +153,8 @@ pub struct AppSpec<'a> {
     pub version_code: u32,
     /// `<application>`'s `<meta-data>`, references already resolved.
     pub application_meta: &'a [(String, crate::apk::MetaValue)],
+    /// `<uses-library>` names from the manifest (`org.apache.http.legacy`, ...).
+    pub uses_libraries: &'a [String],
 }
 
 fn new_instance(env: &JniEnv, class_name: &str) -> Option<(JClass, JObject)> {
@@ -211,6 +213,62 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
             if let Some(arr) = env.string_array(&joined) {
                 env.set_object_field(info, id, arr);
             }
+        }
+    }
+    // `<uses-library>` jars the platform ships (`org.apache.http.legacy`,
+    // `android.test.base`, ...). On a device the package manager lists them in
+    // `sharedLibraryFiles` and `LoadedApk.makePaths` puts them in front of the
+    // APK on the class path; without it YouTube dies resolving
+    // `org.apache.http.protocol.HttpRequestHandler`.
+    let shared: Vec<String> = std::env::var_os("ANDROID_ROOT")
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .flat_map(|root| {
+            spec.uses_libraries
+                .iter()
+                .map(move |lib| root.join("framework").join(format!("{lib}.jar")))
+        })
+        .filter(|jar| jar.is_file())
+        .map(|jar| jar.display().to_string())
+        .collect();
+    // API 37 `makePaths` only takes `.apk` entries from `sharedLibraryFiles`;
+    // jars reach the class loader through `sharedLibraryInfos`, each becoming a
+    // parent loader (`createSharedLibrariesLoaders`). Both are filled, as the
+    // package manager does.
+    let _ = SHARED_LIBRARY_JARS.set(shared.clone());
+    if !shared.is_empty() {
+        if let (Some(id), Some(arr)) = (
+            env.field_id(class, "sharedLibraryFiles", "[Ljava/lang/String;"),
+            env.string_array(&shared),
+        ) {
+            env.set_object_field(info, id, arr);
+        }
+        let infos = (|| -> Option<JObject> {
+            let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
+            let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
+            let sli = env.find_class("android/content/pm/SharedLibraryInfo")?;
+            let ctor = env.method_id(sli, "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/util/List;Ljava/lang/String;JI\
+                 Landroid/content/pm/VersionedPackage;Ljava/util/List;Ljava/util/List;Z)V")?;
+            for jar in &shared {
+                let name = std::path::Path::new(jar).file_stem()?.to_string_lossy().into_owned();
+                let null = std::ptr::null_mut();
+                let entry = env.new_object(sli, ctor, &[
+                    JValue { l: env.new_string(jar) }, JValue { l: null }, JValue { l: null },
+                    JValue { l: env.new_string(&name) }, JValue { j: -1 },
+                    JValue { i: 0 }, // TYPE_BUILTIN
+                    JValue { l: null }, JValue { l: null }, JValue { l: null }, JValue { z: 0 },
+                ])?;
+                env.call_boolean(list, add, &[JValue { l: entry }])?;
+            }
+            Some(list)
+        })();
+        match (infos, env.field_id(class, "sharedLibraryInfos", "Ljava/util/List;")) {
+            (Some(list), Some(id)) => {
+                env.set_object_field(info, id, list);
+                println!("apphost: shared libraries on the class path: {}", shared.join(":"));
+            }
+            _ => eprintln!("apphost: cannot describe <uses-library> jars as SharedLibraryInfo"),
         }
     }
     set_str("dataDir", &spec.data_dir.display().to_string());
@@ -7052,10 +7110,13 @@ fn install_class_loader_on(env: &JniEnv, loaded_apk: JObject, apk: &Path, native
     ) else {
         return false;
     };
-    let Some(parent) = env.call_static_object(cl_class, get_system, &[]) else {
+    let Some(mut parent) = env.call_static_object(cl_class, get_system, &[]) else {
         return false;
     };
     let path = env.new_string(&apk.display().to_string());
+/// `<uses-library>` jars resolved by [`build_app_info`], for the class loader.
+static SHARED_LIBRARY_JARS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
     // The library search path matters: `System.loadLibrary` resolves through
     // the class loader's native library directories, and the two-argument
     // constructor leaves them at the system defaults, so the app's own
@@ -7096,6 +7157,15 @@ fn install_class_loader_on(env: &JniEnv, loaded_apk: JObject, apk: &Path, native
 /// Read `LoadedApk.mIncludeCode` for the bind's package info and for a fresh
 /// `getPackageInfoNoCheck` call.
 ///
+    // `<uses-library>` jars sit in a parent loader, the shape
+    // `LoadedApk.createSharedLibrariesLoaders` gives them on a device.
+    if let Some(jars) = SHARED_LIBRARY_JARS.get().filter(|jars| !jars.is_empty()) {
+        let jars = env.new_string(&jars.join(":"));
+        match env.new_object(pcl_class, ctor, &[JValue { l: jars }, JValue { l: std::ptr::null_mut() }, JValue { l: parent }]) {
+            Some(shared) if !shared.is_null() => parent = shared,
+            _ => eprintln!("apphost: shared-library class loader construction threw"),
+        }
+    }
 /// The bind's instance reports `false`, which makes the class loader come out
 /// with an empty dex path. Comparing it against a direct call separates "the
 /// bind asks for a code-less package info" from "this build maps the

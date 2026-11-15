@@ -503,6 +503,15 @@ pub fn launch(args: &[String]) -> i32 {
             for split in &split_paths {
                 cmd.arg("--classpath").arg(split);
             }
+            // `<uses-library>` jars (`org.apache.http.legacy`): the APK is on
+            // the system class loader's path, so its classes resolve their
+            // references there and the jars have to be on the same path.
+            for lib in &info.uses_libraries {
+                let jar = std::path::Path::new(&sysroot).join("system/framework").join(format!("{lib}.jar"));
+                if jar.is_file() {
+                    cmd.arg("--classpath").arg(&jar);
+                }
+            }
             // The guest geometry is one decision for the whole tree, so it is
             // passed to the ART launcher rather than set piecemeal here.
             if let Some(w) = width {
