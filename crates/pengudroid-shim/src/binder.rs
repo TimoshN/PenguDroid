@@ -2767,7 +2767,20 @@ fn activity_finish_token(data: &[u8], descriptor: &str) -> Option<(u64, i32)> {
     if first_string16(data).as_deref() != Some(descriptor) { return None; }
     let (_, at) = read_string16(data, 12)?;
     let (weak, cookie, offset) = find_local_binder(data)?;
-    if offset != at || u32_at(data, at + 32)? != 0 || u32_at(data, at + 36)? != 0 {
+    // `[token][int resultCode][typed Intent resultData][boolean finishTask]`.
+    // A null Intent is one presence word; a non-null one (an Activity that
+    // calls `setResult(code, data)` before `finish()`, like Rockstar's
+    // Flutter policy screen behind "Next") precedes the trailing finishTask
+    // word. Task-wide finishes are still not hosted.
+    if offset != at {
+        return None;
+    }
+    let finish_task = if u32_at(data, at + 32)? == 0 {
+        u32_at(data, at + 36)?
+    } else {
+        u32_at(data, data.len().checked_sub(4)?)?
+    };
+    if finish_task != 0 {
         return None;
     }
     let result = u32_at(data, at + 28)? as i32;
@@ -5940,6 +5953,16 @@ mod tests {
         };
         assert_eq!(activity_finish_token(&data(0x1234, 0x5678), descriptor), Some((1, 0)));
         assert_eq!(activity_finish_token(&data(0x2345, 0x6789), descriptor), Some((2, 0)));
+        // A result Intent (here an opaque 16-byte body) before finishTask.
+        let mut with_intent = data(0x1234, 0x5678);
+        with_intent.truncate(with_intent.len() - 8);
+        with_intent.extend_from_slice(&1i32.to_ne_bytes());
+        with_intent.extend_from_slice(&[0xab; 16]);
+        with_intent.extend_from_slice(&0i32.to_ne_bytes());
+        assert_eq!(activity_finish_token(&with_intent, descriptor), Some((1, 0)));
+        let last = with_intent.len() - 4;
+        with_intent[last..].copy_from_slice(&1i32.to_ne_bytes());
+        assert_eq!(activity_finish_token(&with_intent, descriptor), None);
         assert_eq!(activity_finish_token(&data(0x1234, 0x6789), descriptor), None);
         __pengudroid_binder_forget_activity_token(1);
         assert_eq!(activity_finish_token(&data(0x1234, 0x5678), descriptor), None);
