@@ -242,6 +242,34 @@ Validation: shim **159 passed**, cli green (94+7+2+3+2), `cargo build
 * Not done: key repeat (Wayland leaves repeat to the client) and switching
   layout groups at runtime (the map is built from the first group at start).
 
+### 2026-11-15 (later): Genshin login completed
+
+**Genshin Impact 7.2 logs in.** With the keyboard, window and WebGL fixes the
+user typed their credentials, pressed Login, solved the Geetest v4 slide
+captcha in its own window and the SDK logged `login success. source:
+password`; the game then showed the account and server selection (Europe).
+Credentials were typed by the user; the harness never enters them.
+
+Then Unity reported "No network access, Code -9905" although the game's own
+curl `HEAD /query_cur_region` probes to the dispatch servers returned 200.
+Nothing answered `IConnectivityManager`, so `getActiveNetworkInfo()` was
+null and `Application.internetReachability` said NotReachable. apphost now
+publishes one connected, validated, unmetered Wi-Fi network (the framework's
+own `NetworkInfo`, `Network`, `NetworkCapabilities`, `LinkProperties`,
+marshalled by its own Parcel code) through a new generic shim entry point,
+`__pengudroid_binder_set_reply(service, code, body)`. The WebView probe now
+prints `webview: probe connectivity activeNetworkInfo.connected=Some(true)
+validated=Some(true)`. Network callbacks (`registerNetworkCallback`) still never
+fire.
+
+App data moved from `/tmp/pengudroid-data` (a 16 GB RAM tmpfs here) to
+`$XDG_DATA_HOME/pengudroid/data/<pkg>` (`PENGUDROID_DATA_ROOT`), migrated on
+first use, so the 20+ GB of game resources fit and survive a reboot.
+
+Still missing for Genshin: `AndroidKeyStore` (keystore2 service): the SDK's
+Tink keyset cannot be created, `CryptoUtils.encrypt` returns null and logs an
+NPE on every account event; login still succeeds.
+
 ### Next concrete task
 
 Watch bridged smoke #11 (`/tmp/bbr2-bridge11.log`, 900 s) and confirm the

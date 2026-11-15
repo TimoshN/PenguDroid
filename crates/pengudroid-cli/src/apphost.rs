@@ -989,6 +989,10 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         env.exception_check();
         eprintln!("apphost: no primary storage volume; getExternalFilesDir() will be null");
     }
+    if install_connectivity(env).is_none() {
+        env.exception_check();
+        eprintln!("apphost: no active network published; apps will report no connectivity");
+    }
     // `RobloxApplication.onCreate` reads `Settings.Global` (through
     // `Settings.NameValueCache`), which resolves the `settings` provider via
     // `IActivityManager.getContentProvider` *during* the bind. The reply has to
@@ -8211,6 +8215,114 @@ fn install_storage_volumes(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
     if !unsafe { setter(code, bytes.as_ptr(), bytes.len()) } { return None; }
     println!("apphost: primary storage volume {root} (getVolumeList = {code}, {} bytes)", bytes.len());
     Some(())
+}
+
+/// Publish the host's network as Android's active network.
+///
+/// With no `IConnectivityManager` answers, `getActiveNetworkInfo()` is null,
+/// so Unity's `Application.internetReachability` reports `NotReachable` and
+/// games refuse to connect even though sockets work (Genshin Impact: "No
+/// network access, Code -9905" right after a successful login). The objects
+/// are the framework's own, marshalled by its own Parcel code: one connected,
+/// validated, unmetered Wi-Fi network.
+fn install_connectivity(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(64)?;
+    let stub = env.find_class("android/net/IConnectivityManager$Stub")?;
+    let code = |name: &str| -> Option<u32> {
+        let field = env.static_field_id(stub, &format!("TRANSACTION_{name}"), "I");
+        if field.is_none() { env.exception_check(); }
+        u32::try_from(env.static_int_field(stub, field?)).ok()
+    };
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let write_int = env.method_id(parcel_class, "writeInt", "(I)V")?;
+    let marshall = env.method_id(parcel_class, "marshall", "()[B")?;
+    let parcelable = env.find_class("android/os/Parcelable")?;
+    let write_to = env.method_id(parcelable, "writeToParcel", "(Landroid/os/Parcel;I)V")?;
+    // `readTypedObject` on the proxy side: presence word, then the object.
+    let typed = |object: JObject| -> Option<Vec<u8>> {
+        let parcel = env.call_static_object(parcel_class, obtain, &[])?;
+        env.call_void(parcel, write_int, &[JValue { i: 1 }]);
+        if !env.call_void(object, write_to, &[JValue { l: parcel }, JValue { i: 0 }]) { return None; }
+        env.byte_array_copy(env.call_object(parcel, marshall, &[])?)
+    };
+
+    // NetworkInfo(TYPE_WIFI, 0, "WIFI", ""), CONNECTED and available.
+    let info_class = env.find_class("android/net/NetworkInfo")?;
+    let info_ctor = env.method_id(info_class, "<init>", "(IILjava/lang/String;Ljava/lang/String;)V")?;
+    let info = env.new_object(info_class, info_ctor, &[
+        JValue { i: 1 }, JValue { i: 0 }, JValue { l: env.new_string("WIFI") }, JValue { l: env.new_string("") },
+    ])?;
+    let state_class = env.find_class("android/net/NetworkInfo$DetailedState")?;
+    let connected = env.static_object_field(state_class,
+        env.static_field_id(state_class, "CONNECTED", "Landroid/net/NetworkInfo$DetailedState;")?);
+    let set_state = env.method_id(info_class, "setDetailedState",
+        "(Landroid/net/NetworkInfo$DetailedState;Ljava/lang/String;Ljava/lang/String;)V")?;
+    env.call_void(info, set_state, &[JValue { l: connected }, JValue { l: std::ptr::null_mut() }, JValue { l: std::ptr::null_mut() }]);
+    if let Some(set_available) = env.method_id(info_class, "setIsAvailable", "(Z)V") {
+        env.call_void(info, set_available, &[JValue { z: 1 }]);
+    }
+
+    let network_class = env.find_class("android/net/Network")?;
+    let network_ctor = env.method_id(network_class, "<init>", "(I)V")?;
+    let network = env.new_object(network_class, network_ctor, &[JValue { i: 100 }])?;
+
+    let caps_class = env.find_class("android/net/NetworkCapabilities")?;
+    let caps = env.new_object(caps_class, env.method_id(caps_class, "<init>", "()V")?, &[])?;
+    let add_transport = env.method_id(caps_class, "addTransportType", "(I)Landroid/net/NetworkCapabilities;")?;
+    let add_capability = env.method_id(caps_class, "addCapability", "(I)Landroid/net/NetworkCapabilities;")?;
+    env.call_object(caps, add_transport, &[JValue { i: 1 }]); // TRANSPORT_WIFI
+    // INTERNET, NOT_METERED, NOT_RESTRICTED, TRUSTED, NOT_VPN, VALIDATED,
+    // NOT_ROAMING, FOREGROUND, NOT_CONGESTED, NOT_SUSPENDED.
+    for capability in [12, 11, 13, 14, 15, 16, 18, 19, 20, 21] {
+        env.call_object(caps, add_capability, &[JValue { i: capability }]);
+    }
+    for (setter, kbps) in [("setLinkUpstreamBandwidthKbps", 100_000), ("setLinkDownstreamBandwidthKbps", 100_000)] {
+        if let Some(m) = env.method_id(caps_class, setter, "(I)Landroid/net/NetworkCapabilities;") {
+            env.call_object(caps, m, &[JValue { i: kbps }]);
+        }
+    }
+
+    let link_class = env.find_class("android/net/LinkProperties")?;
+    let link = env.new_object(link_class, env.method_id(link_class, "<init>", "()V")?, &[])?;
+    if let Some(set_name) = env.method_id(link_class, "setInterfaceName", "(Ljava/lang/String;)V") {
+        env.call_void(link, set_name, &[JValue { l: env.new_string("wlan0") }]);
+    }
+
+    let info_bytes = typed(info)?;
+    let network_bytes = typed(network)?;
+    let caps_bytes = typed(caps)?;
+    let link_bytes = typed(link)?;
+    // `Network[]` from writeTypedArray: length, then one typed element.
+    let all_networks = {
+        let mut bytes = 1i32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&network_bytes);
+        bytes
+    };
+    let setter = shim_symbol("__pengudroid_binder_set_reply")?;
+    let setter: unsafe extern "C" fn(*const u8, usize, u32, *const u8, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    let mut installed = Vec::new();
+    for (name, body) in [
+        ("getActiveNetworkInfo", &info_bytes),
+        ("getActiveNetworkInfoForUid", &info_bytes),
+        ("getNetworkInfo", &info_bytes),
+        ("getNetworkInfoForUid", &info_bytes),
+        ("getActiveNetwork", &network_bytes),
+        ("getActiveNetworkForUid", &network_bytes),
+        ("getNetworkCapabilities", &caps_bytes),
+        ("getLinkProperties", &link_bytes),
+        ("getActiveLinkProperties", &link_bytes),
+        ("getAllNetworks", &all_networks),
+        ("isActiveNetworkMetered", &0i32.to_le_bytes().to_vec()),
+    ] {
+        let Some(code) = code(name) else { continue };
+        let service = b"connectivity";
+        if unsafe { setter(service.as_ptr(), service.len(), code, body.as_ptr(), body.len()) } {
+            installed.push(name);
+        }
+    }
+    println!("apphost: active network published (Wi-Fi, validated): {}", installed.join(", "));
+    (!installed.is_empty()).then_some(())
 }
 
 /// Hand a serialized reply to the binder broker.

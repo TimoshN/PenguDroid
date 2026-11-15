@@ -104,6 +104,27 @@ pub(super) fn probe_tick(env: &JniEnv) {
             let layer = env.call_int(view as JObject, env.method_id(class, "getLayerType", "()I")?, &[])?;
             let attached = env.call_boolean(view as JObject, env.method_id(class, "isAttachedToWindow", "()Z")?, &[])?;
             println!("webview: probe view hardwareAccelerated={accelerated} layerType={layer} attached={attached}");
+            // What Unity's internetReachability and most SDKs ask before
+            // touching the network.
+            let context = env.call_object(view as JObject, env.method_id(class, "getContext", "()Landroid/content/Context;")?, &[])?;
+            let context_class = env.find_class("android/content/Context")?;
+            let get_service = env.method_id(context_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;")?;
+            let cm = env.call_object(context, get_service, &[JValue { l: env.new_string("connectivity") }])?;
+            let cm_class = env.find_class("android/net/ConnectivityManager")?;
+            let info = env.call_object(cm, env.method_id(cm_class, "getActiveNetworkInfo", "()Landroid/net/NetworkInfo;")?, &[])?;
+            let connected = if info.is_null() { None } else {
+                let info_class = env.find_class("android/net/NetworkInfo")?;
+                env.call_boolean(info, env.method_id(info_class, "isConnected", "()Z")?, &[])
+            };
+            let network = env.call_object(cm, env.method_id(cm_class, "getActiveNetwork", "()Landroid/net/Network;")?, &[])?;
+            let internet = if network.is_null() { None } else {
+                let caps = env.call_object(cm, env.method_id(cm_class, "getNetworkCapabilities", "(Landroid/net/Network;)Landroid/net/NetworkCapabilities;")?, &[JValue { l: network }])?;
+                if caps.is_null() { None } else {
+                    let caps_class = env.find_class("android/net/NetworkCapabilities")?;
+                    env.call_boolean(caps, env.method_id(caps_class, "hasCapability", "(I)Z")?, &[JValue { i: 16 }])
+                }
+            };
+            println!("webview: probe connectivity activeNetworkInfo.connected={connected:?} validated={internet:?}");
             Some(())
         })();
     }

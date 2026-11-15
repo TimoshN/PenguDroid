@@ -612,6 +612,38 @@ pub unsafe extern "C" fn __pengudroid_binder_set_storage_volumes(code: u32, ptr:
     true
 }
 
+/// Fixed reply bodies by (service name, transaction code), appended after the
+/// status word. Used for answers the host builds once with the framework's
+/// own Parcel code (`ConnectivityManager`'s active network, for instance).
+static SERVICE_REPLIES: Mutex<Vec<(String, u32, Vec<u8>)>> = Mutex::new(Vec::new());
+
+/// `bool __pengudroid_binder_set_reply(service, service_len, code, body, body_len)`:
+/// answer `code` on the service registered as `service` with `body` (whatever
+/// the AIDL proxy reads after the status word). A later call replaces it.
+///
+/// # Safety
+/// `service` and `body` must be readable for their lengths.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_reply(
+    service: *const u8, service_len: usize, code: u32, body: *const u8, body_len: usize,
+) -> bool {
+    if service.is_null() || service_len == 0 || code == 0 || code >= 0x00ff_fffe || (body.is_null() && body_len != 0) {
+        return false;
+    }
+    let name = String::from_utf8_lossy(std::slice::from_raw_parts(service, service_len)).into_owned();
+    let body = if body_len == 0 { Vec::new() } else { std::slice::from_raw_parts(body, body_len).to_vec() };
+    let mut replies = SERVICE_REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    replies.retain(|(n, c, _)| !(*n == name && *c == code));
+    replies.push((name, code, body));
+    true
+}
+
+/// The installed reply body for this transaction, if any.
+fn installed_reply(handle: u32, code: u32) -> Option<Vec<u8>> {
+    let replies = SERVICE_REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    replies.iter().find(|(name, c, _)| *c == code && handle_for(name) == handle).map(|(_, _, b)| b.clone())
+}
+
 /// `IPackageManager.resolveContentProvider`, read from the loaded Stub.
 /// androidx `FileProvider` looks its own `ProviderInfo` up this way (by
 /// authority, with `GET_META_DATA`) to find its paths XML; without an answer
@@ -2309,6 +2341,25 @@ fn vsync_channel() -> Option<(RawFd, RawFd)> {
 }
 
 /// Whether `data` contains `s` encoded as UTF-16LE (a `String16` payload).
+#[cfg(test)]
+mod installed_reply_tests {
+    use super::*;
+
+    #[test]
+    fn installed_replies_are_keyed_by_service_and_code_and_replaceable() {
+        let name = b"pengudroid.test.connectivity";
+        unsafe {
+            assert!(__pengudroid_binder_set_reply(name.as_ptr(), name.len(), 7, [1u8, 0, 0, 0].as_ptr(), 4));
+            assert!(__pengudroid_binder_set_reply(name.as_ptr(), name.len(), 7, [2u8, 0, 0, 0].as_ptr(), 4));
+            assert!(!__pengudroid_binder_set_reply(name.as_ptr(), name.len(), 0, std::ptr::null(), 0));
+        }
+        let handle = handle_for("pengudroid.test.connectivity");
+        assert_eq!(installed_reply(handle, 7), Some(vec![2, 0, 0, 0]));
+        assert_eq!(installed_reply(handle, 8), None);
+        assert_eq!(installed_reply(handle_for("pengudroid.test.other"), 7), None);
+    }
+}
+
 #[cfg(test)]
 mod provider_authority_tests {
     use super::*;
@@ -4048,6 +4099,15 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     bytes.len()
                 ));
             }
+        }
+    }
+    if let Some(body) = installed_reply(tr.target_handle, tr.code) {
+        parcel.extend_from_slice(&body);
+        if trace_enabled() {
+            diag(&format!(
+                "[binder]   -> installed reply for {} code {} ({} bytes)\n",
+                name_for_handle(tr.target_handle).unwrap_or_default(), tr.code, body.len()
+            ));
         }
     }
     {
