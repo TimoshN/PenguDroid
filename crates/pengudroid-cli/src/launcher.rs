@@ -636,6 +636,12 @@ pub fn launch(args: &[String]) -> i32 {
             // The JIT crashes in `nterp_op_invoke_virtual` on this framework
             // build, so the interpreter is the only working execution mode.
             cmd.arg("--vm-option").arg("-Xint");
+            // Android 17 permits JNI initialization of a previously unset final
+            // static field only in a debuggable-at-init runtime. Native-compiled
+            // initializers (including Kotlin Companion objects) need this.
+            // This enables runtime semantics, not a JDWP listening endpoint.
+            cmd.arg("--vm-option").arg("-Xcompiler-option")
+                .arg("--vm-option").arg("--debuggable");
             if !app_args.is_empty() {
                 cmd.arg("--").args(&app_args);
             }
@@ -648,21 +654,6 @@ pub fn launch(args: &[String]) -> i32 {
     }
 }
 
-/// Which ABI split to keep for the chosen backend: the host ABI for a native
-/// run, and for ART the architecture the translator can handle best (arm64
-/// before armv7, because 32-bit translation needs a 32-bit host process).
-fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
-    if b.abis.is_empty() {
-        return None;
-    }
-    match backend {
-        Backend::Native => {
-            let host = crate::nativelib::host_abi();
-            // Android 17 permits JNI initialization of a previously unset final
-            // static field only in a debuggable-at-init runtime. Native-compiled
-            // initializers (including Kotlin Companion objects) need this.
-            // This enables runtime semantics, not a JDWP listening endpoint.
-            cmd.arg("--vm-option").arg("-Xcompiler-option")
 /// Whether the app's native code needs the ARM translator: it ships ARM
 /// libraries and no libraries for the host ABI.
 fn needs_native_bridge(apks: &[String]) -> bool {
@@ -680,7 +671,16 @@ fn needs_native_bridge(apks: &[String]) -> bool {
     arm
 }
 
-                .arg("--vm-option").arg("--debuggable");
+/// Which ABI split to keep for the chosen backend: the host ABI for a native
+/// run, and for ART the architecture the translator can handle best (arm64
+/// before armv7, because 32-bit translation needs a 32-bit host process).
+fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
+    if b.abis.is_empty() {
+        return None;
+    }
+    match backend {
+        Backend::Native => {
+            let host = crate::nativelib::host_abi();
             if b.abis.iter().any(|a| a == host) {
                 Some(host.to_string())
             } else {

@@ -916,6 +916,10 @@ fn install_system_features_cache(env: &JniEnv) -> Option<()> {
     let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
     // Describe implemented virtual input/audio and screen modes. Do not claim
     // camera, sensors, telephony, multitouch, or Vulkan hardware capabilities.
+    // Wi-Fi is claimed because ConnectivityManager publishes a Wi-Fi network
+    // and the daemon hosts the `wifi` service: without the feature,
+    // `getSystemService("wifi")` returns null and apps that assume a
+    // WifiManager (Rockstar's GTA ports) crash in `onCreate`.
     for name in ["android.hardware.audio.output", "android.hardware.touchscreen",
         "android.hardware.screen.portrait", "android.hardware.screen.landscape",
         "android.hardware.wifi"] {
@@ -975,10 +979,6 @@ pub fn probe_platform_state(env: &JniEnv) -> bool {
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
     let _ = APP_PACKAGE.set(spec.package.to_string());
     if install_hosted_package(env, spec.package).is_none()
-    // Wi-Fi is claimed because ConnectivityManager publishes a Wi-Fi network
-    // and the daemon hosts the `wifi` service: without the feature,
-    // `getSystemService("wifi")` returns null and apps that assume a
-    // WifiManager (Rockstar's GTA ports) crash in `onCreate`.
         || install_hosted_activities(spec.activities.iter().map(|entry| entry.name.as_str())).is_none() {
         eprintln!("apphost: cannot publish the hosted package to the binder broker");
         return false;
@@ -4991,6 +4991,13 @@ fn spawn_input_pump(env: &JniEnv) {
                 if event.is_null() {
                     return;
                 }
+                // MotionEvent.obtain's short overload leaves SOURCE_UNKNOWN.
+                // Native game/WebView input handlers may reject it even though
+                // ordinary Android Views still react to the same coordinates.
+                if let Some(set_source) = env.method_id(motion_class, "setSource", "(I)V") {
+                    let source = if action == ACTION_HOVER_MOVE { 0x2002 } else { 0x1002 };
+                    env.call_void(event, set_source, &[JValue { i: source }]);
+                }
                 env.call_void(root, dispatch, &[JValue { l: event }]);
             }
         };
@@ -5095,13 +5102,6 @@ fn spawn_input_pump(env: &JniEnv) {
                 };
                 let mut parts = coords.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
                 if let (Some(x), Some(y)) = (parts.next(), parts.next()) {
-                // MotionEvent.obtain's short overload leaves SOURCE_UNKNOWN.
-                // Native game/WebView input handlers may reject it even though
-                // ordinary Android Views still react to the same coordinates.
-                if let Some(set_source) = env.method_id(motion_class, "setSource", "(I)V") {
-                    let source = if action == ACTION_HOVER_MOVE { 0x2002 } else { 0x1002 };
-                    env.call_void(event, set_source, &[JValue { i: source }]);
-                }
                     taps.push((x, y, delay));
                 }
             }
@@ -7114,6 +7114,9 @@ fn resume_activity(env: &JniEnv, thread_class: JClass, thread: JObject, record: 
     }
 }
 
+/// `<uses-library>` jars resolved by [`build_app_info`], for the class loader.
+static SHARED_LIBRARY_JARS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 /// Point the app's `LoadedApk` at a class loader that actually has the APK.
 ///
 /// The loader the framework builds here comes out with an empty dex path
@@ -7154,10 +7157,16 @@ fn install_class_loader_on(env: &JniEnv, loaded_apk: JObject, apk: &Path, native
     let Some(mut parent) = env.call_static_object(cl_class, get_system, &[]) else {
         return false;
     };
+    // `<uses-library>` jars sit in a parent loader, the shape
+    // `LoadedApk.createSharedLibrariesLoaders` gives them on a device.
+    if let Some(jars) = SHARED_LIBRARY_JARS.get().filter(|jars| !jars.is_empty()) {
+        let jars = env.new_string(&jars.join(":"));
+        match env.new_object(pcl_class, ctor, &[JValue { l: jars }, JValue { l: std::ptr::null_mut() }, JValue { l: parent }]) {
+            Some(shared) if !shared.is_null() => parent = shared,
+            _ => eprintln!("apphost: shared-library class loader construction threw"),
+        }
+    }
     let path = env.new_string(&apk.display().to_string());
-/// `<uses-library>` jars resolved by [`build_app_info`], for the class loader.
-static SHARED_LIBRARY_JARS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-
     // The library search path matters: `System.loadLibrary` resolves through
     // the class loader's native library directories, and the two-argument
     // constructor leaves them at the system defaults, so the app's own
@@ -7198,15 +7207,6 @@ static SHARED_LIBRARY_JARS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLo
 /// Read `LoadedApk.mIncludeCode` for the bind's package info and for a fresh
 /// `getPackageInfoNoCheck` call.
 ///
-    // `<uses-library>` jars sit in a parent loader, the shape
-    // `LoadedApk.createSharedLibrariesLoaders` gives them on a device.
-    if let Some(jars) = SHARED_LIBRARY_JARS.get().filter(|jars| !jars.is_empty()) {
-        let jars = env.new_string(&jars.join(":"));
-        match env.new_object(pcl_class, ctor, &[JValue { l: jars }, JValue { l: std::ptr::null_mut() }, JValue { l: parent }]) {
-            Some(shared) if !shared.is_null() => parent = shared,
-            _ => eprintln!("apphost: shared-library class loader construction threw"),
-        }
-    }
 /// The bind's instance reports `false`, which makes the class loader come out
 /// with an empty dex path. Comparing it against a direct call separates "the
 /// bind asks for a code-less package info" from "this build maps the
@@ -8372,6 +8372,34 @@ fn install_storage_volumes(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
     Some(())
 }
 
+/// Answer `IDisplayManager.getWifiDisplayStatus` with an empty status (no
+/// Miracast hardware, nothing connected).
+///
+/// `MediaRouter.selectRouteStatic` dereferences the result unconditionally;
+/// a null answer threw out of the main Looper as soon as YouTube's cast
+/// support selected the default route.
+fn install_wifi_display_status(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let stub = env.find_class("android/hardware/display/IDisplayManager$Stub")?;
+    let code = u32::try_from(env.static_int_field(stub,
+        env.static_field_id(stub, "TRANSACTION_getWifiDisplayStatus", "I")?)).ok()?;
+    let (_, status) = new_instance(env, "android/hardware/display/WifiDisplayStatus")?;
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let parcel = env.call_static_object(parcel_class,
+        env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?, &[])?;
+    let write_typed = env.method_id(parcel_class, "writeTypedObject", "(Landroid/os/Parcelable;I)V")?;
+    if !env.call_void(parcel, write_typed, &[JValue { l: status }, JValue { i: 0 }]) {
+        return None;
+    }
+    let body = env.byte_array_copy(env.call_object(parcel,
+        env.method_id(parcel_class, "marshall", "()[B")?, &[])?)?;
+    let setter = shim_symbol("__pengudroid_binder_set_reply")?;
+    let setter: unsafe extern "C" fn(*const u8, usize, u32, *const u8, usize) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    let service = b"display";
+    unsafe { setter(service.as_ptr(), service.len(), code, body.as_ptr(), body.len()) }.then_some(())
+}
+
 /// Publish the host's network as Android's active network.
 ///
 /// With no `IConnectivityManager` answers, `getActiveNetworkInfo()` is null,
@@ -8409,34 +8437,6 @@ fn install_connectivity(env: &JniEnv) -> Option<()> {
         JValue { i: 1 }, JValue { i: 0 }, JValue { l: env.new_string("WIFI") }, JValue { l: env.new_string("") },
     ])?;
     let state_class = env.find_class("android/net/NetworkInfo$DetailedState")?;
-/// Answer `IDisplayManager.getWifiDisplayStatus` with an empty status (no
-/// Miracast hardware, nothing connected).
-///
-/// `MediaRouter.selectRouteStatic` dereferences the result unconditionally;
-/// a null answer threw out of the main Looper as soon as YouTube's cast
-/// support selected the default route.
-fn install_wifi_display_status(env: &JniEnv) -> Option<()> {
-    let _frame = env.local_frame(16)?;
-    let stub = env.find_class("android/hardware/display/IDisplayManager$Stub")?;
-    let code = u32::try_from(env.static_int_field(stub,
-        env.static_field_id(stub, "TRANSACTION_getWifiDisplayStatus", "I")?)).ok()?;
-    let (_, status) = new_instance(env, "android/hardware/display/WifiDisplayStatus")?;
-    let parcel_class = env.find_class("android/os/Parcel")?;
-    let parcel = env.call_static_object(parcel_class,
-        env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?, &[])?;
-    let write_typed = env.method_id(parcel_class, "writeTypedObject", "(Landroid/os/Parcelable;I)V")?;
-    if !env.call_void(parcel, write_typed, &[JValue { l: status }, JValue { i: 0 }]) {
-        return None;
-    }
-    let body = env.byte_array_copy(env.call_object(parcel,
-        env.method_id(parcel_class, "marshall", "()[B")?, &[])?)?;
-    let setter = shim_symbol("__pengudroid_binder_set_reply")?;
-    let setter: unsafe extern "C" fn(*const u8, usize, u32, *const u8, usize) -> bool =
-        unsafe { std::mem::transmute(setter) };
-    let service = b"display";
-    unsafe { setter(service.as_ptr(), service.len(), code, body.as_ptr(), body.len()) }.then_some(())
-}
-
     let connected = env.static_object_field(state_class,
         env.static_field_id(state_class, "CONNECTED", "Landroid/net/NetworkInfo$DetailedState;")?);
     let set_state = env.method_id(info_class, "setDetailedState",
@@ -8634,6 +8634,24 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, spec: &AppSp
     }
 }
 
+/// A marshalled one-entry `ParceledListSlice<ResolveInfo>` whose `field`
+/// (`serviceInfo`, `activityInfo`, ...) is `info`.
+fn resolve_info_slice(env: &JniEnv, field: &str, sig: &str, info: JObject) -> Option<Vec<u8>> {
+    let _frame = env.local_frame(16)?;
+    let (ri_class, ri) = new_instance(env, "android/content/pm/ResolveInfo")?;
+    let id = env.field_id(ri_class, field, sig)?;
+    env.set_object_field(ri, id, info);
+    let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
+    let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
+    if env.call_boolean(list, add, &[JValue { l: ri }]) != Some(true) {
+        return None;
+    }
+    let pls_class = env.find_class("android/content/pm/ParceledListSlice")?;
+    let ctor = env.method_id(pls_class, "<init>", "(Ljava/util/List;)V")?;
+    let pls = env.new_object(pls_class, ctor, &[JValue { l: list }])?;
+    marshal_object(env, pls, "android/content/pm/ParceledListSlice")
+}
+
 /// Firebase discovers its registrars through ComponentDiscoveryService's
 /// ServiceInfo.metaData, before any service instance is actually started.
 fn install_service_info_replies(env: &JniEnv, app_info: JObject, spec: &AppSpec<'_>) -> Option<()> {
@@ -8643,6 +8661,12 @@ fn install_service_info_replies(env: &JniEnv, app_info: JObject, spec: &AppSpec<
     let symbol = shim_symbol("__pengudroid_binder_set_service_entry")?;
     let publish: unsafe extern "C" fn(u32, *const u8, usize, *const u8, usize) =
         unsafe { std::mem::transmute(symbol) };
+    // The same entries answer explicit `queryIntentServices` probes (see the
+    // shim's SERVICE_QUERY_REPLIES): a device resolves an Intent naming one
+    // of the package's own services to that service.
+    let add_query: Option<unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> bool> =
+        shim_symbol("__pengudroid_binder_add_service_query_reply")
+            .map(|symbol| unsafe { std::mem::transmute(symbol) });
     for service in spec.services {
         let _frame = env.local_frame(32)?;
         let (class, info) = new_instance(env, "android/content/pm/ServiceInfo")?;
@@ -8662,6 +8686,17 @@ fn install_service_info_replies(env: &JniEnv, app_info: JObject, spec: &AppSpec<
         }
         let bytes = marshal_object(env, info, "android/content/pm/ServiceInfo")?;
         unsafe { publish(code, service.name.as_ptr(), service.name.len(), bytes.as_ptr(), bytes.len()) };
+        if let Some(add_query) = add_query {
+            // The Intent carries the fully qualified class; the manifest may not.
+            let full = match service.name.strip_prefix('.') {
+                Some(rest) => format!("{}.{rest}", spec.package),
+                None if !service.name.contains('.') => format!("{}.{}", spec.package, service.name),
+                None => service.name.clone(),
+            };
+            if let Some(slice) = resolve_info_slice(env, "serviceInfo", "Landroid/content/pm/ServiceInfo;", info) {
+                unsafe { add_query(full.as_ptr(), full.len(), slice.as_ptr(), slice.len()) };
+            }
+        }
     }
     println!("apphost: published {} manifest ServiceInfo entries", spec.services.len());
     Some(())
@@ -8773,24 +8808,6 @@ fn install_display_replies(env: &JniEnv) {
             },
         );
     }
-/// A marshalled one-entry `ParceledListSlice<ResolveInfo>` whose `field`
-/// (`serviceInfo`, `activityInfo`, ...) is `info`.
-fn resolve_info_slice(env: &JniEnv, field: &str, sig: &str, info: JObject) -> Option<Vec<u8>> {
-    let _frame = env.local_frame(16)?;
-    let (ri_class, ri) = new_instance(env, "android/content/pm/ResolveInfo")?;
-    let id = env.field_id(ri_class, field, sig)?;
-    env.set_object_field(ri, id, info);
-    let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
-    let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
-    if env.call_boolean(list, add, &[JValue { l: ri }]) != Some(true) {
-        return None;
-    }
-    let pls_class = env.find_class("android/content/pm/ParceledListSlice")?;
-    let ctor = env.method_id(pls_class, "<init>", "(Ljava/util/List;)V")?;
-    let pls = env.new_object(pls_class, ctor, &[JValue { l: list }])?;
-    marshal_object(env, pls, "android/content/pm/ParceledListSlice")
-}
-
     // `DisplayInfo` has no `densityDpi` field in this build; the density is
     // derived from the logical size and the display metrics.
     // `Display.getRealMetrics()` reads `logicalDensityDpi`, and a zero there
@@ -8800,12 +8817,6 @@ fn resolve_info_slice(env: &JniEnv, field: &str, sig: &str, info: JObject) -> Op
     set_int("logicalDensityDpi", density_dpi());
     // Display.STATE_ON = 2, Display.TYPE_INTERNAL = 1, Surface.ROTATION_0 = 0.
     set_int("state", 2);
-    // The same entries answer explicit `queryIntentServices` probes (see the
-    // shim's SERVICE_QUERY_REPLIES): a device resolves an Intent naming one
-    // of the package's own services to that service.
-    let add_query: Option<unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> bool> =
-        shim_symbol("__pengudroid_binder_add_service_query_reply")
-            .map(|symbol| unsafe { std::mem::transmute(symbol) });
     set_int("committedState", 2);
     set_int("type", 1);
     set_int("rotation", 0);
@@ -8825,17 +8836,6 @@ fn resolve_info_slice(env: &JniEnv, field: &str, sig: &str, info: JObject) -> Op
         let ctor = env.method_id(class, "<init>", "(IIIF)V")?;
         let mode = env.new_object(class, ctor, &[
             JValue { i: 1 }, JValue { i: surface_w() }, JValue { i: surface_h() }, JValue { f: 60.0 },
-        if let Some(add_query) = add_query {
-            // The Intent carries the fully qualified class; the manifest may not.
-            let full = match service.name.strip_prefix('.') {
-                Some(rest) => format!("{}.{rest}", spec.package),
-                None if !service.name.contains('.') => format!("{}.{}", spec.package, service.name),
-                None => service.name.clone(),
-            };
-            if let Some(slice) = resolve_info_slice(env, "serviceInfo", "Landroid/content/pm/ServiceInfo;", info) {
-                unsafe { add_query(full.as_ptr(), full.len(), slice.as_ptr(), slice.len()) };
-            }
-        }
         ])?;
         let modes = env.new_object_array(1, class, std::ptr::null_mut())?;
         env.set_object_array_element(modes, 0, mode);
