@@ -56,6 +56,18 @@ reports that clicking does not work. Vulkan presentation stopped after 375
 frames in this run; receiving input alone does not establish a responsive UI.
 Investigate the stopped render thread / login overlay before claiming success.
 
+The user supplied a screenshot of a transparent separate window over the game
+and reports a transient loading indicator there. No consent text/buttons have
+been observed, so do not classify it as a terms prompt or dismiss it blindly.
+Two host-side defects are addressed in the follow-up: touch targeting now uses
+FLAG_NOT_TOUCHABLE independently of keyboard FLAG_NOT_FOCUSABLE; removed/unadded
+roots are excluded from input. The applied frame is read from the pinned
+framework's actual `ViewRootImpl.mWinFrame` Rect. The old
+`mClientWindowFrames` lookup did not exist in that framework and prevented frame
+repair. `probe_window_configuration` now checks the actual frame and lifecycle
+field contracts under CheckJNI. These fixes pass 149 CLI tests; the transparent
+window still requires live confirmation after the restart.
+
 ### NVIDIA swapchain allocation — fixed
 
 ZZZ requests SRGB format 43 and image usage `0x93`. The previous unconditional

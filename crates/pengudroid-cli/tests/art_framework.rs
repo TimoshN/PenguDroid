@@ -192,6 +192,7 @@ fn android17_core_services_under_checkjni() {
         "binder: framework ServiceManager codes = [1, 3, 2, 4]",
         "settings: Binder/Parcel scalar value, missing key and unsupported list passed",
         "audio: AIDL focus granted, current gain verified, abandon cleared",
+        "window: real ViewRootImpl frame and input lifecycle fields passed",
         "window: local WindowLayout.computeFrames = 720x1280",
         "window: API-37 resized parcel typed result and flags passed",
         "native KeyCharacterMap: 6 Unicode cases passed",

@@ -1952,7 +1952,7 @@ fn dump_root_state(env: &JniEnv, root: JObject, index: i32) {
                         .unwrap_or(-9999)
                 };
                 parts.push(format!(
-                    "mClientWindowFrames.frame=({},{})-({},{})",
+                    "mWinFrame=({},{})-({},{})",
                     read("left"),
                     read("top"),
                     read("right"),
@@ -4985,7 +4985,7 @@ fn spawn_input_pump(env: &JniEnv) {
             if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
                 println!("input: synthetic action={action} at {x:.0},{y:.0} -> {count} root(s)");
             }
-            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else { return; };
+            let Some(root) = input_root(&env, roots, root_class, size_m, get_m, true) else { return; };
             {
                 let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
                 let Some(event) = env.call_static_object(
@@ -5284,7 +5284,7 @@ fn spawn_input_pump(env: &JniEnv) {
             if roots.is_null() {
                 return;
             }
-            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else {
+            let Some(root) = input_root(&env, roots, root_class, size_m, get_m, true) else {
                 return;
             };
             if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
@@ -5875,6 +5875,17 @@ fn trace_key_target(env: &JniEnv, root: JObject, root_class: JClass) {
 
 fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
     size: JMethodId, get: JMethodId) -> Option<JObject> {
+    input_root(env, roots, root_class, size, get, false)
+}
+
+fn window_accepts_input(flags: i32, pointer: bool, removed: bool, stopped: bool,
+    visible: bool, surface_valid: bool) -> bool {
+    let blocked = if pointer { flags & 0x10 != 0 } else { flags & 8 != 0 };
+    !blocked && !removed && !stopped && visible && surface_valid
+}
+
+fn input_root(env: &JniEnv, roots: JObject, root_class: JClass,
+    size: JMethodId, get: JMethodId, pointer: bool) -> Option<JObject> {
     let view_class = env.find_class("android/view/View")?;
     let params_class = env.find_class("android/view/WindowManager$LayoutParams")?;
     let params_field = env.field_id(root_class, "mWindowAttributes", "Landroid/view/WindowManager$LayoutParams;")?;
@@ -5885,6 +5896,8 @@ fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
     let has_focus = env.method_id(view_class, "hasWindowFocus", "()Z")?;
     let change_focus = env.method_id(root_class, "windowFocusChanged", "(Z)V")?;
     let stopped = env.field_id(root_class, "mStopped", "Z")?;
+    let removed = env.field_id(root_class, "mRemoved", "Z")?;
+    let added = env.field_id(root_class, "mAdded", "Z")?;
     // Like the window manager, focus only windows that have a surface: a
     // dialog that was added but never drawn must not swallow every key.
     let surface_field = env.field_id(root_class, "mSurface", "Landroid/view/Surface;");
@@ -5906,15 +5919,29 @@ fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
         if view.is_null() || params.is_null() { continue; }
         windows.push((root, view));
         let flags = env.int_field(params, flags_field);
-        // FLAG_NOT_FOCUSABLE, and hidden roots, cannot take physical keys.
-        if flags & 8 != 0 || env.boolean_field(root, stopped)
-            || env.call_int(view, visibility, &[]) != Some(0) || !has_surface(root) { continue; }
+        // Popups can accept touch while explicitly refusing keyboard focus.
+        // Removed roots can remain in mRoots until their deferred teardown.
+        let is_removed = env.boolean_field(root, removed) || !env.boolean_field(root, added);
+        let is_stopped = env.boolean_field(root, stopped);
+        let is_visible = env.call_int(view, visibility, &[]) == Some(0);
+        let surface_valid = has_surface(root);
+        if !window_accepts_input(flags, pointer, is_removed, is_stopped, is_visible, surface_valid) {
+            if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                println!("input: root {i} skipped flags={flags:#x} removed={is_removed} stopped={is_stopped} visible={is_visible} surface_valid={surface_valid} pointer={pointer}");
+            }
+            continue;
+        }
         let rank = (env.int_field(params, type_field), i);
         if target.as_ref().map_or(true, |(best, _)| rank > *best) {
             target = Some((rank, root));
         }
     }
     let (_, target) = target?;
+    // A non-focusable touch popup must leave keyboard focus on its owner.
+    let target_params = env.object_field(target, params_field);
+    if pointer && env.int_field(target_params, flags_field) & 8 != 0 {
+        return Some(target);
+    }
     for (root, view) in windows {
         let focused = env.is_same_object(root, target);
         if env.call_boolean(view, has_focus, &[]) != Some(focused) {
@@ -6653,12 +6680,10 @@ fn destroy_activity(env: &JniEnv, thread: JObject, thread_class: JClass, record:
 /// framework object is mutated in place through JNI, so the very next traversal
 /// measures against the real surface.
 fn client_window_frame(env: &JniEnv, root_class: JClass, root: JObject) -> Option<JObject> {
-    let field = env.field_id(root_class, "mClientWindowFrames", "Landroid/window/ClientWindowFrames;")?;
-    let frames = env.object_field(root, field);
-    if frames.is_null() { return None; }
-    let class = env.find_class("android/window/ClientWindowFrames")?;
-    let frame = env.field_id(class, "frame", "Landroid/graphics/Rect;")?;
-    let rect = env.object_field(frames, frame);
+    // The pinned framework stores the applied frame directly in mWinFrame.
+    // ClientWindowFrames is the relayout out-parameter, not a root member.
+    let field = env.field_id(root_class, "mWinFrame", "Landroid/graphics/Rect;")?;
+    let rect = env.object_field(root, field);
     (!rect.is_null()).then_some(rect)
 }
 
@@ -6673,7 +6698,7 @@ fn force_window_frame(env: &JniEnv, root: JObject, width: i32, height: i32) {
 
     let target = client_window_frame(env, root_class, root);
     let Some(rect) = target.filter(|r| !r.is_null()) else {
-        eprintln!("apphost: Android 17 ViewRootImpl.mClientWindowFrames.frame is unavailable");
+        eprintln!("apphost: Android ViewRootImpl.mWinFrame is unavailable");
         return;
     };
     let Some(set) = set else {
@@ -6757,7 +6782,7 @@ fn schedule_roots_dump(env: &JniEnv) {
                 }
             }
             println!(
-                "apphost: root {i} settled w={:?} h={:?} mClientWindowFrames.frame={frame}",
+                "apphost: root {i} settled w={:?} h={:?} mWinFrame={frame}",
                 int("mWidth", root),
                 int("mHeight", root),
             );
@@ -8288,6 +8313,12 @@ pub fn probe_blast_lifecycle(env: &JniEnv) -> bool {
 pub fn probe_window_configuration(env: &JniEnv) -> bool {
     let run = || -> Option<()> {
         let _frame = env.local_frame(48)?;
+        let root_class = env.find_class("android/view/ViewRootImpl")?;
+        env.field_id(root_class, "mWinFrame", "Landroid/graphics/Rect;")?;
+        for name in ["mRemoved", "mAdded", "mStopped"] {
+            env.field_id(root_class, name, "Z")?;
+        }
+        println!("window: real ViewRootImpl frame and input lifecycle fields passed");
         let config = new_configuration(env)?;
         let config_class = env.find_class("android/content/res/Configuration")?;
         let window_field = env.field_id(config_class, "windowConfiguration", "Landroid/app/WindowConfiguration;")?;
@@ -9942,6 +9973,24 @@ pub fn attach_current_thread(vm: *mut c_void) -> Option<JniEnv> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touch_popup_does_not_need_keyboard_focus_and_retired_roots_reject_input() {
+        // ZZZ's transient SDK window: FLAG_NOT_FOCUSABLE, still touchable.
+        assert!(window_accepts_input(0x1800408, true, false, false, true, true));
+        assert!(!window_accepts_input(0x1800408, false, false, false, true, true));
+        // A click-through overlay is the opposite: keyboard eligibility is
+        // independent of FLAG_NOT_TOUCHABLE.
+        assert!(!window_accepts_input(0x10, true, false, false, true, true));
+        assert!(window_accepts_input(0x10, false, false, false, true, true));
+        for pointer in [false, true] {
+            assert!(!window_accepts_input(0, pointer, true, false, true, true));
+            assert!(!window_accepts_input(0, pointer, false, true, true, true));
+            assert!(!window_accepts_input(0, pointer, false, false, false, true));
+            assert!(!window_accepts_input(0, pointer, false, false, true, false));
+        }
+    }
+
 
     /// The dp fields must follow the pixel size and the density, not a stale
     /// constant.
