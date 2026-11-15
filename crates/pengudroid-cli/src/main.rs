@@ -488,13 +488,9 @@ fn cmd_keymap_preset(args: &[String]) -> i32 {
         },
         None => display::Geometry::LANDSCAPE,
     };
-    let Some(map) =
-        pengudroid_input::presets::for_package(package, size.width as f32, size.height as f32)
-    else {
-        eprintln!("pengudroid keymap-preset: no built-in keymap for {package}");
-        return 1;
-    };
-    println!("# {package} at {}x{} (built-in preset; positions are approximate)", size.width, size.height);
+    let map = pengudroid_input::presets::for_package(package, size.width as f32, size.height as f32)
+        .unwrap_or_else(pengudroid_input::presets::default_xbox_pc_preset);
+    println!("# {package} Xbox 360 PC control preset");
     println!(
         "# save as {}",
         pengudroid_input::keymap::keymap_path(package).display()

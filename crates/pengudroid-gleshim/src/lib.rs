@@ -67,6 +67,17 @@ const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_LINEAR: i32 = 0x2601;
 const GL_FRAMEBUFFER: u32 = 0x8D40;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+const GL_RENDERBUFFER: u32 = 0x8D41;
+const GL_DEPTH24_STENCIL8: u32 = 0x88F0;
+const GL_DEPTH_COMPONENT16: u32 = 0x81A5;
+const GL_DEPTH_STENCIL_ATTACHMENT: u32 = 0x821A;
+const GL_DEPTH_ATTACHMENT: u32 = 0x8D00;
+const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+const GL_SCISSOR_TEST: u32 = 0x0C11;
+const GL_SCISSOR_BOX: u32 = 0x0C10;
+const GL_COLOR_CLEAR_VALUE: u32 = 0x0C22;
+const GL_COLOR_WRITEMASK: u32 = 0x0C23;
+const GL_COLOR_BUFFER_BIT: u32 = 0x00004000;
 
 // ---------------------------------------------------------------------------
 // Host entry-point signatures
@@ -125,6 +136,20 @@ type GlClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
 type GlFinish = unsafe extern "C" fn();
 type GlFlush = unsafe extern "C" fn();
 type GlReadPixels = unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut c_void);
+type GlGenRenderbuffers = unsafe extern "C" fn(c_int, *mut u32);
+type GlBindRenderbuffer = unsafe extern "C" fn(u32, u32);
+type GlRenderbufferStorage = unsafe extern "C" fn(u32, u32, c_int, c_int);
+type GlFramebufferRenderbuffer = unsafe extern "C" fn(u32, u32, u32, u32);
+type GlDeleteRenderbuffers = unsafe extern "C" fn(c_int, *const u32);
+type GlCheckFramebufferStatus = unsafe extern "C" fn(u32) -> u32;
+type GlEnable = unsafe extern "C" fn(u32);
+type GlDisable = unsafe extern "C" fn(u32);
+type GlIsEnabled = unsafe extern "C" fn(u32) -> u8;
+type GlScissor = unsafe extern "C" fn(c_int, c_int, c_int, c_int);
+type GlGetIntegerv = unsafe extern "C" fn(u32, *mut c_int);
+type GlGetFloatv = unsafe extern "C" fn(u32, *mut f32);
+type GlGetBooleanv = unsafe extern "C" fn(u32, *mut u8);
+type GlColorMask = unsafe extern "C" fn(u8, u8, u8, u8);
 
 // ---------------------------------------------------------------------------
 // Host table
@@ -170,6 +195,20 @@ struct Host {
     gl_finish: Option<GlFinish>,
     gl_flush: Option<GlFlush>,
     gl_read_pixels: Option<GlReadPixels>,
+    gl_gen_renderbuffers: Option<GlGenRenderbuffers>,
+    gl_bind_renderbuffer: Option<GlBindRenderbuffer>,
+    gl_renderbuffer_storage: Option<GlRenderbufferStorage>,
+    gl_framebuffer_renderbuffer: Option<GlFramebufferRenderbuffer>,
+    gl_delete_renderbuffers: Option<GlDeleteRenderbuffers>,
+    gl_check_framebuffer_status: Option<GlCheckFramebufferStatus>,
+    gl_enable: Option<GlEnable>,
+    gl_disable: Option<GlDisable>,
+    gl_is_enabled: Option<GlIsEnabled>,
+    gl_scissor: Option<GlScissor>,
+    gl_get_integerv: Option<GlGetIntegerv>,
+    gl_get_floatv: Option<GlGetFloatv>,
+    gl_get_booleanv: Option<GlGetBooleanv>,
+    gl_color_mask: Option<GlColorMask>,
 }
 
 impl Host {
@@ -265,6 +304,20 @@ impl Host {
             gl_finish: gl_proc("glFinish").and_then(cast_fn),
             gl_flush: gl_proc("glFlush").and_then(cast_fn),
             gl_read_pixels: gl_proc("glReadPixels").and_then(cast_fn),
+            gl_gen_renderbuffers: gl_proc("glGenRenderbuffers").and_then(cast_fn),
+            gl_bind_renderbuffer: gl_proc("glBindRenderbuffer").and_then(cast_fn),
+            gl_renderbuffer_storage: gl_proc("glRenderbufferStorage").and_then(cast_fn),
+            gl_framebuffer_renderbuffer: gl_proc("glFramebufferRenderbuffer").and_then(cast_fn),
+            gl_delete_renderbuffers: gl_proc("glDeleteRenderbuffers").and_then(cast_fn),
+            gl_check_framebuffer_status: gl_proc("glCheckFramebufferStatus").and_then(cast_fn),
+            gl_enable: gl_proc("glEnable").and_then(cast_fn),
+            gl_disable: gl_proc("glDisable").and_then(cast_fn),
+            gl_is_enabled: gl_proc("glIsEnabled").and_then(cast_fn),
+            gl_scissor: gl_proc("glScissor").and_then(cast_fn),
+            gl_get_integerv: gl_proc("glGetIntegerv").and_then(cast_fn),
+            gl_get_floatv: gl_proc("glGetFloatv").and_then(cast_fn),
+            gl_get_booleanv: gl_proc("glGetBooleanv").and_then(cast_fn),
+            gl_color_mask: gl_proc("glColorMask").and_then(cast_fn),
         })
     }
 }
@@ -493,6 +546,7 @@ struct SurfaceRec {
 struct Target {
     group: u64,
     tex: u32,
+    depth_rbo: u32,
     /// `(context serial, fbo)`.
     fbos: Vec<(u64, u32)>,
 }
@@ -597,8 +651,8 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
         .gl_framebuffer_texture_2d
         .ok_or_else(|| "host glFramebufferTexture2D is unavailable".to_string())?;
 
-    let tex = match rec.targets.iter().find(|t| t.group == info.group) {
-        Some(target) => target.tex,
+    let (tex, depth_rbo) = match rec.targets.iter().find(|t| t.group == info.group) {
+        Some(target) => (target.tex, target.depth_rbo),
         None => {
             // Creating the texture must not disturb the context's own
             // GL_TEXTURE_2D binding.
@@ -623,8 +677,33 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
             tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             bind_texture(GL_TEXTURE_2D, previous);
-            rec.targets.push(Target { group: info.group, tex, fbos: Vec::new() });
-            tex
+
+            let mut depth_rbo = 0u32;
+            if let (
+                Some(gen_rb),
+                Some(bind_rb),
+                Some(rb_storage),
+            ) = (
+                host.gl_gen_renderbuffers,
+                host.gl_bind_renderbuffer,
+                host.gl_renderbuffer_storage,
+            ) {
+                let prev_rb = host_get_integer(host, 0x8CA7) as u32; // GL_RENDERBUFFER_BINDING
+                gen_rb(1, &mut depth_rbo);
+                if depth_rbo != 0 {
+                    bind_rb(GL_RENDERBUFFER, depth_rbo);
+                    rb_storage(
+                        GL_RENDERBUFFER,
+                        GL_DEPTH24_STENCIL8,
+                        rec.w as c_int,
+                        rec.h as c_int,
+                    );
+                }
+                bind_rb(GL_RENDERBUFFER, prev_rb);
+            }
+
+            rec.targets.push(Target { group: info.group, tex, depth_rbo, fbos: Vec::new() });
+            (tex, depth_rbo)
         }
     };
 
@@ -635,6 +714,42 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
     }
     bind_framebuffer(GL_FRAMEBUFFER, fbo);
     framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    if depth_rbo != 0 {
+        if let Some(fb_rb) = host.gl_framebuffer_renderbuffer {
+            fb_rb(
+                GL_FRAMEBUFFER,
+                GL_DEPTH_STENCIL_ATTACHMENT,
+                GL_RENDERBUFFER,
+                depth_rbo,
+            );
+            let complete = host
+                .gl_check_framebuffer_status
+                .map_or(true, |check| check(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+            if !complete {
+                fb_rb(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+                if let (Some(bind_rb), Some(rb_storage)) =
+                    (host.gl_bind_renderbuffer, host.gl_renderbuffer_storage)
+                {
+                    let prev_rb = host_get_integer(host, 0x8CA7) as u32;
+                    bind_rb(GL_RENDERBUFFER, depth_rbo);
+                    rb_storage(
+                        GL_RENDERBUFFER,
+                        GL_DEPTH_COMPONENT16,
+                        rec.w as c_int,
+                        rec.h as c_int,
+                    );
+                    bind_rb(GL_RENDERBUFFER, prev_rb);
+                    fb_rb(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth_rbo);
+                    let ok16 = host
+                        .gl_check_framebuffer_status
+                        .map_or(true, |check| check(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+                    if !ok16 {
+                        fb_rb(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+                    }
+                }
+            }
+        }
+    }
     let target = rec.targets.iter_mut().find(|t| t.group == info.group).unwrap();
     target.fbos.push((info.serial, fbo));
     Ok((tex, fbo))
@@ -993,23 +1108,33 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
 
         let conn = Connection::connect_endpoint(&default_socket_path())
             .map_err(|e| format!("cannot connect to the daemon: {e}"))?;
-        // Never block a guest indefinitely behind a wedged daemon.
-        let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+        // Cold daemon start (fontconfig / Adwaita initialization) can take ~1s on
+        // first surface creation; give it a 5s budget and allow recovery on timeout.
+        let _ = conn.set_read_timeout(Some(Duration::from_millis(5000)));
 
         let hello = Message::Hello {
             version: PROTO_VERSION,
             role: Role::Guest,
             pid: std::process::id() as i32,
         };
-        conn.send_message(&hello, &[])
-            .map_err(|e| format!("Hello failed: {e}"))?;
-        let (reply, fds) = conn
-            .recv_message()
-            .map_err(|e| format!("Welcome failed: {e}"))?;
+        if let Err(e) = conn.send_message(&hello, &[]) {
+            st.connect_attempted = false;
+            return Err(format!("Hello failed: {e}"));
+        }
+        let (reply, fds) = match conn.recv_message() {
+            Ok(v) => v,
+            Err(e) => {
+                st.connect_attempted = false;
+                return Err(format!("Welcome failed: {e}"));
+            }
+        };
         close_fds(&fds);
         match reply {
             Message::Welcome { .. } => {}
-            other => return Err(format!("unexpected handshake reply: {other:?}")),
+            other => {
+                st.connect_attempted = false;
+                return Err(format!("unexpected handshake reply: {other:?}"));
+            }
         }
         st.conn = Some(conn);
     }
@@ -1033,6 +1158,7 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
     };
     if let Err(e) = send_result {
         st.conn = None;
+        st.connect_attempted = false;
         return Err(format!("CreateSurface failed: {e}"));
     }
 
@@ -1044,6 +1170,7 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
         Ok(v) => v,
         Err(e) => {
             st.conn = None;
+            st.connect_attempted = false;
             return Err(format!("SurfaceCreated failed: {e}"));
         }
     };
@@ -1061,10 +1188,20 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
             // creates a splash surface and destroys it when the real one appears.
             std::env::set_var("PENGUDROID_LAST_SURFACE_ID", surface_id.to_string());
             if let Some(conn) = st.conn.as_ref() {
-                let fps_meter = std::env::var("PENGUDROID_FPS_METER").is_ok_and(|value| value == "1" || value == "true");
-                conn.send_message(&Message::SetSurfaceOptions { surface_id, fps_meter }, &[])
-                    .map_err(|e| format!("surface preferences: {e}"))?;
-                let (reply, fds) = conn.recv_message().map_err(|e| e.to_string())?;
+                let fps_meter = mangohud_enabled();
+                if let Err(e) = conn.send_message(&Message::SetSurfaceOptions { surface_id, fps_meter }, &[]) {
+                    st.conn = None;
+                    st.connect_attempted = false;
+                    return Err(format!("surface preferences: {e}"));
+                }
+                let (reply, fds) = match conn.recv_message() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        st.conn = None;
+                        st.connect_attempted = false;
+                        return Err(e.to_string());
+                    }
+                };
                 close_fds(&fds);
                 if let Message::Error { message, .. } = reply { return Err(message); }
             }
@@ -1582,6 +1719,45 @@ pub unsafe extern "C" fn eglChooseConfig(
             pair[1] = EGL_PBUFFER_BIT;
         }
     }
+    // Mesa Intel/AMD surfaceless displays include RGB565 configs that games like
+    // SDL3 pick by mistake when attrs omit alpha/bits or ask for >= 5 bits.
+    // Try an explicit RGBA8888 preference first, falling back to `exact`/`relaxed`.
+    let mut rgba8 = Vec::with_capacity(exact.len() + 10);
+    let (mut has_r, mut has_g, mut has_b, mut has_a) = (false, false, false, false);
+    for pair in exact.chunks(2) {
+        if pair.len() < 2 {
+            break;
+        }
+        let k = pair[0];
+        let mut v = pair[1];
+        match k {
+            0x3020 if v > 0 && v < 32 => v = 32,
+            0x3024 => {
+                has_r = true;
+                if v < 8 { v = 8; }
+            }
+            0x3023 => {
+                has_g = true;
+                if v < 8 { v = 8; }
+            }
+            0x3022 => {
+                has_b = true;
+                if v < 8 { v = 8; }
+            }
+            0x3021 => {
+                has_a = true;
+                if v < 8 { v = 8; }
+            }
+            _ => {}
+        }
+        rgba8.extend([k, v]);
+    }
+    if !has_r { rgba8.extend([0x3024, 8]); }
+    if !has_g { rgba8.extend([0x3023, 8]); }
+    if !has_b { rgba8.extend([0x3022, 8]); }
+    if !has_a { rgba8.extend([0x3021, 8]); }
+    rgba8.push(EGL_NONE);
+
     let mut relaxed = exact.clone();
     for pair in relaxed.chunks_mut(2) {
         if pair.len() == 2 && RELAXABLE.contains(&pair[0]) {
@@ -1601,8 +1777,12 @@ pub unsafe extern "C" fn eglChooseConfig(
         minimal[3] = exact[index * 2 + 1];
     }
 
-    let attempts: [(&str, &Vec<c_int>); 3] =
-        [("req", &exact), ("relaxed", &relaxed), ("minimal", &minimal)];
+    let attempts: [(&str, &Vec<c_int>); 4] = [
+        ("rgba8", &rgba8),
+        ("req", &exact),
+        ("relaxed", &relaxed),
+        ("minimal", &minimal),
+    ];
 
     let mut last = EGL_FALSE;
     for (label, list) in attempts {
@@ -1632,6 +1812,12 @@ pub unsafe extern "C" fn eglGetConfigAttrib(
     attribute: c_int,
     value: *mut c_int,
 ) -> u32 {
+    const EGL_NATIVE_VISUAL_ID: c_int = 0x302E;
+    const WINDOW_FORMAT_RGBA_8888: c_int = 1;
+    if attribute == EGL_NATIVE_VISUAL_ID && !value.is_null() {
+        *value = WINDOW_FORMAT_RGBA_8888;
+        return EGL_TRUE;
+    }
     match host() {
         // SAFETY: forwarded verbatim.
         Ok(host) => (host.get_config_attrib)(dpy, config, attribute, value),
@@ -2010,6 +2196,25 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *mut c_void {
     // the host's copies reject our offscreen surfaces with `EGL_BAD_DISPLAY`.
     let requested = std::ffi::CStr::from_ptr(name).to_bytes();
     let ours: &[(&[u8], *mut c_void)] = &[
+        (b"eglGetDisplay", eglGetDisplay as *mut c_void),
+        (b"eglGetPlatformDisplay", eglGetPlatformDisplay as *mut c_void),
+        (b"eglGetPlatformDisplayEXT", eglGetPlatformDisplayEXT as *mut c_void),
+        (b"eglInitialize", eglInitialize as *mut c_void),
+        (b"eglTerminate", eglTerminate as *mut c_void),
+        (b"eglGetError", eglGetError as *mut c_void),
+        (b"eglQueryString", eglQueryString as *mut c_void),
+        (b"eglChooseConfig", eglChooseConfig as *mut c_void),
+        (b"eglGetConfigAttrib", eglGetConfigAttrib as *mut c_void),
+        (b"eglCreateContext", eglCreateContext as *mut c_void),
+        (b"eglDestroyContext", eglDestroyContext as *mut c_void),
+        (b"eglMakeCurrent", eglMakeCurrent as *mut c_void),
+        (b"eglGetCurrentContext", eglGetCurrentContext as *mut c_void),
+        (b"eglGetCurrentDisplay", eglGetCurrentDisplay as *mut c_void),
+        (b"eglGetCurrentSurface", eglGetCurrentSurface as *mut c_void),
+        (b"eglBindAPI", eglBindAPI as *mut c_void),
+        (b"eglQueryAPI", eglQueryAPI as *mut c_void),
+        (b"eglSwapInterval", eglSwapInterval as *mut c_void),
+        (b"eglCreatePbufferSurface", eglCreatePbufferSurface as *mut c_void),
         (b"eglSetDamageRegionKHR", eglSetDamageRegionKHR as *mut c_void),
         (b"eglSwapBuffersWithDamageKHR", eglSwapBuffersWithDamageKHR as *mut c_void),
         (b"eglSurfaceAttrib", eglSurfaceAttrib as *mut c_void),
@@ -2023,6 +2228,13 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *mut c_void {
         (b"eglDestroyImageKHR", eglDestroyImageKHR as *mut c_void),
         (b"eglCreateImage", eglCreateImage as *mut c_void),
         (b"eglDestroyImage", eglDestroyImage as *mut c_void),
+        (b"eglCreateSyncKHR", eglCreateSyncKHR as *mut c_void),
+        (b"eglDestroySyncKHR", eglDestroySyncKHR as *mut c_void),
+        (b"eglClientWaitSyncKHR", eglClientWaitSyncKHR as *mut c_void),
+        (b"eglWaitSyncKHR", eglWaitSyncKHR as *mut c_void),
+        (b"eglGetSyncAttribKHR", eglGetSyncAttribKHR as *mut c_void),
+        (b"eglDupNativeFenceFDANDROID", eglDupNativeFenceFDANDROID as *mut c_void),
+        (b"eglPresentationTimeANDROID", eglPresentationTimeANDROID as *mut c_void),
     ];
     for (symbol, ptr) in ours {
         if requested == *symbol {
@@ -2153,6 +2365,17 @@ pub unsafe extern "C" fn eglDestroySurface(_dpy: EGLDisplay, surface: EGLSurface
         CURRENT_SURFACE.with(|c| if c.get() == surface as usize { c.set(0) });
         let mut st = lock_state();
         let rec = &mut *(surface as *mut SurfaceRec);
+        if let Ok(h) = host() {
+            if h.get_current_context.is_some_and(|cur| !cur().is_null()) {
+                if let Some(del_rb) = h.gl_delete_renderbuffers {
+                    for target in &rec.targets {
+                        if target.depth_rbo != 0 {
+                            del_rb(1, &target.depth_rbo);
+                        }
+                    }
+                }
+            }
+        }
         if let Err(e) = destroy_daemon_surface(&mut st, rec) {
             eprintln!("[pengudroid-gleshim] {e}");
         }
@@ -2553,6 +2776,15 @@ pub unsafe extern "C" fn eglGetPlatformDisplay(
     eglGetDisplay(native_display)
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn eglGetPlatformDisplayEXT(
+    platform: u32,
+    native_display: *mut c_void,
+    _attribs: *const c_int,
+) -> EGLDisplay {
+    eglGetPlatformDisplay(platform, native_display, std::ptr::null())
+}
+
 /// `eglQueryAPI()` — EGL 1.5. The shim only ever binds OpenGL ES.
 #[no_mangle]
 pub unsafe extern "C" fn eglQueryAPI() -> u32 {
@@ -2569,6 +2801,264 @@ pub unsafe extern "C" fn eglQueryAPI() -> u32 {
 /// the surface is a synchronous offscreen FBO.
 #[export_name = "_Z13eglBeginFramePvS_"]
 pub unsafe extern "C" fn eglBeginFrame(_dpy: EGLDisplay, _surface: EGLSurface) {}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn mangohud_config_value(key: &str) -> Option<String> {
+    let raw = std::env::var("MANGOHUD_CONFIG").ok()?;
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item == key {
+            return Some(String::new());
+        }
+        if let Some((k, v)) = item.split_once('=') {
+            if k.trim() == key {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn mangohud_enabled() -> bool {
+    if mangohud_config_value("no_display").is_some() {
+        return false;
+    }
+    env_truthy("PENGUDROID_FPS_METER")
+        || env_truthy("MANGOHUD")
+        || std::env::var_os("MANGOHUD_CONFIG").is_some_and(|v| !v.is_empty())
+}
+
+struct MangoHudStats {
+    last_frame: std::time::Instant,
+    window_start: std::time::Instant,
+    frames: u32,
+    fps: f32,
+    last_ms: f32,
+    history: [f32; 24],
+    cursor: usize,
+}
+
+fn record_mangohud_sample(surface: usize) -> (u32, f32, [f32; 24], usize) {
+    use std::time::Instant;
+    static STATS: OnceLock<Mutex<std::collections::HashMap<usize, MangoHudStats>>> =
+        OnceLock::new();
+    let now = Instant::now();
+    let mut map = STATS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 64 {
+        map.clear();
+    }
+    let entry = map.entry(surface).or_insert_with(|| MangoHudStats {
+        last_frame: now,
+        window_start: now,
+        frames: 0,
+        fps: 60.0,
+        last_ms: 16.7,
+        history: [16.7; 24],
+        cursor: 0,
+    });
+    let dt_ms = (now.duration_since(entry.last_frame).as_secs_f32() * 1000.0).clamp(0.1, 250.0);
+    entry.last_frame = now;
+    entry.last_ms = dt_ms;
+    entry.history[entry.cursor] = dt_ms;
+    entry.cursor = (entry.cursor + 1) % entry.history.len();
+    entry.frames += 1;
+    let elapsed = now.duration_since(entry.window_start).as_secs_f32();
+    if elapsed >= 0.5 {
+        entry.fps = entry.frames as f32 / elapsed;
+        entry.frames = 0;
+        entry.window_start = now;
+    } else if entry.fps <= 0.0 {
+        entry.fps = 1000.0 / dt_ms;
+    }
+    (entry.fps.round().clamp(0.0, 9999.0) as u32, entry.last_ms, entry.history, entry.cursor)
+}
+
+fn glyph_3x5(ch: char) -> [u8; 5] {
+    match ch.to_ascii_uppercase() {
+        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
+        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
+        'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
+        'G' => [0b111, 0b100, 0b101, 0b101, 0b111],
+        'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
+        'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
+        'N' => [0b111, 0b101, 0b101, 0b101, 0b101],
+        'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        'P' => [0b111, 0b101, 0b111, 0b100, 0b100],
+        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        '.' => [0b000, 0b000, 0b000, 0b000, 0b010],
+        ':' => [0b000, 0b010, 0b000, 0b010, 0b000],
+        _ => [0; 5],
+    }
+}
+
+/// Render an in-frame MangoHud-style performance overlay into the surface FBO.
+///
+/// Uses `glScissor` + `glClear` so it works identically on GLES 1/2/3 without
+/// disturbing shader programs, vertex arrays, or texture bindings.
+unsafe fn draw_mangohud_overlay(surface: EGLSurface, host: &Host) {
+    if !mangohud_enabled() {
+        return;
+    }
+    let rec = &*(surface as *const SurfaceRec);
+    if rec.w < 240 || rec.h < 120 {
+        return;
+    }
+    let (
+        Some(enable),
+        Some(disable),
+        Some(is_enabled),
+        Some(scissor),
+        Some(clear_color),
+        Some(clear),
+        Some(get_int),
+        Some(get_float),
+        Some(get_bool),
+        Some(color_mask),
+    ) = (
+        host.gl_enable,
+        host.gl_disable,
+        host.gl_is_enabled,
+        host.gl_scissor,
+        host.gl_clear_color,
+        host.gl_clear,
+        host.gl_get_integerv,
+        host.gl_get_floatv,
+        host.gl_get_booleanv,
+        host.gl_color_mask,
+    )
+    else {
+        return;
+    };
+
+    let (fps, ms, history, cursor) = record_mangohud_sample(surface as usize);
+    let was_scissor = is_enabled(GL_SCISSOR_TEST) != 0;
+    let mut prev_box = [0i32; 4];
+    get_int(GL_SCISSOR_BOX, prev_box.as_mut_ptr());
+    let mut prev_clear = [0f32; 4];
+    get_float(GL_COLOR_CLEAR_VALUE, prev_clear.as_mut_ptr());
+    let mut prev_mask = [1u8; 4];
+    get_bool(GL_COLOR_WRITEMASK, prev_mask.as_mut_ptr());
+
+    enable(GL_SCISSOR_TEST);
+    color_mask(1, 1, 1, 1);
+
+    let w = rec.w as i32;
+    let h = rec.h as i32;
+    let flipped = std::env::var_os("PENGUDROID_NO_PRESENT_FLIP").is_none();
+    let scale: i32 = if rec.w >= 1600 { 3 } else { 2 };
+    let line1 = format!("MANGOHUD {fps:3} FPS");
+    let line2 = format!("MESA {ms:5.1} MS");
+    let chars = line1.len().max(line2.len()) as i32;
+    let pad = 4 * scale;
+    let char_step = 4 * scale;
+    let box_w = (chars * char_step + pad * 2).min(w - 16);
+    let graph_h = 8 * scale;
+    let box_h = (5 * scale) * 2 + 4 * scale + graph_h + pad * 2;
+    let pos = mangohud_config_value("position").unwrap_or_default();
+    let margin = 12;
+    let box_x = if pos.contains("right") { (w - box_w - margin).max(4) } else { margin };
+    let box_y = if pos.contains("bottom") { (h - box_h - margin).max(4) } else { margin };
+
+    let fill_rect = |sx: i32, sy: i32, rw: i32, rh: i32, r: f32, g: f32, b: f32| {
+        if rw <= 0 || rh <= 0 {
+            return;
+        }
+        let gl_y = if flipped { h - sy - rh } else { sy };
+        scissor(sx.clamp(0, w), gl_y.clamp(0, h), rw, rh);
+        clear_color(r, g, b, 1.0);
+        clear(GL_COLOR_BUFFER_BIT);
+    };
+
+    let draw_text = |text: &str, tx: i32, ty: i32, r: f32, g: f32, b: f32| {
+        clear_color(r, g, b, 1.0);
+        for (idx, ch) in text.chars().enumerate() {
+            let rows = glyph_3x5(ch);
+            let gx = tx + idx as i32 * char_step;
+            for (ry, bits) in rows.iter().enumerate() {
+                for rx in 0..3i32 {
+                    if (bits >> (2 - rx)) & 1 != 0 {
+                        let px = gx + rx * scale;
+                        let py = ty + ry as i32 * scale;
+                        let gl_y = if flipped { h - py - scale } else { py };
+                        scissor(px.clamp(0, w), gl_y.clamp(0, h), scale, scale);
+                        clear(GL_COLOR_BUFFER_BIT);
+                    }
+                }
+            }
+        }
+    };
+
+    // Panel backdrop + left MangoHud orange accent strip
+    fill_rect(box_x, box_y, box_w, box_h, 0.06, 0.07, 0.09);
+    fill_rect(box_x, box_y, scale + 1, box_h, 0.96, 0.45, 0.12);
+
+    let (fps_r, fps_g, fps_b) = if fps >= 50 {
+        (0.45, 0.95, 0.45)
+    } else if fps >= 30 {
+        (0.98, 0.78, 0.25)
+    } else {
+        (0.96, 0.30, 0.30)
+    };
+    draw_text(&line1, box_x + pad, box_y + pad, fps_r, fps_g, fps_b);
+    draw_text(
+        &line2,
+        box_x + pad,
+        box_y + pad + 7 * scale,
+        0.55,
+        0.86,
+        0.98,
+    );
+
+    // Mini frametime graph along bottom of HUD card
+    let gx0 = box_x + pad;
+    let gy0 = box_y + box_h - pad - graph_h;
+    let bar_w = ((box_w - pad * 2) / history.len() as i32).max(2);
+    for i in 0..history.len() {
+        let sample = history[(cursor + i) % history.len()];
+        let bh = ((sample / 33.3) * graph_h as f32).round().clamp(1.0, graph_h as f32) as i32;
+        let (br, bg, bb) = if sample <= 18.5 {
+            (0.35, 0.85, 0.45)
+        } else if sample <= 34.0 {
+            (0.95, 0.72, 0.22)
+        } else {
+            (0.92, 0.28, 0.28)
+        };
+        fill_rect(
+            gx0 + i as i32 * bar_w,
+            gy0 + (graph_h - bh),
+            (bar_w - 1).max(1),
+            bh,
+            br,
+            bg,
+            bb,
+        );
+    }
+
+    color_mask(prev_mask[0], prev_mask[1], prev_mask[2], prev_mask[3]);
+    clear_color(prev_clear[0], prev_clear[1], prev_clear[2], prev_clear[3]);
+    scissor(prev_box[0], prev_box[1], prev_box[2], prev_box[3]);
+    if !was_scissor {
+        disable(GL_SCISSOR_TEST);
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -> u32 {
@@ -2600,6 +3090,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         log_once(format_args!("eglSwapBuffers: {e}"));
         return EGL_FALSE;
     }
+    draw_mangohud_overlay(surface, host);
     if let Some(finish) = host.gl_finish {
         finish();
     }
@@ -2636,7 +3127,10 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         }
         Err(e) => {
             log_once(format_args!("eglSwapBuffers: {e}"));
-            EGL_FALSE
+            // Transient daemon timeouts/reconnects must not make SDL3/hwui tear
+            // down the entire rendering context; next swap will reconnect.
+            pace_swap(surface as usize);
+            EGL_TRUE
         }
     }
 }
@@ -2683,6 +3177,9 @@ fn pace_swap(surface: usize) {
         std::env::var("PENGUDROID_MAX_FPS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
+            .or_else(|| {
+                mangohud_config_value("fps_limit").and_then(|v| v.parse().ok())
+            })
             .unwrap_or(60)
     });
     let Some(gap) = frame_gap_micros(max_fps) else { return };

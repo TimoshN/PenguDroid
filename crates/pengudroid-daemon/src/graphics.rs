@@ -1037,7 +1037,7 @@ mod imp {
             let Some(surface) = self.state.surfaces.get_mut(&id) else { return false };
             surface.fps_meter = enabled;
             let title = surface.title.clone();
-            if !enabled { self.state.update_frame_title(id, title); }
+            self.state.update_frame_title(id, title);
             let _ = self.conn.flush();
             true
         }
@@ -1055,11 +1055,10 @@ mod imp {
             entry.0 += 1;
             let elapsed = now.duration_since(entry.1).as_secs_f32();
             if elapsed >= 1.0 {
-                let fps = entry.0 as f32 / elapsed;
+                let _fps = entry.0 as f32 / elapsed;
                 entry.0 = 0; entry.1 = now;
-                let title = format!("{} · {fps:.0} FPS", root.title);
-                self.state.update_frame_title(parent, title);
-                let _ = self.conn.flush();
+                // FPS meter overlay is rendered in-frame via MangoHud (`MANGOHUD=1`),
+                // leaving the window title clean.
             }
         }
 

@@ -1,18 +1,14 @@
 //! Native Linux input for PenguDroid.
 //!
-//! Two halves, both talking to the kernel rather than to a toolkit:
-//!
-//! * [`uinput`] creates virtual devices and injects real input events. This is
-//!   how a touch reaches a game that reads input the way a device does — its own
-//!   `AInputQueue`, an SDL2/Unity/Unreal loop, or a compositor — instead of
-//!   relying on the app's Java view tree.
-//! * [`keymap`] stores per-package key bindings and turns them into gestures, so
-//!   a keyboard can drive a game that only understands a touchscreen.
-//!
-//! [`presets`] holds built-in keymaps for games whose touch layout is known.
-//!
-//! [`mapper`] joins the two: it reads a physical keyboard through `evdev` and
-//! replays each bound key as a touch on the virtual panel.
+//! * [`uinput`] provides kernel `/dev/uinput` virtual devices (`VirtualTouch`,
+//!   `VirtualGamepad`, `VirtualKeyboard`) and evdev readers (`KernelTouchReader`,
+//!   `GamepadEventReader`, `EventReader`) so touch and Xbox 360 gamepad input
+//!   pass through real native Linux input calls across all apps.
+//! * [`keymap`] stores per-package Keyboard/Mouse <-> Xbox 360 Gamepad
+//!   bindings (no keymapper-to-touch synthesis).
+//! * [`presets`] holds built-in Xbox 360 PC-style control presets.
+//! * [`mapper`] translates physical keyboards/gamepads through a `Keymap` onto
+//!   kernel `uinput` devices.
 
 pub mod keymap;
 pub mod mapper;
@@ -20,6 +16,9 @@ pub mod presets;
 pub mod uinput;
 pub mod xkb;
 
-pub use keymap::{Action, Binding, Dir, Keymap};
+pub use keymap::{Action, Binding, Dir, GamepadButton, Keymap};
 pub use mapper::KeyMapper;
-pub use uinput::{EventReader, InputEvent, VirtualKeyboard, VirtualTouch};
+pub use uinput::{
+    EventReader, GamepadEventReader, GamepadHostEvent, InputEvent, KernelTouchEvent,
+    KernelTouchPhase, KernelTouchReader, VirtualGamepad, VirtualKeyboard, VirtualTouch,
+};

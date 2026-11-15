@@ -971,6 +971,10 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot install the Android virtual keyboard");
         return false;
     }
+    if install_virtual_gamepad(env).is_none() {
+        env.exception_check();
+        eprintln!("apphost: warning: could not install the virtual Xbox 360 gamepad");
+    }
     if install_system_features_cache(env).is_none() {
         eprintln!("apphost: cannot initialize the framework system feature cache");
         return false;
@@ -4788,15 +4792,8 @@ fn spawn_input_pump(env: &JniEnv) {
             eprintln!("apphost: input pump: dispatchInputEvent not found");
             return;
         };
-        // `MotionEvent.setAxisValue` does not exist in this framework (only the
-        // `getAxisValue` accessors do), so a wheel delta cannot be attached to a
-        // synthesized event. `PointerAxis` is therefore dropped instead of
-        // dispatching a scroll with a zero delta — which would look like the app
-        // ignoring the wheel anyway. A real fix needs either that hidden setter or
-        // an `InputManager.injectInputEvent` path.
-        let set_axis_value: Option<JMethodId> = None;
-        // Resolved up front, used only when a keymap is active (see below).
         let multi_touch = MultiTouchJni::resolve(&env, motion_class);
+        let gamepad_jni = GamepadJni::resolve(&env);
         let Some(key_class) = env.find_class("android/view/KeyEvent") else {
             return;
         };
@@ -4811,18 +4808,21 @@ fn spawn_input_pump(env: &JniEnv) {
         const ACTION_MOVE: i32 = 2;
         const ACTION_HOVER_MOVE: i32 = 7;
         const ACTION_SCROLL: i32 = 8;
+        const SOURCE_KEYBOARD: i32 = 0x101;
+        const SOURCE_GAMEPAD: i32 = 0x401 | 0x101;
+        const SOURCE_JOYSTICK: i32 = 0x0100_0010;
+        const GAMEPAD_DEVICE_ID: i32 = 2;
 
         let mut keyboard = crate::keyboard::Keyboard::default();
         // Bound keys pressed while a text field had focus: their releases
         // must reach the field too, not the keymap.
         let mut typed_past_keymap: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut down_time = 0i64;
+        let down_time = 0i64;
         let mut pressed = false;
         let mut last = (0.0f32, 0.0f32);
         let mut buf = [0u8; 16];
 
-        // Deliver to the focused visible root only. Broadcasting one tap to all
-        // roots also clicks the stopped Activity underneath a new one.
+        // Deliver a single-pointer event (`TOOL_TYPE_FINGER` for touch, `ACTION_HOVER_MOVE` via 6-arg).
         let inject = |action: i32, x: f32, y: f32, down_time: i64| {
             let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
                 return;
@@ -4836,9 +4836,21 @@ fn spawn_input_pump(env: &JniEnv) {
                 println!("input: synthetic action={action} at {x:.0},{y:.0} -> {count} root(s)");
             }
             let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else { return; };
-            {
-                let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
-                let Some(event) = env.call_static_object(
+            let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+            let event = if matches!(action, ACTION_DOWN | ACTION_UP | ACTION_MOVE) {
+                multi_touch.as_ref().and_then(|multi| {
+                    let frame = crate::keymap_gesture::Frame {
+                        action,
+                        starts_gesture: action == ACTION_DOWN,
+                        pointers: vec![crate::keymap_gesture::Pointer { id: 0, x, y }],
+                    };
+                    multi.obtain(&env, motion_class, &frame, down_time, now)
+                })
+            } else {
+                None
+            }
+            .or_else(|| {
+                env.call_static_object(
                     motion_class,
                     obtain,
                     &[
@@ -4849,18 +4861,16 @@ fn spawn_input_pump(env: &JniEnv) {
                         JValue { f: y },
                         JValue { i: 0 },
                     ],
-                ) else {
-                    return;
-                };
-                if event.is_null() {
-                    return;
+                )
+            });
+            if let Some(event) = event {
+                if !event.is_null() {
+                    env.call_void(root, dispatch, &[JValue { l: event }]);
                 }
-                env.call_void(root, dispatch, &[JValue { l: event }]);
             }
         };
 
-        // The same, but with a wheel delta attached: `setAxisValue` has to run on
-        // the instance that is actually dispatched, which is per-root.
+        // Mouse wheel scroll using `PointerCoords.setAxisValue(AXIS_VSCROLL = 9, delta)`.
         let inject_scroll = |x: f32, y: f32, delta: f32| {
             let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
                 return;
@@ -4878,28 +4888,26 @@ fn spawn_input_pump(env: &JniEnv) {
                     continue;
                 }
                 let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
-                let Some(event) = env.call_static_object(
-                    motion_class,
-                    obtain,
-                    &[
-                        JValue { j: now },
-                        JValue { j: now },
-                        JValue { i: ACTION_SCROLL },
-                        JValue { f: x },
-                        JValue { f: y },
-                        JValue { i: 0 },
-                    ],
-                ) else {
-                    continue;
-                };
-                if event.is_null() {
-                    continue;
+                let event = multi_touch.as_ref().and_then(|multi| {
+                    multi.obtain_single_axis(
+                        &env,
+                        motion_class,
+                        ACTION_SCROLL,
+                        x,
+                        y,
+                        0,
+                        0x2002, // SOURCE_MOUSE | SOURCE_CLASS_POINTER
+                        3,      // TOOL_TYPE_MOUSE
+                        &[(9, delta)],
+                        now,
+                        now,
+                    )
+                });
+                if let Some(event) = event {
+                    if !event.is_null() {
+                        env.call_void(root, dispatch, &[JValue { l: event }]);
+                    }
                 }
-                if let Some(set_axis) = set_axis_value {
-                    // AXIS_VSCROLL = 9.
-                    env.call_void(event, set_axis, &[JValue { i: 9 }, JValue { f: delta }]);
-                }
-                env.call_void(root, dispatch, &[JValue { l: event }]);
             }
         };
 
@@ -5029,84 +5037,66 @@ fn spawn_input_pump(env: &JniEnv) {
             }
         }
 
-        // Per-app keymap: a bound key becomes a gesture instead of a key press.
-        // The GUI writes this file, and a missing file simply means no mapping.
+        // Per-app keymap: Keyboard/Mouse <-> Xbox 360 Controller controls only.
+        // Touch is never synthesized from keys anymore; touch is routed natively
+        // through the Linux kernel input subsystem for all applications.
         let keymap = APP_PACKAGE.get().and_then(|package| {
-            // CLI launches keep automatic profile loading; the desktop launcher
-            // explicitly forwards the per-app checkbox, including its off state.
             if std::env::var_os("PENGUDROID_KEYMAPPER").as_deref() == Some(std::ffi::OsStr::new("0")) {
-                println!("input: keymap disabled for {package}");
+                println!("input: Xbox 360 keymapper disabled for {package}");
                 return None;
             }
-            // The launcher resolves the host path before the prefix overrides
-            // the guest's HOME; fall back to the documented location otherwise.
             let path = std::env::var_os("PENGUDROID_KEYMAP_PATH")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| pengudroid_input::keymap::keymap_path(package));
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                // No profile of the user's own: fall back to the built-in one
-                // for this game, laid out for the current display.
-                let (w, h) = (surface_w(), surface_h());
-                let map = pengudroid_input::presets::for_package(package, w as f32, h as f32)?;
-                println!(
-                    "input: built-in keymap for {package} at {w}x{h} ({} binding(s)); \
-                     save your own to {} to replace it",
-                    map.bindings.len(),
-                    path.display()
-                );
-                return Some(map);
-            };
-            match pengudroid_input::keymap::Keymap::parse(&text) {
-                Ok(map) if !map.bindings.is_empty() => {
-                    println!(
-                        "input: keymap {} ({} binding(s))",
-                        path.display(),
-                        map.bindings.len()
-                    );
-                    Some(map)
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    // A typo must be visible, not silently ignored: the user
-                    // would otherwise think the mapping is broken.
-                    eprintln!("input: keymap {} ignored: {e}", path.display());
-                    None
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                match pengudroid_input::keymap::Keymap::parse(&text) {
+                    Ok(map) if !map.bindings.is_empty() => {
+                        println!(
+                            "input: keymap {} ({} Xbox/PC binding(s))",
+                            path.display(),
+                            map.bindings.len()
+                        );
+                        return Some(map);
+                    }
+                    Ok(_) => return None,
+                    Err(e) => {
+                        eprintln!("input: keymap {} ignored: {e}", path.display());
+                        return None;
+                    }
                 }
             }
+            let (w, h) = (surface_w(), surface_h());
+            if let Some(map) = pengudroid_input::presets::for_package(package, w as f32, h as f32) {
+                println!(
+                    "input: built-in Xbox 360 keymap for {package} ({} binding(s))",
+                    map.bindings.len()
+                );
+                return Some(map);
+            }
+            if std::env::var_os("PENGUDROID_KEYMAPPER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+                let map = pengudroid_input::presets::default_xbox_pc_preset();
+                println!(
+                    "input: default PC Xbox 360 keymap active for {package} ({} binding(s))",
+                    map.bindings.len()
+                );
+                return Some(map);
+            }
+            None
         });
-        let mut mapped_held = crate::keymap_gesture::HeldPoints::default();
-        // With a keymap the mouse and every mapped key are separate fingers of
-        // one multi-pointer stream: walking (a joystick), turning the camera
-        // (the mouse) and pressing a skill overlap, and Android has a single
-        // event stream per window. Without a keymap nothing overlaps, so the
-        // long-verified single-pointer path stays exactly as it was.
-        // `PENGUDROID_LEGACY_TOUCH=1` forces that path even with a keymap, at
-        // the cost of one finger at a time.
-        let multi_touch = multi_touch.filter(|_| {
-            keymap.is_some() && std::env::var_os("PENGUDROID_LEGACY_TOUCH").is_none()
-        });
-        if keymap.is_some() {
-            println!(
-                "input: mapped touches are {}",
-                if multi_touch.is_some() { "multi-pointer" } else { "single-pointer (legacy)" }
-            );
-        }
+
         let touch_state = std::cell::RefCell::new(crate::keymap_gesture::TouchState::default());
-        // `downTime` of the gesture in progress: taken at the first finger and
-        // kept until the last one lifts.
         let gesture_down = std::cell::Cell::new(0i64);
-        let send_touch = |event: crate::keymap_gesture::Event| {
-            use crate::keymap_gesture::Event;
+        let deliver_touch_event = |event: crate::keymap_gesture::TouchEvent| {
+            use crate::keymap_gesture::TouchEvent;
             let Some(multi) = &multi_touch else {
-                // One finger at a time: the pointer id is irrelevant.
                 match event {
-                    Event::Down { x, y, .. } => {
+                    TouchEvent::Down { x, y, .. } => {
                         gesture_down
                             .set(env.call_static_long(clock_class, uptime, &[]).unwrap_or(0));
                         inject(ACTION_DOWN, x, y, gesture_down.get());
                     }
-                    Event::Move { x, y, .. } => inject(ACTION_MOVE, x, y, gesture_down.get()),
-                    Event::Up { x, y, .. } => inject(ACTION_UP, x, y, gesture_down.get()),
+                    TouchEvent::Move { x, y, .. } => inject(ACTION_MOVE, x, y, gesture_down.get()),
+                    TouchEvent::Up { x, y, .. } => inject(ACTION_UP, x, y, gesture_down.get()),
                 }
                 return;
             };
@@ -5132,7 +5122,7 @@ fn spawn_input_pump(env: &JniEnv) {
             };
             if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
                 println!(
-                    "input: touch action={:#x} pointers={:?}",
+                    "input: kernel touch action={:#x} pointers={:?}",
                     frame.action, frame.pointers
                 );
             }
@@ -5140,6 +5130,81 @@ fn spawn_input_pump(env: &JniEnv) {
                 env.call_void(root, dispatch, &[JValue { l: event }]);
             }
         };
+
+        // Universal native kernel touch setup:
+        // 1. Open all hardware kernel touchscreens via `/dev/input/event*`.
+        // 2. Try creating our own `/dev/uinput` `VirtualTouch` + opening its
+        //    kernel node via `KernelTouchReader` so even pointer touches round-trip
+        //    through the Linux kernel input subsystem across every Android app.
+        let mut virtual_touch = pengudroid_input::VirtualTouch::create(
+            "PenguDroid Kernel Touch",
+            surface_w().max(1) as u32,
+            surface_h().max(1) as u32,
+        )
+        .ok();
+        let mut kernel_touch_readers: Vec<(pengudroid_input::KernelTouchReader, bool)> = Vec::new();
+        let mut exclude_touch_nodes = Vec::new();
+        let mut vtouch_kernel_loopback = false;
+        if let Some(node) = virtual_touch.as_ref().and_then(|vt| vt.node().map(|p| p.to_path_buf())) {
+            exclude_touch_nodes.push(node.clone());
+            if let Ok(reader) = pengudroid_input::KernelTouchReader::open(&node) {
+                kernel_touch_readers.push((reader, true));
+                vtouch_kernel_loopback = true;
+                println!("input: native kernel uinput touch active ({})", node.display());
+            }
+        }
+        for path in pengudroid_input::uinput::touchscreens(&exclude_touch_nodes) {
+            if let Ok(reader) = pengudroid_input::KernelTouchReader::open(&path) {
+                println!("input: hardware kernel touchscreen active ({})", path.display());
+                kernel_touch_readers.push((reader, false));
+            }
+        }
+
+        let mut drain_kernel_touches = || {
+            let (sw, sh) = (surface_w().max(1) as f32, surface_h().max(1) as f32);
+            for (reader, _is_virtual) in kernel_touch_readers.iter_mut() {
+                let Ok(events) = reader.drain() else { continue };
+                for kev in events {
+                    let id = if kev.slot == 0 {
+                        crate::keymap_gesture::MOUSE_POINTER
+                    } else {
+                        100 + kev.slot
+                    };
+                    let x = kev.norm_x * sw;
+                    let y = kev.norm_y * sh;
+                    let te = match kev.phase {
+                        pengudroid_input::KernelTouchPhase::Down => {
+                            crate::keymap_gesture::TouchEvent::Down { id, x, y }
+                        }
+                        pengudroid_input::KernelTouchPhase::Move => {
+                            crate::keymap_gesture::TouchEvent::Move { id, x, y }
+                        }
+                        pengudroid_input::KernelTouchPhase::Up => {
+                            crate::keymap_gesture::TouchEvent::Up { id, x, y }
+                        }
+                    };
+                    deliver_touch_event(te);
+                }
+            }
+        };
+
+        let mut virtual_gamepad =
+            pengudroid_input::VirtualGamepad::create("Microsoft X-Box 360 pad").ok();
+        let mut exclude_pad_nodes = Vec::new();
+        if let Some(node) = virtual_gamepad.as_ref().and_then(|vp| vp.node().map(|p| p.to_path_buf())) {
+            println!("input: native kernel uinput Xbox 360 gamepad ({})", node.display());
+            exclude_pad_nodes.push(node);
+        }
+        let mut physical_gamepads: Vec<pengudroid_input::GamepadEventReader> =
+            pengudroid_input::uinput::gamepads(&exclude_pad_nodes)
+                .into_iter()
+                .filter_map(|p| {
+                    let r = pengudroid_input::GamepadEventReader::open(&p).ok()?;
+                    println!("input: physical gamepad connected ({})", p.display());
+                    Some(r)
+                })
+                .collect();
+
         // Mouse-look needs the compositor to lock the pointer; the gleshim
         // owns the daemon connection, so the request goes through it.
         let pointer_lock: Option<unsafe extern "C" fn(i32) -> i32> = {
@@ -5151,25 +5216,125 @@ fn spawn_input_pump(env: &JniEnv) {
             };
             (!sym.is_null()).then(|| unsafe { std::mem::transmute(sym) })
         };
-        // Whether the pointer is locked right now, as far as this side knows.
         let mut pointer_locked = false;
         let mut last_look_motion = std::time::Instant::now();
-        // How long the mouse must rest before the camera finger is lifted.
-        const LOOK_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
-        // Run a mapped binding for a key or mouse-button edge.
-        let run_binding = |action: &pengudroid_input::keymap::Action,
-                           code: u16,
-                           pressed: bool,
-                           held: &mut crate::keymap_gesture::HeldPoints| {
-            let gesture_steps = crate::keymap_gesture::steps(action, code, pressed, held);
-            if !gesture_steps.is_empty() && std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
-                println!("input: keymap code={code} -> {} touch step(s)", gesture_steps.len());
+        const LOOK_IDLE: std::time::Duration = std::time::Duration::from_millis(60);
+        let mut gamepad_state = crate::keymap_gesture::GamepadState::default();
+        let mut pad_down_times: std::collections::HashMap<i32, i64> =
+            std::collections::HashMap::new();
+        let mut sdl_joystick_registered = false;
+
+        let dispatch_android_key = |kb: &mut crate::keyboard::Keyboard, linux_code: u16, is_down: bool| {
+            let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+            let Some(key) = kb.event(linux_code as u32, is_down, now) else {
+                return;
+            };
+            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+                return;
+            };
+            let roots = env.object_field(wmg, roots_field);
+            if roots.is_null() {
+                return;
             }
-            for step in gesture_steps {
-                if step.delay_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(step.delay_ms));
+            println!("input: key code={} pressed={} android={} meta={:#x}",
+                linux_code, is_down, key.code, key.meta);
+            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else {
+                return;
+            };
+            if let Some(event) = env.new_object(key_class, key_ctor, &[
+                JValue { j: key.down_time }, JValue { j: now },
+                JValue { i: key.action }, JValue { i: key.code },
+                JValue { i: key.repeat }, JValue { i: key.meta },
+                JValue { i: -1 },
+                JValue { i: linux_code as i32 }, JValue { i: 0 },
+                JValue { i: SOURCE_KEYBOARD },
+            ]) {
+                if !event.is_null() {
+                    env.call_void(root, dispatch, &[JValue { l: event }]);
                 }
-                send_touch(step.event);
+            }
+            if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                trace_key_target(&env, root, root_class);
+            }
+        };
+
+        let mut emit_gamepad_output = |out: crate::keymap_gesture::GamepadOutput,
+                                       kb: &mut crate::keyboard::Keyboard,
+                                       virtual_gamepad: &mut Option<pengudroid_input::VirtualGamepad>,
+                                       pad_down_times: &mut std::collections::HashMap<i32, i64>,
+                                       sdl_joystick_registered: &mut bool| {
+            let has_work = !out.pad_buttons.is_empty() || out.axes_changed || !out.key_events.is_empty();
+            if !has_work {
+                return;
+            }
+            if !*sdl_joystick_registered {
+                *sdl_joystick_registered = true;
+                gamepad_jni.ensure_sdl_joystick(&env);
+            }
+            if let Some(vpad) = virtual_gamepad.as_mut() {
+                let btns: Vec<(u16, bool)> =
+                    out.pad_buttons.iter().map(|&(b, d)| (b.linux_code(), d)).collect();
+                let _ = vpad.emit_state(
+                    &btns,
+                    out.axes.lx,
+                    out.axes.ly,
+                    out.axes.rx,
+                    out.axes.ry,
+                    out.axes.lt,
+                    out.axes.rt,
+                    out.axes.hat_x,
+                    out.axes.hat_y,
+                );
+            }
+            for (target_code, is_down) in out.key_events {
+                dispatch_android_key(kb, target_code, is_down);
+            }
+            let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+            if let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) {
+                let roots = env.object_field(wmg, roots_field);
+                if !roots.is_null() {
+                    if let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) {
+                        for &(btn, is_down) in &out.pad_buttons {
+                            let acode = btn.android_keycode();
+                            let down_t = if is_down {
+                                *pad_down_times.entry(acode).or_insert(now)
+                            } else {
+                                pad_down_times.remove(&acode).unwrap_or(now)
+                            };
+                            let action = if is_down { ACTION_DOWN } else { ACTION_UP };
+                            if let Some(event) = env.new_object(key_class, key_ctor, &[
+                                JValue { j: down_t }, JValue { j: now },
+                                JValue { i: action }, JValue { i: acode },
+                                JValue { i: 0 }, JValue { i: 0 },
+                                JValue { i: GAMEPAD_DEVICE_ID },
+                                JValue { i: btn.linux_code() as i32 },
+                                JValue { i: 0 },
+                                JValue { i: SOURCE_GAMEPAD },
+                            ]) {
+                                if !event.is_null() {
+                                    env.call_void(root, dispatch, &[JValue { l: event }]);
+                                }
+                            }
+                            gamepad_jni.notify_sdl_button(&env, GAMEPAD_DEVICE_ID, acode, is_down);
+                        }
+                        if out.axes_changed {
+                            if let Some(multi) = &multi_touch {
+                                if let Some(motion) = gamepad_jni.obtain_axes_event(
+                                    &env,
+                                    motion_class,
+                                    multi,
+                                    &out.axes,
+                                    GAMEPAD_DEVICE_ID,
+                                    SOURCE_JOYSTICK,
+                                    now,
+                                ) {
+                                    env.call_void(root, dispatch, &[JValue { l: motion }]);
+                                }
+                            }
+                            gamepad_jni.notify_sdl_axes(&env, GAMEPAD_DEVICE_ID, &out.axes);
+                        }
+                    }
+                }
             }
         };
 
@@ -5222,10 +5387,36 @@ fn spawn_input_pump(env: &JniEnv) {
                 last_trace = std::time::Instant::now();
                 trace_surface_views(&env);
             }
+            drain_kernel_touches();
+            for reader in physical_gamepads.iter_mut() {
+                if let Ok(events) = reader.drain() {
+                    if !events.is_empty() {
+                        if let Some(_frame) = env.local_frame(64) {
+                            for ev in events {
+                                let out = gamepad_state.apply_physical_event(keymap.as_ref(), ev);
+                                emit_gamepad_output(
+                                    out,
+                                    &mut keyboard,
+                                    &mut virtual_gamepad,
+                                    &mut pad_down_times,
+                                    &mut sdl_joystick_registered,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if unsafe { poll(buf.as_mut_ptr()) } == 0 {
-                if mapped_held.look_finger_down() && last_look_motion.elapsed() >= LOOK_IDLE {
-                    for step in mapped_held.look_idle() {
-                        send_touch(step.event);
+                if gamepad_state.look_nonzero() && last_look_motion.elapsed() >= LOOK_IDLE {
+                    if let Some(_frame) = env.local_frame(64) {
+                        let out = gamepad_state.decay_look();
+                        emit_gamepad_output(
+                            out,
+                            &mut keyboard,
+                            &mut virtual_gamepad,
+                            &mut pad_down_times,
+                            &mut sdl_joystick_registered,
+                        );
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(8));
@@ -5244,16 +5435,13 @@ fn spawn_input_pump(env: &JniEnv) {
             }
             // Mouse wheel: Wayland's axis value is positive when scrolling down,
             // while `MotionEvent.AXIS_VSCROLL` is positive when scrolling up, so
-            // sign flips. This is what lets the user scroll a feed at all.
+            // sign flips.
             if tag == 5 && a as u8 == 0 {
                 inject_scroll(last.0, last.1, -b);
                 continue;
             }
             // Keyboard: `a` is the Linux keycode, `b` is 1 for press.
             if tag == 6 {
-                // While a text field has focus (a login form, chat, a WebView
-                // input) keys type, as with any keymapper: the press decides,
-                // and its release follows the same way.
                 let typing = keymap.as_ref().is_some_and(|m| m.action_for(a as u16).is_some()) && {
                     if b != 0.0 {
                         let roots = env.call_static_object(wmg_class, get_instance, &[])
@@ -5268,158 +5456,142 @@ fn spawn_input_pump(env: &JniEnv) {
                         typed_past_keymap.remove(&(a as u32))
                     }
                 };
-                // A bound key drives a touch gesture instead of the Android
-                // key. Consuming it here is what makes a touch-only game
-                // playable without also typing into the app.
                 if let Some(map) = keymap.as_ref().filter(|_| !typing) {
                     if let Some(action) = map.action_for(a as u16) {
-                        run_binding(action, a as u16, b != 0.0, &mut mapped_held);
-                        // A `look` binding toggles mouse-look; keep the
-                        // compositor's pointer lock in step with it.
-                        if mapped_held.look_active() != pointer_locked {
-                            let want = mapped_held.look_active();
+                        let out = gamepad_state.handle_key(action, a as u16, b != 0.0);
+                        if let Some(want) = out.look_active_changed {
                             let ok = pointer_lock
                                 .is_some_and(|lock| unsafe { lock(i32::from(want)) } != 0);
                             if want && !ok {
-                                // No lock means no relative motion: leaving
-                                // the mode on would only swallow the mouse.
-                                for step in mapped_held.look_cancel() {
-                                    send_touch(step.event);
-                                }
+                                let cancel_out = gamepad_state.cancel_look();
+                                emit_gamepad_output(
+                                    cancel_out,
+                                    &mut keyboard,
+                                    &mut virtual_gamepad,
+                                    &mut pad_down_times,
+                                    &mut sdl_joystick_registered,
+                                );
                                 eprintln!(
-                                    "input: mouse-look is unavailable (the compositor did not \
-                                     lock the pointer)"
+                                    "input: mouse-look is unavailable (the compositor did not lock the pointer)"
                                 );
                             } else {
                                 pointer_locked = want;
                                 println!("input: mouse-look {}", if want { "on" } else { "off" });
                                 if want && pressed {
-                                    // The left button was mid-drag as a touch;
-                                    // its release now belongs to mouse-look, so
-                                    // lift that finger here.
                                     pressed = false;
-                                    send_touch(crate::keymap_gesture::Event::Up {
-                                        id: crate::keymap_gesture::MOUSE_POINTER,
-                                        x: last.0,
-                                        y: last.1,
-                                    });
+                                    if let Some(vt) = virtual_touch.as_mut() {
+                                        let _ = vt.touch_up(0);
+                                    }
+                                    if !vtouch_kernel_loopback {
+                                        deliver_touch_event(crate::keymap_gesture::TouchEvent::Up {
+                                            id: crate::keymap_gesture::MOUSE_POINTER,
+                                            x: last.0,
+                                            y: last.1,
+                                        });
+                                    }
                                 }
                             }
                         }
+                        emit_gamepad_output(
+                            out,
+                            &mut keyboard,
+                            &mut virtual_gamepad,
+                            &mut pad_down_times,
+                            &mut sdl_joystick_registered,
+                        );
                         continue;
                     }
                 }
-                let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
-                let Some(key) = keyboard.event(a as u32, b != 0.0, now) else {
-                    continue;
-                };
-                let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
-                    continue;
-                };
-                let roots = env.object_field(wmg, roots_field);
-                if roots.is_null() {
-                    continue;
-                }
-                println!("input: key code={} pressed={} android={} meta={:#x}",
-                    a, b != 0.0, key.code, key.meta);
-                let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else {
-                    continue;
-                };
-                // Each window manager focus notification is queued on this
-                // root's main Handler before its input event. Without it VRI
-                // drops every physical key with "no window focus".
-                if let Some(event) = env.new_object(key_class, key_ctor, &[
-                    JValue { j: key.down_time }, JValue { j: now },
-                    JValue { i: key.action }, JValue { i: key.code },
-                    JValue { i: key.repeat }, JValue { i: key.meta },
-                    JValue { i: -1 }, // KeyCharacterMap.VIRTUAL_KEYBOARD
-                    JValue { i: a as i32 }, JValue { i: 0 },
-                    JValue { i: 0x101 }, // InputDevice.SOURCE_KEYBOARD
-                ]) {
-                    if !event.is_null() {
-                        env.call_void(root, dispatch, &[JValue { l: event }]);
-                    }
-                }
-                if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
-                    trace_key_target(&env, root, root_class);
-                }
+                dispatch_android_key(&mut keyboard, a as u16, b != 0.0);
                 continue;
             }
-            // Relative motion only arrives while the pointer is locked.
+            // Relative motion only arrives while mouse-look has the pointer locked.
             if tag == 7 {
                 last_look_motion = std::time::Instant::now();
-                for step in mapped_held.look_motion(a, b) {
-                    send_touch(step.event);
-                }
+                let out = gamepad_state.handle_look_motion(a, b);
+                emit_gamepad_output(
+                    out,
+                    &mut keyboard,
+                    &mut virtual_gamepad,
+                    &mut pad_down_times,
+                    &mut sdl_joystick_registered,
+                );
                 continue;
             }
-            // A mouse button other than the left one can carry a binding
-            // (`MOUSE_RIGHT = tap ...`); unbound, it is ignored as before. The
-            // left button is the touch itself — except in mouse-look, where
-            // there is no cursor to touch with and its binding applies.
-            // (A left-button binding pressed in mouse-look is also released
-            // through here if the mode was switched off while it was held.)
+            // Mapped mouse buttons -> Xbox 360 gamepad button / key.
             if tag == 4
-                && (a as u32 != 0x110 || mapped_held.look_active() || mapped_held.is_down(0x110))
+                && (a as u32 != 0x110 || pointer_locked || gamepad_state.is_down(0x110))
             {
                 if let Some(action) = keymap.as_ref().and_then(|m| m.action_for(a as u16)) {
-                    run_binding(action, a as u16, b != 0.0, &mut mapped_held);
+                    let out = gamepad_state.handle_key(action, a as u16, b != 0.0);
+                    emit_gamepad_output(
+                        out,
+                        &mut keyboard,
+                        &mut virtual_gamepad,
+                        &mut pad_down_times,
+                        &mut sdl_joystick_registered,
+                    );
                 }
                 continue;
             }
-            if multi_touch.is_some() {
-                // The mouse is finger 0 of the shared multi-pointer stream.
-                use crate::keymap_gesture::{Event, MOUSE_POINTER};
-                match tag {
-                    1 | 3 => {
-                        last = (a, b);
-                        if pressed {
-                            send_touch(Event::Move { id: MOUSE_POINTER, x: a, y: b });
-                        } else if touch_state.borrow().is_idle() {
-                            // A hover is its own stream; it may not interleave
-                            // with a touch gesture that is in progress.
-                            inject(ACTION_HOVER_MOVE, a, b, down_time);
-                        }
-                    }
-                    4 => {
-                        pressed = b != 0.0;
-                        let (x, y) = last;
-                        send_touch(if pressed {
-                            Event::Down { id: MOUSE_POINTER, x, y }
-                        } else {
-                            Event::Up { id: MOUSE_POINTER, x, y }
-                        });
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            let (action, x, y) = match tag {
+            // Universal touch routing via native Linux kernel input (`/dev/uinput`
+            // VirtualTouch -> KernelTouchReader -> Android SOURCE_TOUCHSCREEN),
+            // falling back cleanly to direct `deliver_touch_event` when `/dev/uinput`
+            // or `/dev/input/eventN` is inaccessible.
+            match tag {
                 1 | 3 => {
                     last = (a, b);
-                    (if pressed { ACTION_MOVE } else { ACTION_HOVER_MOVE }, a, b)
+                    if pressed {
+                        if let Some(vt) = virtual_touch.as_mut() {
+                            let _ = vt.touch_move(0, a, b);
+                        }
+                        if vtouch_kernel_loopback {
+                            drain_kernel_touches();
+                        } else {
+                            deliver_touch_event(crate::keymap_gesture::TouchEvent::Move {
+                                id: crate::keymap_gesture::MOUSE_POINTER,
+                                x: a,
+                                y: b,
+                            });
+                        }
+                    } else if touch_state.borrow().is_idle() {
+                        inject(ACTION_HOVER_MOVE, a, b, down_time);
+                    }
                 }
-                // BTN_LEFT (0x110) only; other buttons are ignored.
                 4 if a as u32 == 0x110 => {
-                    if b != 0.0 {
-                        pressed = true;
-                        down_time = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
-                        println!("input: tap DOWN at {:.0},{:.0}", last.0, last.1);
-                        (ACTION_DOWN, last.0, last.1)
+                    pressed = b != 0.0;
+                    let (x, y) = last;
+                    if let Some(vt) = virtual_touch.as_mut() {
+                        if pressed {
+                            let _ = vt.touch_down(0, x, y);
+                        } else {
+                            let _ = vt.touch_up(0);
+                        }
+                    }
+                    if vtouch_kernel_loopback {
+                        drain_kernel_touches();
                     } else {
-                        pressed = false;
-                        println!("input: tap UP at {:.0},{:.0}", last.0, last.1);
-                        (ACTION_UP, last.0, last.1)
+                        deliver_touch_event(if pressed {
+                            crate::keymap_gesture::TouchEvent::Down {
+                                id: crate::keymap_gesture::MOUSE_POINTER,
+                                x,
+                                y,
+                            }
+                        } else {
+                            crate::keymap_gesture::TouchEvent::Up {
+                                id: crate::keymap_gesture::MOUSE_POINTER,
+                                x,
+                                y,
+                            }
+                        });
                     }
                 }
                 _ => {
                     if tag != 2 {
                         println!("input: unhandled tag={tag} a={a} b={b}");
                     }
-                    continue;
                 }
-            };
-            inject(action, x, y, down_time);
+            }
         }
     });
 }
@@ -5441,12 +5613,17 @@ struct MultiTouchJni {
     coords_y: JFieldId,
     coords_pressure: JFieldId,
     coords_size: JFieldId,
+    coords_set_axis: Option<JMethodId>,
 }
 
 impl MultiTouchJni {
     fn resolve(env: &JniEnv, motion_class: JClass) -> Option<MultiTouchJni> {
         let props_class = env.find_class("android/view/MotionEvent$PointerProperties")?;
         let coords_class = env.find_class("android/view/MotionEvent$PointerCoords")?;
+        let coords_set_axis = env.method_id(coords_class, "setAxisValue", "(IF)V");
+        if coords_set_axis.is_none() {
+            env.exception_check();
+        }
         Some(MultiTouchJni {
             obtain: env.static_method_id(
                 motion_class,
@@ -5464,6 +5641,7 @@ impl MultiTouchJni {
             coords_y: env.field_id(coords_class, "y", "F")?,
             coords_pressure: env.field_id(coords_class, "pressure", "F")?,
             coords_size: env.field_id(coords_class, "size", "F")?,
+            coords_set_axis,
         })
     }
 
@@ -5520,6 +5698,277 @@ impl MultiTouchJni {
             ],
         )?;
         (!event.is_null()).then_some(event)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn obtain_single_axis(
+        &self,
+        env: &JniEnv,
+        motion_class: JClass,
+        action: i32,
+        x: f32,
+        y: f32,
+        device_id: i32,
+        source: i32,
+        tool_type: i32,
+        axes: &[(i32, f32)],
+        down_time: i64,
+        event_time: i64,
+    ) -> Option<JObject> {
+        let props = env.new_object_array(1, self.props_class, std::ptr::null_mut())?;
+        let coords = env.new_object_array(1, self.coords_class, std::ptr::null_mut())?;
+        let prop = env.new_object(self.props_class, self.props_ctor, &[])?;
+        let coord = env.new_object(self.coords_class, self.coords_ctor, &[])?;
+        if props.is_null() || coords.is_null() || prop.is_null() || coord.is_null() {
+            return None;
+        }
+        env.set_int_field(prop, self.props_id, 0);
+        env.set_int_field(prop, self.props_tool, tool_type);
+        env.set_float_field(coord, self.coords_x, x);
+        env.set_float_field(coord, self.coords_y, y);
+        env.set_float_field(coord, self.coords_pressure, 1.0);
+        env.set_float_field(coord, self.coords_size, 1.0);
+        if let Some(set_axis) = self.coords_set_axis {
+            for &(axis, val) in axes {
+                env.call_void(coord, set_axis, &[JValue { i: axis }, JValue { f: val }]);
+            }
+        }
+        env.set_object_array_element(props, 0, prop);
+        env.set_object_array_element(coords, 0, coord);
+        let event = env.call_static_object(
+            motion_class,
+            self.obtain,
+            &[
+                JValue { j: down_time },
+                JValue { j: event_time },
+                JValue { i: action },
+                JValue { i: 1 },
+                JValue { l: props },
+                JValue { l: coords },
+                JValue { i: 0 },
+                JValue { i: 0 },
+                JValue { f: 1.0 },
+                JValue { f: 1.0 },
+                JValue { i: device_id },
+                JValue { i: 0 },
+                JValue { i: source },
+                JValue { i: 0 },
+            ],
+        )?;
+        (!event.is_null()).then_some(event)
+    }
+}
+
+/// Optional SDL2/SDL3 Android controller bridge alongside `ViewRootImpl` dispatch.
+struct GamepadJni {
+    sdl_mgr: Option<JClass>,
+    sdl_poll: Option<JMethodId>,
+    sdl_add_v2: Option<JMethodId>,
+    sdl_add_v3: Option<JMethodId>,
+    sdl_pad_down: Option<JMethodId>,
+    sdl_pad_up: Option<JMethodId>,
+    pad_returns_bool: bool,
+    sdl_joy: Option<JMethodId>,
+    sdl_hat: Option<JMethodId>,
+}
+
+impl GamepadJni {
+    fn resolve(env: &JniEnv) -> GamepadJni {
+        let Some(sdl_mgr) = env.find_class_quiet("org/libsdl/app/SDLControllerManager") else {
+            return GamepadJni {
+                sdl_mgr: None,
+                sdl_poll: None,
+                sdl_add_v2: None,
+                sdl_add_v3: None,
+                sdl_pad_down: None,
+                sdl_pad_up: None,
+                pad_returns_bool: false,
+                sdl_joy: None,
+                sdl_hat: None,
+            };
+        };
+        let sdl_poll = env.static_method_id_quiet(sdl_mgr, "pollInputDevices", "()V");
+        let sdl_add_v2 = env.static_method_id_quiet(
+            sdl_mgr,
+            "nativeAddJoystick",
+            "(ILjava/lang/String;Ljava/lang/String;IIIIII)I",
+        );
+        let sdl_add_v3 = env.static_method_id_quiet(
+            sdl_mgr,
+            "nativeAddJoystick",
+            "(ILjava/lang/String;Ljava/lang/String;IIIIIIZZZZ)V",
+        );
+        let mut pad_returns_bool = false;
+        let sdl_pad_down = env
+            .static_method_id_quiet(sdl_mgr, "onNativePadDown", "(II)I")
+            .or_else(|| {
+                let m = env.static_method_id_quiet(sdl_mgr, "onNativePadDown", "(II)Z");
+                if m.is_some() {
+                    pad_returns_bool = true;
+                }
+                m
+            });
+        let sdl_pad_up = if pad_returns_bool {
+            env.static_method_id_quiet(sdl_mgr, "onNativePadUp", "(II)Z")
+        } else {
+            env.static_method_id_quiet(sdl_mgr, "onNativePadUp", "(II)I")
+                .or_else(|| env.static_method_id_quiet(sdl_mgr, "onNativePadUp", "(II)Z"))
+        };
+        let sdl_joy = env.static_method_id_quiet(sdl_mgr, "onNativeJoy", "(IIF)V");
+        let sdl_hat = env.static_method_id_quiet(sdl_mgr, "onNativeHat", "(IIII)V");
+        GamepadJni {
+            sdl_mgr: Some(sdl_mgr),
+            sdl_poll,
+            sdl_add_v2,
+            sdl_add_v3,
+            sdl_pad_down,
+            sdl_pad_up,
+            pad_returns_bool,
+            sdl_joy,
+            sdl_hat,
+        }
+    }
+
+    fn ensure_sdl_joystick(&self, env: &JniEnv) {
+        let Some(cls) = self.sdl_mgr else {
+            return;
+        };
+        if let Some(poll) = self.sdl_poll {
+            if env.call_static_void(cls, poll, &[]) {
+                return;
+            }
+            env.exception_clear();
+        }
+        let name = env.new_string("Xbox 360 Controller");
+        let desc = env.new_string("pengudroid:xbox360-gamepad");
+        if let Some(add_v3) = self.sdl_add_v3 {
+            let _ = env.call_static_void(
+                cls,
+                add_v3,
+                &[
+                    JValue { i: 2 },
+                    JValue { l: name },
+                    JValue { l: desc },
+                    JValue { i: 0x045e },
+                    JValue { i: 0x028e },
+                    JValue { i: 0xffff },
+                    JValue { i: 6 },
+                    JValue { i: 0x3f },
+                    JValue { i: 1 },
+                    JValue { z: 0 },
+                    JValue { z: 0 },
+                    JValue { z: 0 },
+                    JValue { z: 0 },
+                ],
+            );
+            env.exception_clear();
+        } else if let Some(add_v2) = self.sdl_add_v2 {
+            let _ = env.call_static_int(
+                cls,
+                add_v2,
+                &[
+                    JValue { i: 2 },
+                    JValue { l: name },
+                    JValue { l: desc },
+                    JValue { i: 0x045e },
+                    JValue { i: 0x028e },
+                    JValue { i: 0xffff },
+                    JValue { i: 6 },
+                    JValue { i: 0x3f },
+                    JValue { i: 1 },
+                ],
+            );
+            env.exception_clear();
+        }
+    }
+
+    fn obtain_axes_event(
+        &self,
+        env: &JniEnv,
+        motion_class: JClass,
+        multi: &MultiTouchJni,
+        axes: &crate::keymap_gesture::GamepadAxes,
+        device_id: i32,
+        source: i32,
+        now: i64,
+    ) -> Option<JObject> {
+        let pairs = [
+            (0, axes.lx),   // AXIS_X
+            (1, axes.ly),   // AXIS_Y
+            (11, axes.rx),  // AXIS_Z (Xbox right stick X)
+            (14, axes.ry),  // AXIS_RZ (Xbox right stick Y)
+            (15, axes.hat_x),
+            (16, axes.hat_y),
+            (17, axes.lt),  // AXIS_LTRIGGER
+            (18, axes.rt),  // AXIS_RTRIGGER
+            (22, axes.rt),  // AXIS_GAS
+            (23, axes.lt),  // AXIS_BRAKE
+        ];
+        multi.obtain_single_axis(
+            env,
+            motion_class,
+            2, // ACTION_MOVE
+            axes.lx,
+            axes.ly,
+            device_id,
+            source,
+            0, // TOOL_TYPE_UNKNOWN
+            &pairs,
+            now,
+            now,
+        )
+    }
+
+    fn notify_sdl_button(&self, env: &JniEnv, device_id: i32, android_code: i32, down: bool) {
+        let Some(cls) = self.sdl_mgr else { return };
+        let method = if down { self.sdl_pad_down } else { self.sdl_pad_up };
+        if let Some(m) = method {
+            if self.pad_returns_bool {
+                let _ = env.call_static_boolean(cls, m, &[JValue { i: device_id }, JValue { i: android_code }]);
+            } else {
+                let _ = env.call_static_int(cls, m, &[JValue { i: device_id }, JValue { i: android_code }]);
+            }
+            env.exception_clear();
+        }
+    }
+
+    fn notify_sdl_axes(
+        &self,
+        env: &JniEnv,
+        device_id: i32,
+        axes: &crate::keymap_gesture::GamepadAxes,
+    ) {
+        let Some(cls) = self.sdl_mgr else { return };
+        if let Some(joy) = self.sdl_joy {
+            for (axis_idx, val) in [
+                (0, axes.lx),
+                (1, axes.ly),
+                (2, axes.rx),
+                (3, axes.ry),
+                (4, axes.lt * 2.0 - 1.0),
+                (5, axes.rt * 2.0 - 1.0),
+            ] {
+                let _ = env.call_static_void(
+                    cls,
+                    joy,
+                    &[JValue { i: device_id }, JValue { i: axis_idx }, JValue { f: val }],
+                );
+            }
+            env.exception_clear();
+        }
+        if let Some(hat) = self.sdl_hat {
+            let _ = env.call_static_void(
+                cls,
+                hat,
+                &[
+                    JValue { i: device_id },
+                    JValue { i: 0 },
+                    JValue { i: axes.hat_x.round() as i32 },
+                    JValue { i: axes.hat_y.round() as i32 },
+                ],
+            );
+            env.exception_clear();
+        }
     }
 }
 
@@ -8141,6 +8590,115 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
     let data = marshal_object(env, device, "android/view/InputDevice")?;
     install_reply(&data, "__pengudroid_binder_set_input_device");
     println!("apphost: virtual keyboard installed; native character map validated");
+    Some(())
+}
+
+/// Build and register the virtual Xbox 360 Controller (`deviceId = 2`,
+/// Vendor `0x045e`, Product `0x028e`) via `InputDevice$Builder`.
+fn build_virtual_key_character_map(env: &JniEnv) -> Option<JObject> {
+    let raw = crate::keyboard::virtual_character_map_parcel();
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let parcel = env.call_static_object(parcel_class, obtain, &[])?;
+    if parcel.is_null() {
+        return None;
+    }
+    let bytes = env.new_byte_array(raw.len() as i32)?;
+    env.set_byte_array_region(bytes, 0, &raw);
+    let unmarshall = env.method_id(parcel_class, "unmarshall", "([BII)V")?;
+    if !env.call_void(
+        parcel,
+        unmarshall,
+        &[JValue { l: bytes }, JValue { i: 0 }, JValue { i: raw.len() as i32 }],
+    ) {
+        return None;
+    }
+    let reset = env.method_id(parcel_class, "setDataPosition", "(I)V")?;
+    if !env.call_void(parcel, reset, &[JValue { i: 0 }]) {
+        return None;
+    }
+    let map_class = env.find_class("android/view/KeyCharacterMap")?;
+    let ctor = env.method_id(map_class, "<init>", "(Landroid/os/Parcel;)V")?;
+    let map = env.new_object(map_class, ctor, &[JValue { l: parcel }]);
+    if let Some(recycle) = env.method_id(parcel_class, "recycle", "()V") {
+        let _ = env.call_void(parcel, recycle, &[]);
+    }
+    map.filter(|m| !m.is_null())
+}
+
+fn install_virtual_gamepad(env: &JniEnv) -> Option<()> {
+    let name = env.new_string("Xbox 360 Controller");
+    let descriptor = env.new_string("pengudroid:xbox360-gamepad");
+    let (class, builder) = new_instance(env, "android/view/InputDevice$Builder")?;
+    // SOURCE_KEYBOARD (0x101) | SOURCE_DPAD (0x201) | SOURCE_GAMEPAD (0x401) | SOURCE_JOYSTICK (0x01000010)
+    const SOURCES_XBOX: i32 = 0x0100_0711;
+    const SOURCE_JOYSTICK: i32 = 0x0100_0010;
+    for (method, value) in [
+        ("setId", 2),
+        ("setGeneration", 1),
+        ("setControllerNumber", 1),
+        ("setVendorId", 0x045e),
+        ("setProductId", 0x028e),
+        ("setSources", SOURCES_XBOX),
+        ("setKeyboardType", 1),
+    ] {
+        let m = env.method_id(class, method, "(I)Landroid/view/InputDevice$Builder;")?;
+        env.call_object(builder, m, &[JValue { i: value }])?;
+    }
+    for (method, value) in [("setName", name), ("setDescriptor", descriptor)] {
+        let m = env.method_id(class, method, "(Ljava/lang/String;)Landroid/view/InputDevice$Builder;")?;
+        env.call_object(builder, m, &[JValue { l: value }])?;
+    }
+    for method in ["setExternal", "setEnabled"] {
+        let m = env.method_id(class, method, "(Z)Landroid/view/InputDevice$Builder;")?;
+        env.call_object(builder, m, &[JValue { z: 1 }])?;
+    }
+    let kcm = build_virtual_key_character_map(env)?;
+    let set_map = env.method_id(
+        class,
+        "setKeyCharacterMap",
+        "(Landroid/view/KeyCharacterMap;)Landroid/view/InputDevice$Builder;",
+    )?;
+    env.call_object(builder, set_map, &[JValue { l: kcm }])?;
+    let add_range = env.method_id(
+        class,
+        "addMotionRange",
+        "(IIFFFFF)Landroid/view/InputDevice$Builder;",
+    )?;
+    for &(axis, min, max, flat, fuzz) in &[
+        (0, -1.0f32, 1.0f32, 0.05f32, 0.01f32),  // AXIS_X
+        (1, -1.0, 1.0, 0.05, 0.01),              // AXIS_Y
+        (11, -1.0, 1.0, 0.05, 0.01),             // AXIS_Z (RX)
+        (14, -1.0, 1.0, 0.05, 0.01),             // AXIS_RZ (RY)
+        (15, -1.0, 1.0, 0.0, 0.0),               // AXIS_HAT_X
+        (16, -1.0, 1.0, 0.0, 0.0),               // AXIS_HAT_Y
+        (17, 0.0, 1.0, 0.0, 0.0),                // AXIS_LTRIGGER
+        (18, 0.0, 1.0, 0.0, 0.0),                // AXIS_RTRIGGER
+        (22, 0.0, 1.0, 0.0, 0.0),                // AXIS_GAS
+        (23, 0.0, 1.0, 0.0, 0.0),                // AXIS_BRAKE
+    ] {
+        env.call_object(
+            builder,
+            add_range,
+            &[
+                JValue { i: axis },
+                JValue { i: SOURCE_JOYSTICK },
+                JValue { f: min },
+                JValue { f: max },
+                JValue { f: flat },
+                JValue { f: fuzz },
+                JValue { f: 0.0 },
+            ],
+        )?;
+    }
+    let build = env.method_id(class, "build", "()Landroid/view/InputDevice;")?;
+    let device = env.call_object(builder, build, &[])?;
+    if device.is_null() {
+        return None;
+    }
+    let data = marshal_object(env, device, "android/view/InputDevice")?;
+    install_reply(&data, "__pengudroid_binder_set_gamepad_device");
+    println!("apphost: virtual Xbox 360 Controller (045e:028e, id=2) installed");
     Some(())
 }
 

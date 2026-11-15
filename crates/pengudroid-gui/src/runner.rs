@@ -74,8 +74,13 @@ impl Drop for RunningApp {
 
 /// Always send both states so inherited settings cannot override an app's UI.
 fn launch_preferences(cmd: &mut Command, fps: bool, keymapper: bool) {
-    cmd.env("PENGUDROID_FPS_METER", if fps { "1" } else { "0" })
+    let fps_val = if fps { "1" } else { "0" };
+    cmd.env("PENGUDROID_FPS_METER", fps_val)
+        .env("MANGOHUD", fps_val)
         .env("PENGUDROID_KEYMAPPER", if keymapper { "1" } else { "0" });
+    if fps && std::env::var_os("MANGOHUD_CONFIG").is_none() {
+        cmd.env("MANGOHUD_CONFIG", "fps,frametime,frame_timing=1,position=top-left");
+    }
 }
 
 /// The Android tree to run against.
@@ -121,14 +126,15 @@ mod tests {
     fn launcher_passes_each_apps_controls_preference_to_the_child() {
         for enabled in [false, true] {
             let mut child = Command::new("/bin/sh");
-            child.args(["-c", "printf '%s:%s' \"$PENGUDROID_KEYMAPPER\" \"$PENGUDROID_FPS_METER\""]);
+            child.args(["-c", "printf '%s:%s:%s' \"$PENGUDROID_KEYMAPPER\" \"$PENGUDROID_FPS_METER\" \"$MANGOHUD\""]);
             child.env("PENGUDROID_KEYMAPPER", "inherited")
-                .env("PENGUDROID_FPS_METER", "inherited");
+                .env("PENGUDROID_FPS_METER", "inherited")
+                .env("MANGOHUD", "inherited");
             launch_preferences(&mut child, !enabled, enabled);
             let output = child.output().unwrap();
             assert!(output.status.success());
             assert_eq!(String::from_utf8(output.stdout).unwrap(),
-                if enabled { "1:0" } else { "0:1" });
+                if enabled { "1:0:0" } else { "0:1:1" });
         }
     }
 

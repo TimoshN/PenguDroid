@@ -1196,6 +1196,8 @@ const IDM_GET_DISPLAY_INFO: u32 = 1;
 
 /// Framework-marshalled virtual keyboard InputDevice, including its native map.
 static VIRTUAL_INPUT_DEVICE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Framework-marshalled virtual Xbox 360 Controller InputDevice.
+static VIRTUAL_GAMEPAD_DEVICE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 // Internal virtual_input::reply semantic IDs, never default wire codes.
 const INPUT_OPERATIONS: [u32; 9] = [1, 2, 3, 4, 5, 6, 7, 22, 8];
 static INPUT_TRANSACTION_CODES: Mutex<Option<[u32; 9]>> = Mutex::new(None);
@@ -3636,7 +3638,8 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             return Reply::unknown_transaction(tr, "invalid IInputManager interface token");
         };
         let device = VIRTUAL_INPUT_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(body) = crate::virtual_input::reply(operation, args, &device) else {
+        let gamepad = VIRTUAL_GAMEPAD_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(body) = crate::virtual_input::reply_with_devices(operation, args, &device, &gamepad) else {
             return Reply::unknown_transaction(tr, "unsupported or malformed IInputManager arguments");
         };
         parcel.extend_from_slice(&body);
@@ -5203,6 +5206,16 @@ pub unsafe extern "C" fn __pengudroid_binder_set_setting(
 pub unsafe extern "C" fn __pengudroid_binder_set_input_device(ptr: *const u8, len: usize) {
     if ptr.is_null() || len == 0 { return; }
     *VIRTUAL_INPUT_DEVICE.lock().unwrap_or_else(|e| e.into_inner()) =
+        std::slice::from_raw_parts(ptr, len).to_vec();
+}
+
+/// Install the virtual Xbox 360 gamepad's framework-written InputDevice parcel.
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_gamepad_device(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 { return; }
+    *VIRTUAL_GAMEPAD_DEVICE.lock().unwrap_or_else(|e| e.into_inner()) =
         std::slice::from_raw_parts(ptr, len).to_vec();
 }
 
