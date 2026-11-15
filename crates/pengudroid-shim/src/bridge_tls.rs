@@ -74,17 +74,43 @@ const BUSY: *mut State = 1usize as *mut State;
 /// Synthetic guest pthread record → the host `pthread_t` it stands for. Records
 /// are never unmapped, so a stale entry names a finished host thread, which is
 /// exactly what glibc would be told about it.
-static HANDLES: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static HANDLES: std::sync::RwLock<std::collections::BTreeMap<usize, usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 /// The host `pthread_t` for `handle`: unchanged unless it is a guest record.
 pub fn host_handle(handle: usize) -> usize {
-    HANDLES.lock().unwrap_or_else(|e| e.into_inner()).get(&handle).copied().unwrap_or(handle)
+    // Fast lock-free path for the calling thread's own synthetic pthread record.
+    let self_hit = STATE.with(|slot| {
+        let state = slot.get();
+        if !state.is_null() && state != BUSY {
+            // SAFETY: `state` is mmap'd for the lifetime of the process.
+            let guest_ptr = unsafe { ptr::addr_of!((*state).pthread.0) as usize };
+            if handle == guest_ptr {
+                return Some(unsafe { (*state).host_pthread });
+            }
+        }
+        None
+    });
+    if let Some(host) = self_hit {
+        return host;
+    }
+    HANDLES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&handle)
+        .copied()
+        .unwrap_or(handle)
 }
 
 /// The kernel TID stored in a guest record, if `handle` is one.
 pub fn guest_record_tid(handle: usize) -> Option<i32> {
-    if !HANDLES.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&handle) { return None; }
+    if !HANDLES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&handle)
+    {
+        return None;
+    }
     // SAFETY: registered records live until process exit.
     Some(unsafe { ptr::read((handle as *const u8).add(PTHREAD_TID).cast::<i32>()) })
 }
@@ -140,7 +166,7 @@ unsafe fn initialize() -> Result<*mut State, c_int> {
     let state = allocation.cast::<State>();
     (*state).host_pthread = host as usize;
     let pthread = ptr::addr_of_mut!((*state).pthread.0).cast::<u8>();
-    HANDLES.lock().unwrap_or_else(|e| e.into_inner()).insert(pthread as usize, host as usize);
+    HANDLES.write().unwrap_or_else(|e| e.into_inner()).insert(pthread as usize, host as usize);
     let tls = ptr::addr_of_mut!((*state).tls.0).cast::<u8>();
     let libgen = ptr::addr_of_mut!((*state).libgen.0).cast::<u8>();
     store(pthread, PTHREAD_BIONIC_TLS, tls);
@@ -245,12 +271,12 @@ mod tests {
         unsafe {
             let record = Box::into_raw(Box::new([0u8; PTHREAD_SIZE]));
             ptr::write((record as *mut u8).add(PTHREAD_TID).cast::<i32>(), 4242);
-            HANDLES.lock().unwrap().insert(record as usize, 0x1234_5000);
+            HANDLES.write().unwrap().insert(record as usize, 0x1234_5000);
             assert_eq!(host_handle(record as usize), 0x1234_5000);
             assert_eq!(guest_record_tid(record as usize), Some(4242));
             assert_eq!(host_handle(0x7777_0000), 0x7777_0000);
             assert_eq!(guest_record_tid(0x7777_0000), None);
-            HANDLES.lock().unwrap().remove(&(record as usize));
+            HANDLES.write().unwrap().remove(&(record as usize));
             drop(Box::from_raw(record));
         }
     }

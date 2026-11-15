@@ -8,6 +8,7 @@ members = [
     "crates/pengudroid-elf",
     "crates/pengudroid-hostgpu",
     "crates/pengudroid-gleshim",
+    "crates/pengudroid-vkshim",
     "crates/pengudroid-daemon",
     "crates/pengudroid-cli",
     "crates/pengudroid-shim",
@@ -16,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -43,7 +44,7 @@ pengudroid-gleshim = { path = "crates/pengudroid-gleshim" }
 pengudroid-device = { path = "crates/pengudroid-device" }
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

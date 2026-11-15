@@ -459,11 +459,21 @@ pub fn launch(args: &[String]) -> i32 {
     }
     println!("  apk     : {apk_path}");
     println!("  prefix  : {}", prefix.display());
+    println!("  cpu     : {}", host_simd_tier());
     println!("  backend : {} ({})", backend.name(), planned.reason);
     if backend != planned.backend {
         println!("  note    : forced with --backend");
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    if bundle_selected_abi.as_deref() == Some("armeabi-v7a") {
+        eprintln!(
+            "pengudroid launch: {} only ships 32-bit armeabi-v7a libraries; \
+             PenguDroid's runtime and Berberis translator require 64-bit arm64-v8a or x86_64",
+            info.package
+        );
+        return 1;
+    }
 
     match backend {
         Backend::Native => {
@@ -658,7 +668,7 @@ pub fn launch(args: &[String]) -> i32 {
                     cmd.env("BERBERIS_FLAGS", "glibc-host-thread-id-handoff");
                 }
                 if std::env::var_os("BERBERIS_MODE").is_none() {
-                    cmd.env("BERBERIS_MODE", "lite-translate-or-interpret");
+                    cmd.env("BERBERIS_MODE", "two-gear");
                 }
                 if std::env::var_os("PENGUDROID_GLESHIM").is_none() {
                     if let Some(g) = crate::nativelib::find_gleshim() {
@@ -684,6 +694,29 @@ pub fn launch(args: &[String]) -> i32 {
             }
             run_child(cmd)
         }
+    }
+}
+
+/// Highest SIMD ISA tier supported by the host CPU at runtime.
+fn host_simd_tier() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("bmi2")
+        {
+            return "x86_64 (AVX2+FMA+BMI2)";
+        }
+        if std::arch::is_x86_feature_detected!("sse4.2")
+            && std::arch::is_x86_feature_detected!("popcnt")
+        {
+            return "x86_64 (SSE4.2+POPCNT)";
+        }
+        "x86_64 (baseline SSE2)"
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        std::env::consts::ARCH
     }
 }
 

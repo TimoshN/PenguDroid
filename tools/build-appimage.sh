@@ -57,11 +57,11 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "building release binaries"
     cargo build --release --offline \
         -p pengudroid-cli -p pengudroid-gui \
-        -p pengudroid-shim -p pengudroid-gleshim -p pengudroid-daemon
+        -p pengudroid-shim -p pengudroid-gleshim -p pengudroid-vkshim -p pengudroid-daemon
 fi
 
 missing=""
-for f in pengudroid pengudroid-gui pengudroid-daemon libpengudroid_shim.so libpengudroid_gleshim.so; do
+for f in pengudroid pengudroid-gui pengudroid-daemon libpengudroid_shim.so libpengudroid_gleshim.so libpengudroid_vkshim.so; do
     [ -f "$TARGET/release/$f" ] || missing="$missing $f"
 done
 if [ -n "$missing" ]; then
@@ -80,6 +80,7 @@ install -m 0755 "$TARGET/release/pengudroid" "$APPDIR/usr/bin/pengudroid"
 install -m 0755 "$TARGET/release/pengudroid-daemon" "$APPDIR/usr/bin/pengudroid-daemon"
 install -m 0755 "$TARGET/release/libpengudroid_shim.so" "$APPDIR/usr/bin/libpengudroid_shim.so"
 install -m 0755 "$TARGET/release/libpengudroid_gleshim.so" "$APPDIR/usr/bin/libpengudroid_gleshim.so"
+install -m 0755 "$TARGET/release/libpengudroid_vkshim.so" "$APPDIR/usr/bin/libpengudroid_vkshim.so"
 install -m 0644 "$ROOT/logo.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/pengudroid.png"
 cp "$APPDIR/usr/share/icons/hicolor/256x256/apps/pengudroid.png" "$APPDIR/pengudroid.png"
 

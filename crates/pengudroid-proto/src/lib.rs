@@ -371,6 +371,7 @@ pub enum Message {
         fourcc: u32,
         modifier: u64,
         offset: u32,
+        top_down: bool,
     },
 
     /// One hardware decoder per connection, bound to an owned video surface.
@@ -663,7 +664,7 @@ impl Message {
                 e.i32(crop.right);
                 e.i32(crop.bottom);
             }
-            PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset } => {
+            PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset, top_down } => {
                 e.u32(*surface_id);
                 e.u32(*width);
                 e.u32(*height);
@@ -671,6 +672,7 @@ impl Message {
                 e.u32(*fourcc);
                 e.u64(*modifier);
                 e.u32(*offset);
+                e.u8(u8::from(*top_down));
             }
             VideoDecoderOpen { surface_id, codec, device, extra } => {
                 e.u32(*surface_id); e.str(codec); e.str(device); e.bytes(extra);
@@ -893,6 +895,7 @@ impl Message {
                 fourcc: d.u32()?,
                 modifier: d.u64()?,
                 offset: d.u32()?,
+                top_down: d.u8()? != 0,
             },
             K::VideoDecoderOpen => VideoDecoderOpen { surface_id: d.u32()?, codec: d.str()?, device: d.str()?, extra: d.bytes()?.to_vec() },
             K::VideoDecoderReady => VideoDecoderReady,

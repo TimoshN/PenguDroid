@@ -4970,8 +4970,8 @@ unsafe fn alloc_itf(owner: *mut Obj, vtable: *const c_void) -> *mut c_void {
     p
 }
 
-fn iid_matches(iid: *const c_void, value: usize) -> bool {
-    !iid.is_null() && iid as usize == value
+fn iid_matches(iid: *const c_void, expected: SlIidPtr) -> bool {
+    !iid.is_null() && iid == expected.0.cast()
 }
 
 // ---------------------------------------------------------------------------
@@ -5543,14 +5543,35 @@ static BQ_VTABLE: SLAndroidSimpleBufferQueueItf_ = SLAndroidSimpleBufferQueueItf
     RegisterCallback: Some(bq_register_callback),
 };
 
-/// Export a batch of OpenSL ES interface-ID data symbols. Apps compare these
-/// opaque values and pass them back to us; they are never dereferenced, so
-/// unique non-null integers are sufficient.
+/// Backing storage for an OpenSL ES `SLInterfaceID_` struct. Callers (such as
+/// Wwise's `libAkSoundEngine.so` or native-bridge proxies) may dereference or
+/// compare the UUID bytes behind `SL_IID_*`, so each exported symbol must point
+/// to readable `.rodata` memory rather than an integer sentinel.
+#[repr(C)]
+pub struct SLInterfaceID_ {
+    id: usize,
+    _pad: [u64; 7],
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+pub struct SlIidPtr(pub *const SLInterfaceID_);
+
+unsafe impl Sync for SlIidPtr {}
+
+/// Export a batch of OpenSL ES interface-ID data symbols pointing to distinct
+/// `.rodata` `SLInterfaceID_` structs.
 macro_rules! sl_iids {
     ($($name:ident = $value:expr),* $(,)?) => {
         $(
             #[no_mangle]
-            pub static $name: usize = $value;
+            pub static $name: SlIidPtr = {
+                static DATA: SLInterfaceID_ = SLInterfaceID_ {
+                    id: $value,
+                    _pad: [0; 7],
+                };
+                SlIidPtr(&DATA)
+            };
         )*
     };
 }
@@ -6396,7 +6417,7 @@ mod tests {
             assert_eq!(
                 (object_vt.GetInterface.unwrap())(
                     engine,
-                    SL_IID_ENGINE as *const c_void,
+                    SL_IID_ENGINE.0.cast(),
                     &mut engine_itf,
                 ),
                 SL_RESULT_SUCCESS
@@ -6462,7 +6483,7 @@ mod tests {
             assert_eq!(
                 (player_vt.GetInterface.unwrap())(
                     player,
-                    SL_IID_PLAY as *const c_void,
+                    SL_IID_PLAY.0.cast(),
                     &mut play_itf,
                 ),
                 SL_RESULT_SUCCESS
@@ -6483,7 +6504,7 @@ mod tests {
             assert_eq!(
                 (player_vt.GetInterface.unwrap())(
                     player,
-                    SL_IID_ANDROIDSIMPLEBUFFERQUEUE as *const c_void,
+                    SL_IID_ANDROIDSIMPLEBUFFERQUEUE.0.cast(),
                     &mut bq_itf,
                 ),
                 SL_RESULT_SUCCESS
@@ -6500,7 +6521,7 @@ mod tests {
             assert_eq!(
                 (player_vt.GetInterface.unwrap())(
                     player,
-                    SL_IID_RECORD as *const c_void,
+                    SL_IID_RECORD.0.cast(),
                     &mut unsupported,
                 ),
                 SL_RESULT_FEATURE_UNSUPPORTED

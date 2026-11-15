@@ -1035,6 +1035,11 @@ pub fn art_test(args: &[String]) -> i32 {
             let _ = std::fs::remove_file(&link);
             let _ = std::os::unix::fs::symlink(&gleshim, &link);
         }
+        if let Some(vkshim) = crate::nativelib::find_vkshim() {
+            let link = prepared.join("libpengudroid_vkshim.so");
+            let _ = std::fs::remove_file(&link);
+            let _ = std::os::unix::fs::symlink(&vkshim, &link);
+        }
         cmd.env("PENGUDROID_BRIDGE_LIB_PATH", &prepared_bridge.path);
         native_bridge = Some(prepared_bridge.name);
         ld_path = format!("{}:{ld_path}", prepared.display());
@@ -1044,10 +1049,25 @@ pub fn art_test(args: &[String]) -> i32 {
     // hwui's EGL calls land on the sysroot's Bionic `libEGL`, which has no
     // driver behind it, so nothing is ever drawn.
     let gleshim = crate::nativelib::find_gleshim();
-    let preload = match &gleshim {
-        Some(g) => format!("{}:{}", shim.display(), g.display()),
-        None => shim.display().to_string(),
-    };
+    let mut preload_parts = vec![shim.display().to_string()];
+    if let Some(g) = &gleshim {
+        preload_parts.push(g.display().to_string());
+    }
+    if let Some(vk) = crate::nativelib::find_vkshim() {
+        preload_parts.push(vk.display().to_string());
+        for cand in [
+            "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/usr/lib64/libvulkan.so.1",
+            "/usr/lib/libvulkan.so.1",
+        ] {
+            if std::path::Path::new(cand).exists() {
+                preload_parts.push(cand.to_string());
+                break;
+            }
+        }
+    }
+    let preload = preload_parts.join(":");
     // Extra preloads for diagnostics are loaded *after* the VM instead (see
     // `art_main`), because ART installs its fault handler during Runtime::Init
     // and a preloaded handler would be replaced by it.
@@ -1699,22 +1719,25 @@ fn reflected_shorty(env: crate::jni::JniEnv, method: *mut c_void) -> Option<Stri
     let _frame = env.local_frame(32)?;
     let reflected = env.to_reflected_method(method, false)?;
     let member_class = env.object_class(reflected)?;
+    let class_of_class = env.object_class(member_class)?;
+    let get_class_name = env.method_id(class_of_class, "getName", "()Ljava/lang/String;")?;
     let class_char = |class: crate::jni::JClass| -> Option<char> {
-        let class_of_class = env.object_class(class)?;
-        let get_name = env.method_id(class_of_class, "getName", "()Ljava/lang/String;")?;
-        let name = env.call_object(class, get_name, &[])?;
+        let name = env.call_object(class, get_class_name, &[])?;
         Some(shorty_char_for_class_name(&env.get_string(name)?))
     };
+    let member_name_obj = env.call_object(member_class, get_class_name, &[])?;
+    let member_name = env.get_string(member_name_obj)?;
     let mut shorty = String::new();
-    match env.method_id(member_class, "getReturnType", "()Ljava/lang/Class;") {
-        Some(get_return_type) => {
-            let ret = env.call_object(reflected, get_return_type, &[])?;
-            shorty.push(class_char(ret)?);
+    if member_name == "java.lang.reflect.Constructor" {
+        shorty.push('V');
+    } else {
+        match env.method_id_quiet(member_class, "getReturnType", "()Ljava/lang/Class;") {
+            Some(get_return_type) => {
+                let ret = env.call_object(reflected, get_return_type, &[])?;
+                shorty.push(class_char(ret)?);
+            }
+            None => shorty.push('V'),
         }
-        // A `Constructor` has no `getReturnType`; `method_id` already
-        // described and cleared the NoSuchMethodError. Constructors return
-        // void.
-        None => shorty.push('V'),
     }
     let get_parameter_types =
         env.method_id(member_class, "getParameterTypes", "()[Ljava/lang/Class;")?;
@@ -1729,11 +1752,15 @@ fn reflected_shorty(env: crate::jni::JniEnv, method: *mut c_void) -> Option<Stri
 /// The result is cached and intentionally leaked: berberis reads the string
 /// after the callback returns, so the bytes must outlive every call.
 unsafe extern "C" fn bridge_get_method_shorty(env: *mut c_void, method: *mut c_void) -> *const c_char {
-    static SHORTY_CACHE: std::sync::Mutex<Option<std::collections::HashMap<usize, CString>>> =
-        std::sync::Mutex::new(None);
-    let mut cache = SHORTY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let map = cache.get_or_insert_with(std::collections::HashMap::new);
-    if let Some(shorty) = map.get(&(method as usize)) {
+    static SHORTY_CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<usize, CString>>,
+    > = std::sync::OnceLock::new();
+    let cache = SHORTY_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Some(shorty) = cache
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(method as usize))
+    {
         return shorty.as_ptr();
     }
     let Some(shorty) = reflected_shorty(crate::jni::JniEnv(env), method).and_then(|s| CString::new(s).ok())
@@ -1743,6 +1770,7 @@ unsafe extern "C" fn bridge_get_method_shorty(env: *mut c_void, method: *mut c_v
         eprintln!("art: shorty lookup failed for {method:p}");
         return c"".as_ptr();
     };
+    let mut map = cache.write().unwrap_or_else(|e| e.into_inner());
     map.entry(method as usize).or_insert(shorty).as_ptr()
 }
 

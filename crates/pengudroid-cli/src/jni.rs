@@ -334,6 +334,20 @@ impl JniEnv {
         Some(m)
     }
 
+    /// `GetMethodID(clazz, name, sig)`, clearing any pending exception quietly.
+    pub fn method_id_quiet(&self, class: JClass, name: &str, sig: &str) -> Option<JMethodId> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let csig = std::ffi::CString::new(sig).ok()?;
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JMethodId =
+            unsafe { self.func(slot::GET_METHOD_ID) };
+        let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
+        if m.is_null() {
+            self.exception_clear();
+            return None;
+        }
+        Some(m)
+    }
+
     /// `CallObjectMethodA(obj, method, args)`.
     pub fn call_object(&self, obj: JObject, method: JMethodId, args: &[JValue]) -> Option<JObject> {
         let f: unsafe extern "C" fn(*mut c_void, JObject, JMethodId, *const JValue) -> JObject =

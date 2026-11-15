@@ -33,14 +33,17 @@ def package(appdir, repo):
         shutil.copy2(source, tools / name)
     # GLVND is driver-neutral; vendor GPU drivers stay on the host.
     dynamic = ["libwayland-client.so.0", "libwayland-egl.so.1", "libxkbcommon.so.0",
-               "libEGL.so.1", "libGLESv2.so.2", "libGLdispatch.so.0", "libgbm.so.1",
-               "libstdc++.so.6"]
+               "libxkbcommon-x11.so.0", "libEGL.so.1", "libGLESv2.so.2",
+               "libGLdispatch.so.0", "libgbm.so.1", "libstdc++.so.6"]
     cache = subprocess.check_output(["/sbin/ldconfig", "-p"], text=True)
     for name in dynamic:
         match = re.search(r"^\s*" + re.escape(name) + r"\s+\([^\n]*x86-64[^\n]*\) => (\S+)", cache, re.M)
         if not match:
             raise RuntimeError(f"missing host build input: {name}")
         shutil.copy2(match[1], libs / name)
+    unversioned_xkb_x11 = libs / "libxkbcommon-x11.so"
+    if not unversioned_xkb_x11.exists():
+        unversioned_xkb_x11.symlink_to("libxkbcommon-x11.so.0")
     for directory in [Path("/usr/lib/x86_64-linux-gnu/pipewire-0.3"), Path("/usr/lib/x86_64-linux-gnu/spa-0.2")]:
         if directory.is_dir():
             shutil.copytree(directory, usr / "portable" / directory.name, dirs_exist_ok=True)

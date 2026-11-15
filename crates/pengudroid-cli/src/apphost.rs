@@ -856,13 +856,25 @@ fn install_system_features_cache(env: &JniEnv) -> Option<()> {
     if env.call_static_boolean(class, has, &[])? { return Some(()); }
     let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
     let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
-    // Describe implemented virtual input/audio and screen modes. Do not claim
-    // camera, sensors, telephony, multitouch, or Vulkan hardware capabilities.
-    for name in ["android.hardware.audio.output", "android.hardware.touchscreen",
-        "android.hardware.screen.portrait", "android.hardware.screen.landscape"] {
+    // Describe implemented virtual input/audio, screen modes, and Vulkan WSI.
+    // Do not claim camera, sensors, telephony, or multitouch capabilities.
+    for (name, version) in [
+        ("android.hardware.audio.output", 0i32),
+        ("android.hardware.touchscreen", 0),
+        ("android.hardware.screen.portrait", 0),
+        ("android.hardware.screen.landscape", 0),
+        ("android.hardware.vulkan.level", 1),
+        ("android.hardware.vulkan.version", 0x0040_1000),
+        ("android.hardware.vulkan.compute", 0),
+    ] {
         let (feature_class, feature) = new_instance(env, "android/content/pm/FeatureInfo")?;
         let name_field = env.field_id(feature_class, "name", "Ljava/lang/String;")?;
         env.set_object_field(feature, name_field, env.new_string(name));
+        if version != 0 {
+            if let Some(ver_field) = env.field_id(feature_class, "version", "I") {
+                env.set_int_field(feature, ver_field, version);
+            }
+        }
         if env.call_boolean(list, add, &[JValue { l: feature }])? != true { return None; }
     }
     let ctor = env.method_id(class, "<init>", "(Ljava/util/Collection;)V")?;
@@ -6551,6 +6563,28 @@ fn launch_hosted_activity(
             eprintln!("apphost: ActivityClientRecord.{field} not found");
         }
     };
+    if let Ok(unity_args) = std::env::var("PENGUDROID_UNITY_ARGS") {
+        let trimmed = unity_args.trim();
+        if !trimmed.is_empty() && !intent.is_null() {
+            if let Some(intent_cls) = env.find_class("android/content/Intent") {
+                let key = env.new_string("unity");
+                let has_extra = env
+                    .method_id(intent_cls, "hasExtra", "(Ljava/lang/String;)Z")
+                    .and_then(|m| env.call_boolean(intent, m, &[JValue { l: key }]))
+                    .unwrap_or(false);
+                if !has_extra {
+                    if let Some(put_extra) = env.method_id(
+                        intent_cls,
+                        "putExtra",
+                        "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                    ) {
+                        let val = env.new_string(trimmed);
+                        let _ = env.call_object(intent, put_extra, &[JValue { l: key }, JValue { l: val }]);
+                    }
+                }
+            }
+        }
+    }
     set("activityInfo", "Landroid/content/pm/ActivityInfo;", activity_info);
     set("intent", "Landroid/content/Intent;", intent);
     set("packageInfo", "Landroid/app/LoadedApk;", loaded_apk);

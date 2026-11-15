@@ -1413,6 +1413,7 @@ unsafe fn present_dmabuf(
             fourcc,
             modifier,
             offset,
+            top_down: false,
         };
         conn.send_message(&msg, &[fd]).map_err(|e| {
             io_failure = true;

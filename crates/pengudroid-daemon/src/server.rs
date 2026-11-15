@@ -434,14 +434,14 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
                 };
                 (Some(reply), vec![], false)
             }
-            Message::PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset } => {
+            Message::PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset, top_down } => {
                 // SAFETY: these fds arrived via SCM_RIGHTS and are now ours.
                 let in_fds: Vec<OwnedFd> = raw_fds
                     .into_iter()
                     .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
                     .collect();
                 handle_present_dmabuf(
-                    &daemon, surface_id, width, height, stride, fourcc, modifier, offset, in_fds,
+                    &daemon, surface_id, width, height, stride, fourcc, modifier, offset, top_down, in_fds,
                 )
             }
             other => {
@@ -1077,6 +1077,7 @@ fn handle_present_dmabuf(
     fourcc: u32,
     modifier: u64,
     offset: u32,
+    top_down: bool,
     in_fds: Vec<OwnedFd>,
 ) -> (Option<Message>, Vec<OwnedFd>, bool) {
     let mut fds = in_fds.into_iter();
@@ -1095,7 +1096,7 @@ fn handle_present_dmabuf(
             false,
         );
     };
-    match gfx.present_dmabuf(surface_id, fd, width, height, stride, fourcc, modifier, offset) {
+    match gfx.present_dmabuf(surface_id, fd, width, height, stride, fourcc, modifier, offset, top_down) {
         Ok(()) => {
             crate::debug!("presented dmabuf on surface {surface_id} ({width}x{height})");
             (Some(Message::Ack), vec![], false)
