@@ -59,3 +59,9 @@ keyboard path, so a key that is itself bound to a touch triggers that touch.
   LB/RB are Page Up/Down.
 * `PENGUDROID_GAMEPAD=off` — ignore controllers.
 * `PENGUDROID_TRACE_INPUT=1` — log every controller event the app receives.
+
+The profile is checked against the live API-37 InputManager under `CheckJNI`
+for both Xbox One and Xbox 360 identities. Axis and button conventions follow
+[Android controller input](https://developer.android.com/games/sdk/game-controller/controller-input).
+This is one logical normalized controller; independent local multiplayer and
+force feedback are not claimed.

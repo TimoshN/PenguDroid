@@ -8337,7 +8337,8 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
 pub fn probe_keyboard(env: &JniEnv) -> bool {
     let run = || -> Option<()> {
         install_virtual_keyboard(env)?;
-        let _frame = env.local_frame(16)?;
+        let _frame = env.local_frame(128)?;
+        install_virtual_gamepad(env)?;
         let class = env.find_class("android/view/KeyCharacterMap")?;
         let load = env.static_method_id(class, "load", "(I)Landroid/view/KeyCharacterMap;")?;
         let map = env.call_static_object(class, load, &[JValue { i: -1 }])?;
@@ -8359,6 +8360,16 @@ pub fn probe_keyboard(env: &JniEnv) -> bool {
         // (not InputDevice lookup) is allowed to use the virtual fallback.
         let missing = env.call_static_object(device_class, get_device, &[JValue { i: 123456 }])?;
         if !missing.is_null() { return None; }
+        let controller = env.call_static_object(device_class, get_device, &[JValue { i: 2 }])?;
+        if controller.is_null() { return None; }
+        let supports = env.method_id(device_class, "supportsSource", "(I)Z")?;
+        for source in [0x401, 0x201, 0x0100_0010] {
+            if env.call_boolean(controller, supports, &[JValue { i: source }]) != Some(true) { return None; }
+        }
+        let product = env.method_id(device_class, "getProductId", "()I")?;
+        let expected = if std::env::var("PENGUDROID_GAMEPAD_PROFILE").as_deref() == Ok("xbox360") { 0x028e } else { 0x02dd };
+        if env.call_int(controller, product, &[])? != expected { return None; }
+        println!("controller: InputManager -> Xbox profile -> gamepad/dpad/joystick sources passed");
         println!("keyboard: InputManager -> InputDevice(-1) -> native KeyCharacterMap: 6 Unicode cases passed");
         Some(())
     };
@@ -8477,6 +8488,9 @@ fn build_virtual_key_character_map(env: &JniEnv) -> Option<JObject> {
 }
 
 fn install_virtual_gamepad(env: &JniEnv) -> Option<()> {
+    // Refuse a stale/mismatched shim rather than claiming that a device was
+    // registered when the Binder backend cannot publish it.
+    shim_symbol("__pengudroid_binder_set_gamepad_device")?;
     let legacy = std::env::var("PENGUDROID_GAMEPAD_PROFILE").as_deref() == Ok("xbox360");
     let name = env.new_string(if legacy { "Xbox 360 Controller" } else { "Xbox One Controller" });
     let descriptor = env.new_string(if legacy { "pengudroid:xbox360-gamepad" } else { "pengudroid:xbox-one-gamepad" });

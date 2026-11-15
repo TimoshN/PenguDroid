@@ -197,3 +197,14 @@ fn android17_core_services_under_checkjni() {
         "native KeyCharacterMap: 6 Unicode cases passed",
     ] { assert!(text.contains(expected), "missing {expected}:\n{text}"); }
 }
+
+#[test]
+fn android17_normalized_controller_profiles_under_checkjni() {
+    let Some(root) = optional_android17_sysroot() else { return };
+    for (label, profile) in [("xbox-one", "xboxone"), ("xbox-360", "xbox360")] {
+        let text = run_framework_probe(&root, label, false, false,
+            &[("PENGUDROID_GAMEPAD_PROFILE", profile)]);
+        assert!(text.contains("controller: InputManager -> Xbox profile -> gamepad/dpad/joystick sources passed"),
+            "normalized controller profile was not returned by the live Android InputManager: {text}");
+    }
+}
