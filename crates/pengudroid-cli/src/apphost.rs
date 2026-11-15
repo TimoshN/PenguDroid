@@ -1196,6 +1196,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         report_display_metrics(env);
         fix_app_configuration(env, data);
         report_application(env, thread);
+        if let Ok(names) = std::env::var("PENGUDROID_PROBE_SERVICES") {
+            probe_services(env, thread, &names);
+        }
         if let Ok(name) = std::env::var("PENGUDROID_LOAD_LIB") {
             probe_load_library(env, &name);
         }
@@ -3523,6 +3526,40 @@ fn report_display_metrics(env: &JniEnv) {
 /// `handleBindApplication` instantiates it through `Instrumentation`; if that
 /// silently produced nothing, the app's own `onCreate` (where Roblox loads its
 /// native library) never runs.
+/// `PENGUDROID_PROBE_SERVICES=sensor,vibrator,...`: report which
+/// `Context.getSystemService` names come back null (or throw) for the app.
+fn probe_services(env: &JniEnv, thread: JObject, names: &str) {
+    let Some(_frame) = env.local_frame(64) else { return };
+    let Some(thread_class) = env.find_class("android/app/ActivityThread") else { return };
+    let Some(field) = env.field_id(thread_class, "mInitialApplication", "Landroid/app/Application;") else { return };
+    let app = env.object_field(thread, field);
+    if app.is_null() {
+        return;
+    }
+    let Some(ctx_class) = env.find_class("android/content/Context") else { return };
+    let Some(get) = env.method_id(ctx_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") else { return };
+    for name in names.split(',').filter(|n| !n.is_empty()) {
+        let arg = env.new_string(name);
+        match env.call_object(app, get, &[JValue { l: arg }]) {
+            Some(obj) if !obj.is_null() => {
+                println!("apphost: probe service {name}: present");
+                if name == "user" {
+                    if let Some(um) = env.find_class("android/os/UserManager") {
+                        for m in ["isUserUnlocked", "isUserUnlockingOrUnlocked", "isUserRunning"] {
+                            let sig = "()Z";
+                            if let Some(id) = env.method_id(um, m, sig) {
+                                println!("apphost: probe UserManager.{m}() = {:?}", env.call_boolean(obj, id, &[]));
+                            }
+                        }
+                    }
+                }
+            }
+            Some(_) => println!("apphost: probe service {name}: NULL"),
+            None => println!("apphost: probe service {name}: threw"),
+        }
+    }
+}
+
 fn report_application(env: &JniEnv, thread: JObject) {
     let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
         return;
