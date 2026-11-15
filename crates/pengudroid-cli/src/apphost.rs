@@ -1056,6 +1056,10 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         env.exception_check();
         eprintln!("apphost: no active network published; apps will report no connectivity");
     }
+    if install_wifi_display_status(env).is_none() {
+        env.exception_check();
+        eprintln!("apphost: no WifiDisplayStatus reply; MediaRouter route selection will NPE");
+    }
     // `RobloxApplication.onCreate` reads `Settings.Global` (through
     // `Settings.NameValueCache`), which resolves the `settings` provider via
     // `IActivityManager.getContentProvider` *during* the bind. The reply has to
@@ -8368,6 +8372,34 @@ fn install_connectivity(env: &JniEnv) -> Option<()> {
         JValue { i: 1 }, JValue { i: 0 }, JValue { l: env.new_string("WIFI") }, JValue { l: env.new_string("") },
     ])?;
     let state_class = env.find_class("android/net/NetworkInfo$DetailedState")?;
+/// Answer `IDisplayManager.getWifiDisplayStatus` with an empty status (no
+/// Miracast hardware, nothing connected).
+///
+/// `MediaRouter.selectRouteStatic` dereferences the result unconditionally;
+/// a null answer threw out of the main Looper as soon as YouTube's cast
+/// support selected the default route.
+fn install_wifi_display_status(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let stub = env.find_class("android/hardware/display/IDisplayManager$Stub")?;
+    let code = u32::try_from(env.static_int_field(stub,
+        env.static_field_id(stub, "TRANSACTION_getWifiDisplayStatus", "I")?)).ok()?;
+    let (_, status) = new_instance(env, "android/hardware/display/WifiDisplayStatus")?;
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let parcel = env.call_static_object(parcel_class,
+        env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?, &[])?;
+    let write_typed = env.method_id(parcel_class, "writeTypedObject", "(Landroid/os/Parcelable;I)V")?;
+    if !env.call_void(parcel, write_typed, &[JValue { l: status }, JValue { i: 0 }]) {
+        return None;
+    }
+    let body = env.byte_array_copy(env.call_object(parcel,
+        env.method_id(parcel_class, "marshall", "()[B")?, &[])?)?;
+    let setter = shim_symbol("__pengudroid_binder_set_reply")?;
+    let setter: unsafe extern "C" fn(*const u8, usize, u32, *const u8, usize) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    let service = b"display";
+    unsafe { setter(service.as_ptr(), service.len(), code, body.as_ptr(), body.len()) }.then_some(())
+}
+
     let connected = env.static_object_field(state_class,
         env.static_field_id(state_class, "CONNECTED", "Landroid/net/NetworkInfo$DetailedState;")?);
     let set_state = env.method_id(info_class, "setDetailedState",
