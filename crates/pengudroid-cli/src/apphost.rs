@@ -8289,6 +8289,20 @@ fn install_connectivity(env: &JniEnv) -> Option<()> {
         env.call_void(link, set_name, &[JValue { l: env.new_string("wlan0") }]);
     }
 
+    // `registerNetworkCallback`/`requestNetwork` keep the callback only when
+    // the service hands back a NetworkRequest. Without one, the later
+    // `unregisterNetworkCallback` throws "NetworkCallback was not registered"
+    // (Chromium does this when the last WebView goes away: Genshin crashed
+    // right after its login pages closed). Callbacks are never invoked; the
+    // network above is the only one and never changes.
+    let request_builder = env.find_class("android/net/NetworkRequest$Builder")?;
+    let builder = env.new_object(request_builder, env.method_id(request_builder, "<init>", "()V")?, &[])?;
+    if let Some(add) = env.method_id(request_builder, "addCapability", "(I)Landroid/net/NetworkRequest$Builder;") {
+        env.call_object(builder, add, &[JValue { i: 12 }]);
+    }
+    let request = env.call_object(builder, env.method_id(request_builder, "build", "()Landroid/net/NetworkRequest;")?, &[])?;
+    let request_bytes = typed(request)?;
+
     let info_bytes = typed(info)?;
     let network_bytes = typed(network)?;
     let caps_bytes = typed(caps)?;
@@ -8314,6 +8328,10 @@ fn install_connectivity(env: &JniEnv) -> Option<()> {
         ("getActiveLinkProperties", &link_bytes),
         ("getAllNetworks", &all_networks),
         ("isActiveNetworkMetered", &0i32.to_le_bytes().to_vec()),
+        ("requestNetwork", &request_bytes),
+        ("listenForNetwork", &request_bytes),
+        ("pendingRequestForNetwork", &request_bytes),
+        ("pendingListenForNetwork", &request_bytes),
     ] {
         let Some(code) = code(name) else { continue };
         let service = b"connectivity";

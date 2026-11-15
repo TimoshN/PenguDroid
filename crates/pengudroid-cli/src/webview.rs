@@ -124,7 +124,13 @@ pub(super) fn probe_tick(env: &JniEnv) {
                     env.call_boolean(caps, env.method_id(caps_class, "hasCapability", "(I)Z")?, &[JValue { i: 16 }])
                 }
             };
-            println!("webview: probe connectivity activeNetworkInfo.connected={connected:?} validated={internet:?}");
+            // Chromium registers a NetworkCallback per WebView and unregisters
+            // it when the last one goes away; that must not throw.
+            let callback_class = env.find_class("android/net/ConnectivityManager$NetworkCallback")?;
+            let callback = env.new_object(callback_class, env.method_id(callback_class, "<init>", "()V")?, &[])?;
+            env.call_void(cm, env.method_id(cm_class, "registerDefaultNetworkCallback", "(Landroid/net/ConnectivityManager$NetworkCallback;)V")?, &[JValue { l: callback }]);
+            let unregistered = env.call_void(cm, env.method_id(cm_class, "unregisterNetworkCallback", "(Landroid/net/ConnectivityManager$NetworkCallback;)V")?, &[JValue { l: callback }]);
+            println!("webview: probe connectivity activeNetworkInfo.connected={connected:?} validated={internet:?} callback unregisters={unregistered}");
             Some(())
         })();
     }

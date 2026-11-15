@@ -259,8 +259,11 @@ own `NetworkInfo`, `Network`, `NetworkCapabilities`, `LinkProperties`,
 marshalled by its own Parcel code) through a new generic shim entry point,
 `__pengudroid_binder_set_reply(service, code, body)`. The WebView probe now
 prints `webview: probe connectivity activeNetworkInfo.connected=Some(true)
-validated=Some(true)`. Network callbacks (`registerNetworkCallback`) still never
-fire.
+validated=Some(true)`. `requestNetwork`/`listenForNetwork` (and the
+PendingIntent forms) return a NetworkRequest, so a registered NetworkCallback
+can be unregistered: without it Chromium threw "NetworkCallback was not
+registered" when the last WebView closed after login, and Genshin exited.
+Callbacks are never invoked (one network that never changes).
 
 App data moved from `/tmp/pengudroid-data` (a 16 GB RAM tmpfs here) to
 `$XDG_DATA_HOME/pengudroid/data/<pkg>` (`PENGUDROID_DATA_ROOT`), migrated on
