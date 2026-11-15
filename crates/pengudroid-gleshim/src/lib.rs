@@ -468,6 +468,7 @@ fn log_once(args: std::fmt::Arguments<'_>) {
 
 /// The object behind every `EGLSurface` this crate hands out.
 struct SurfaceRec {
+    window: Option<usize>,
     w: u32,
     h: u32,
     /// The colour texture for each GL share group that drew into this surface,
@@ -494,7 +495,8 @@ struct Target {
     group: u64,
     tex: u32,
     /// `(context serial, fbo)`.
-    fbos: Vec<(u64, u32)>,
+    size: (u32, u32),
+    fbos: Vec<(u64, u32, u32, u32, u32)>,
 }
 
 /// What gleshim knows about a context: a serial unique to this creation (the
@@ -558,22 +560,38 @@ fn env_dim(name: &str, default: u32) -> u32 {
 
 /// Lazily create the colour texture + FBO for `surface`. The host context must
 /// be current on this thread.
+unsafe fn refresh_window_dimensions(rec: &mut SurfaceRec) {
+    let Some(window) = rec.window else { return };
+    let (w, h) = window_size(window as *mut c_void);
+    rec.w = if w > 0 { w } else { env_dim("PENGUDROID_SURFACE_W", rec.w) };
+    rec.h = if h > 0 { h } else { env_dim("PENGUDROID_SURFACE_H", rec.h) };
+}
+
+unsafe fn resize_depth_storage(host: &Host, depth: u32, w: u32, h: u32) -> Result<(), String> {
+    type Bind = unsafe extern "C" fn(u32, u32);
+    type Storage = unsafe extern "C" fn(u32, u32, c_int, c_int);
+    let get = host.get_proc_address.ok_or("host eglGetProcAddress unavailable")?;
+    let bind: Bind = cast_fn(get(c"glBindRenderbuffer".as_ptr())).ok_or("no glBindRenderbuffer")?;
+    let storage: Storage = cast_fn(get(c"glRenderbufferStorage".as_ptr())).ok_or("no glRenderbufferStorage")?;
+    let previous = host_get_integer(host, 0x8CA7) as u32;
+    bind(0x8D41, depth);
+    storage(0x8D41, 0x88F0, w as c_int, h as c_int);
+    bind(0x8D41, previous);
+    Ok(())
+}
+
 /// The texture and FBO the *current* context renders this surface through,
 /// created on first use: the texture once per share group, the FBO once per
 /// context.
 unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), String> {
     let rec = &mut *(surface as *mut SurfaceRec);
+    refresh_window_dimensions(rec);
     let current = host.get_current_context.map(|f| f() as usize).filter(|c| *c != 0)
         .unwrap_or_else(|| CURRENT_CONTEXT.with(|c| c.get()));
     if current == 0 {
         return Err("no current context for the surface's framebuffer".into());
     }
     let info = context_info(current);
-    if let Some(target) = rec.targets.iter().find(|t| t.group == info.group) {
-        if let Some(&(_, fbo)) = target.fbos.iter().find(|(serial, _)| *serial == info.serial) {
-            return Ok((target.tex, fbo));
-        }
-    }
 
     let gen_textures = host
         .gl_gen_textures
@@ -596,6 +614,24 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
     let framebuffer_texture_2d = host
         .gl_framebuffer_texture_2d
         .ok_or_else(|| "host glFramebufferTexture2D is unavailable".to_string())?;
+
+    if let Some(target) = rec.targets.iter_mut().find(|t| t.group == info.group) {
+        if target.size != (rec.w, rec.h) {
+            let previous = host_get_integer(host, 0x8069) as u32;
+            bind_texture(GL_TEXTURE_2D, target.tex);
+            tex_image_2d(GL_TEXTURE_2D, 0, GL_RGBA8, rec.w as c_int, rec.h as c_int,
+                0, GL_RGBA as u32, GL_UNSIGNED_BYTE, std::ptr::null());
+            bind_texture(GL_TEXTURE_2D, previous);
+            target.size = (rec.w, rec.h);
+        }
+        if let Some(entry) = target.fbos.iter_mut().find(|entry| entry.0 == info.serial) {
+            if (entry.3, entry.4) != (rec.w, rec.h) {
+                resize_depth_storage(host, entry.2, rec.w, rec.h)?;
+                entry.3 = rec.w; entry.4 = rec.h;
+            }
+            return Ok((target.tex, entry.1));
+        }
+    }
 
     let tex = match rec.targets.iter().find(|t| t.group == info.group) {
         Some(target) => target.tex,
@@ -623,7 +659,7 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
             tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             bind_texture(GL_TEXTURE_2D, previous);
-            rec.targets.push(Target { group: info.group, tex, fbos: Vec::new() });
+            rec.targets.push(Target { group: info.group, tex, size: (rec.w, rec.h), fbos: Vec::new() });
             tex
         }
     };
@@ -635,8 +671,34 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
     }
     bind_framebuffer(GL_FRAMEBUFFER, fbo);
     framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    // Android window configs advertise depth/stencil. A color-only replacement
+    // makes depth-tested games draw occluded geometry over the foreground.
+    type GenRenderbuffers = unsafe extern "C" fn(c_int, *mut u32);
+    type BindRenderbuffer = unsafe extern "C" fn(u32, u32);
+    type RenderbufferStorage = unsafe extern "C" fn(u32, u32, c_int, c_int);
+    type FramebufferRenderbuffer = unsafe extern "C" fn(u32, u32, u32, u32);
+    let gl_proc = |name: &str| {
+        let name = CString::new(name).ok()?;
+        let ptr = host.get_proc_address?(name.as_ptr());
+        (!ptr.is_null()).then_some(ptr)
+    };
+    let gen: GenRenderbuffers = gl_proc("glGenRenderbuffers").and_then(cast_fn)
+        .ok_or("host glGenRenderbuffers unavailable")?;
+    let bind: BindRenderbuffer = gl_proc("glBindRenderbuffer").and_then(cast_fn)
+        .ok_or("host glBindRenderbuffer unavailable")?;
+    let storage: RenderbufferStorage = gl_proc("glRenderbufferStorage").and_then(cast_fn)
+        .ok_or("host glRenderbufferStorage unavailable")?;
+    let attach: FramebufferRenderbuffer = gl_proc("glFramebufferRenderbuffer").and_then(cast_fn)
+        .ok_or("host glFramebufferRenderbuffer unavailable")?;
+    let previous = host_get_integer(host, 0x8CA7) as u32;
+    let mut depth = 0;
+    gen(1, &mut depth);
+    bind(0x8D41, depth); // GL_RENDERBUFFER
+    storage(0x8D41, 0x88F0, rec.w as c_int, rec.h as c_int); // DEPTH24_STENCIL8
+    attach(GL_FRAMEBUFFER, 0x821A, 0x8D41, depth); // DEPTH_STENCIL_ATTACHMENT
+    bind(0x8D41, previous);
     let target = rec.targets.iter_mut().find(|t| t.group == info.group).unwrap();
-    target.fbos.push((info.serial, fbo));
+    target.fbos.push((info.serial, fbo, depth, rec.w, rec.h));
     Ok((tex, fbo))
 }
 
@@ -680,7 +742,7 @@ fn is_default_framebuffer(name: u32, serial: u64) -> bool {
     surfaces.into_iter().any(|surface| {
         // SAFETY: live surfaces are SurfaceRecs owned by this shim.
         let rec = unsafe { &*(surface as *const SurfaceRec) };
-        rec.targets.iter().any(|t| t.fbos.iter().any(|&(s, fbo)| s == serial && fbo == name))
+        rec.targets.iter().any(|t| t.fbos.iter().any(|&(s, fbo, _, _, _)| s == serial && fbo == name))
     })
 }
 
@@ -2104,6 +2166,7 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
         eprintln!("[gleshim] eglCreateWindowSurface -> {w}x{h}");
     }
     let rec = Box::new(SurfaceRec {
+        window: Some(native_window as usize),
         w,
         h,
         targets: Vec::new(),
@@ -2190,7 +2253,7 @@ pub unsafe extern "C" fn eglCreatePbufferSurface(
             }
         }
     }
-    let rec = Box::new(SurfaceRec { w, h, targets: Vec::new(), surface_id: 0, owns_surface: false });
+    let rec = Box::new(SurfaceRec { window: None, w, h, targets: Vec::new(), surface_id: 0, owns_surface: false });
     let surface = Box::into_raw(rec) as EGLSurface;
     live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).insert(surface as usize);
     surface
@@ -2229,7 +2292,8 @@ pub unsafe extern "C" fn eglQuerySurface(
         return EGL_FALSE;
     }
     // SAFETY: non-null surfaces are `SurfaceRec` pointers from the create calls.
-    let rec = &*(surface as *const SurfaceRec);
+    let rec = &mut *(surface as *mut SurfaceRec);
+    refresh_window_dimensions(rec);
     match attribute {
         0x3057 => {
             *value = rec.w as c_int; // EGL_WIDTH
@@ -2832,9 +2896,13 @@ pub unsafe extern "C" fn glClearColor(red: f32, green: f32, blue: f32, alpha: f3
 
 #[no_mangle]
 pub unsafe extern "C" fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int) {
-    if let Some(f) = host().ok().and_then(|h| h.gl_viewport) {
+    if let Ok(host) = host() {
+        let surface = current_surface() as EGLSurface;
+        if !surface.is_null() { let _ = ensure_fbo(surface, host); }
+        if let Some(f) = host.gl_viewport {
         // SAFETY: forwarded verbatim.
         f(x, y, width, height);
+        }
     }
 }
 
@@ -3063,6 +3131,13 @@ mod tests {
 
             let clear_color: Option<unsafe extern "C" fn(f32, f32, f32, f32)> =
                 gl_proc("glClearColor");
+            let get_integer: unsafe extern "C" fn(u32, *mut i32) =
+                gl_proc("glGetIntegerv").expect("glGetIntegerv must resolve");
+            let mut bits = 0;
+            get_integer(0x0D56, &mut bits); // GL_DEPTH_BITS
+            assert!(bits >= 24, "window framebuffer must support depth testing");
+            get_integer(0x0D57, &mut bits); // GL_STENCIL_BITS
+            assert!(bits >= 8, "window framebuffer must support stencil testing");
             let clear: Option<unsafe extern "C" fn(u32)> = gl_proc("glClear");
             let clear_color = clear_color.expect("glClearColor must resolve");
             let clear = clear.expect("glClear must resolve");
@@ -3077,6 +3152,17 @@ mod tests {
             assert_eq!(exported.height, 48, "export height must match the surface");
             assert_eq!(rec.w, 64);
             assert_eq!(rec.h, 48);
+            std::env::set_var("PENGUDROID_SURFACE_W", "128");
+            std::env::set_var("PENGUDROID_SURFACE_H", "96");
+            let mut queried = 0;
+            assert_eq!(eglQuerySurface(dpy, surface, 0x3057, &mut queried), EGL_TRUE);
+            assert_eq!(queried, 128, "window query must follow the new client size");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            let resized = export_surface_dmabuf(surface).expect("resized dmabuf export");
+            assert_eq!((resized.width, resized.height), (128, 96));
+            libc::close(resized.fd);
+            std::env::set_var("PENGUDROID_SURFACE_W", "64");
+            std::env::set_var("PENGUDROID_SURFACE_H", "48");
             assert_eq!(exported.stride % 4, 0, "stride is not pixel aligned");
             assert!(exported.fourcc != 0, "export returned no fourcc");
 

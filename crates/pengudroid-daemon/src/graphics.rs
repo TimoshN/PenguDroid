@@ -949,8 +949,27 @@ mod imp {
         /// scales it into.
         pub fn surface_geometry(&mut self, id: u32) -> Option<(u32, u32, u32, u32)> {
             self.state.surfaces.get(&id).map(|s| {
-                (s.width, s.height, s.display_width, s.display_height)
+                // A SurfaceView buffer may be recreated during relayout. Its
+                // scaled size is not the desktop's requested window size;
+                // following it feeds the previous buffer size back into ART.
+                let desktop = s.parent_id.and_then(|parent| self.state.surfaces.get(&parent))
+                    .unwrap_or(s);
+                (s.width, s.height, desktop.display_width, desktop.display_height)
             })
+        }
+
+        /// Preserve desktop state when an EGL window is recreated for a
+        /// relayout at exactly the old window's requested client dimensions.
+        pub fn replacement_window_state(&self, id: u32, width: u32, height: u32) -> Option<u32> {
+            let surface = self.state.surfaces.get(&id)?;
+            if surface.xdg_toplevel.is_none()
+                || (surface.display_width, surface.display_height) != (width, height)
+                || (surface.width, surface.height) == (width, height) { return None; }
+            if surface.window_state.contains(WindowState::FULLSCREEN) {
+                Some(pengudroid_proto::WINDOW_FULLSCREEN)
+            } else if surface.window_state.contains(WindowState::MAXIMIZED) {
+                Some(pengudroid_proto::WINDOW_MAXIMIZED)
+            } else { None }
         }
 
         /// Maximize, fullscreen, or return a window to normal. The compositor
@@ -1968,6 +1987,13 @@ mod imp {
             let child = &graphics.state.surfaces[&video];
             assert_eq!(child.display_width, 320);
             assert_eq!(child.display_height, (90 * (480 - header) / 240).max(1));
+            assert_eq!(graphics.surface_geometry(video), Some((160, 90, 640, 480 - header)),
+                "resize follower must observe desktop geometry, not scaled child buffer geometry");
+            graphics.state.surfaces.get_mut(&id).unwrap().window_state = WindowState::MAXIMIZED;
+            assert_eq!(graphics.replacement_window_state(id, 640, 480 - header),
+                Some(pengudroid_proto::WINDOW_MAXIMIZED));
+            assert_eq!(graphics.replacement_window_state(id, 160, 90), None,
+                "unrelated windows must not inherit maximization");
             let top = graphics.state.surfaces[&id].xdg_toplevel.clone().unwrap();
             for maximized in [true, false] {
                 if maximized { top.set_maximized(); } else { top.unset_maximized(); }
@@ -2044,6 +2070,7 @@ mod imp {
         pub fn set_surface_options(&mut self, _id: u32, _enabled: bool) -> bool { false }
         pub fn set_window_state(&mut self, _id: u32, _state: u32) -> bool { false }
         pub fn surface_geometry(&mut self, _id: u32) -> Option<(u32, u32, u32, u32)> { None }
+        pub fn replacement_window_state(&self, _id: u32, _width: u32, _height: u32) -> Option<u32> { None }
         pub fn set_pointer_lock(&mut self, _id: u32, _locked: bool) -> bool { false }
         pub fn pointer_lock_surface(&self) -> Option<u32> { None }
         pub fn contains_surface(&self, _id: u32) -> bool { false }

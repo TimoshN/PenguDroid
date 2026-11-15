@@ -673,8 +673,14 @@ fn handle(
                     false,
                 );
             };
+            let inherited_state = {
+                let owners = daemon.surface_owner.lock().unwrap();
+                owners.iter().filter(|(_, pid)| **pid == peer.pid)
+                    .find_map(|(id, _)| gfx.replacement_window_state(*id, w, h))
+            };
             match gfx.create_toplevel(w, h, &title) {
                 Some(info) => {
+                    if let Some(state) = inherited_state { gfx.set_window_state(info.id, state); }
                     let fd = gfx.surface_fd(info.id);
                     daemon.remember_surface_owner(info.id, peer.pid);
                     crate::info!("created surface {} '{}' {}×{}", info.id, title, w, h);
