@@ -915,17 +915,27 @@ fn install_system_features_cache(env: &JniEnv) -> Option<()> {
     let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
     let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
     // Describe implemented virtual input/audio and screen modes. Do not claim
-    // camera, sensors, telephony, multitouch, or Vulkan hardware capabilities.
+    // camera, sensors, telephony, or multitouch hardware capabilities.
     // Wi-Fi is claimed because ConnectivityManager publishes a Wi-Fi network
     // and the daemon hosts the `wifi` service: without the feature,
     // `getSystemService("wifi")` returns null and apps that assume a
     // WifiManager (Rockstar's GTA ports) crash in `onCreate`.
     for name in ["android.hardware.audio.output", "android.hardware.touchscreen",
         "android.hardware.screen.portrait", "android.hardware.screen.landscape",
-        "android.hardware.wifi"] {
+        "android.hardware.wifi", "android.hardware.vulkan.level",
+        "android.hardware.vulkan.version", "android.hardware.vulkan.compute",
+        "android.hardware.gamepad"] {
+        if name == "android.hardware.gamepad" && std::env::var("PENGUDROID_GAMEPAD").as_deref() == Ok("off") { continue; }
         let (feature_class, feature) = new_instance(env, "android/content/pm/FeatureInfo")?;
         let name_field = env.field_id(feature_class, "name", "Ljava/lang/String;")?;
         env.set_object_field(feature, name_field, env.new_string(name));
+        let version = match name {
+            "android.hardware.vulkan.level" => 1,
+            "android.hardware.vulkan.version" => 0x0040_1000,
+            _ => 0,
+        };
+        let version_field = env.field_id(feature_class, "version", "I")?;
+        env.set_int_field(feature, version_field, version);
         if env.call_boolean(list, add, &[JValue { l: feature }])? != true { return None; }
     }
     let ctor = env.method_id(class, "<init>", "(Ljava/util/Collection;)V")?;
@@ -1032,6 +1042,10 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     }
     if install_virtual_keyboard(env).is_none() {
         eprintln!("apphost: cannot install the Android virtual keyboard");
+        return false;
+    }
+    if std::env::var("PENGUDROID_GAMEPAD").as_deref() != Ok("off") && install_virtual_gamepad(env).is_none() {
+        eprintln!("apphost: cannot register the normalized Xbox One input device");
         return false;
     }
     if install_system_features_cache(env).is_none() {
@@ -5356,7 +5370,26 @@ fn spawn_input_pump(env: &JniEnv) {
             .and_then(|c| env.method_id(c, "setAxisValue", "(IF)V"));
         // Records queued by the controller, ahead of the compositor's.
         let mut synthetic: std::collections::VecDeque<(u32, f32, f32)> = std::collections::VecDeque::new();
+        let mut kernel_touch_readers: Vec<_> = pengudroid_input::uinput::touchscreens(&[])
+            .into_iter().filter_map(|path| pengudroid_input::KernelTouchReader::open(&path).ok()).collect();
+
         loop {
+            for (device, reader) in kernel_touch_readers.iter_mut().enumerate() {
+                if let Ok(events) = reader.drain() {
+                    for event in events {
+                        let id = 1000 + device as i32 * 32 + event.slot;
+                        let (x, y) = (event.norm_x * surface_w() as f32, event.norm_y * surface_h() as f32);
+                        use crate::keymap_gesture::Event;
+                        let touch = match event.phase {
+                            pengudroid_input::KernelTouchPhase::Down => Event::Down { id, x, y },
+                            pengudroid_input::KernelTouchPhase::Move => Event::Move { id, x, y },
+                            pengudroid_input::KernelTouchPhase::Up => Event::Up { id, x, y },
+                        };
+                        send_touch(touch);
+                    }
+                }
+            }
+
             if let Some(rx) = &pad_rx {
                 let mut outs = Vec::new();
                 while let Ok(event) = rx.try_recv() {
@@ -5392,7 +5425,7 @@ fn spawn_input_pump(env: &JniEnv) {
                                 JValue { j: down }, JValue { j: now },
                                 JValue { i: if pressed { 0 } else { 1 } }, JValue { i: keycode },
                                 JValue { i: 0 }, JValue { i: 0 },
-                                JValue { i: -1 }, JValue { i: 0 }, JValue { i: 0 },
+                                JValue { i: 2 }, JValue { i: 0 }, JValue { i: 0 },
                                 JValue { i: 0x401 }, // SOURCE_GAMEPAD | SOURCE_KEYBOARD
                             ]) {
                                 if !event.is_null() {
@@ -5422,7 +5455,7 @@ fn spawn_input_pump(env: &JniEnv) {
                                 JValue { j: now }, JValue { j: now }, JValue { i: ACTION_MOVE },
                                 JValue { i: 1 }, JValue { l: props }, JValue { l: coords },
                                 JValue { i: 0 }, JValue { i: 0 }, JValue { f: 1.0 }, JValue { f: 1.0 },
-                                JValue { i: -1 }, JValue { i: 0 },
+                                JValue { i: 2 }, JValue { i: 0 },
                                 JValue { i: 0x0100_0010 }, // SOURCE_JOYSTICK
                                 JValue { i: 0 },
                             ]) else { continue };
@@ -8409,6 +8442,124 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
     let data = marshal_object(env, device, "android/view/InputDevice")?;
     install_reply(&data, "__pengudroid_binder_set_input_device");
     println!("apphost: virtual keyboard installed; native character map validated");
+    Some(())
+}
+
+fn build_virtual_key_character_map(env: &JniEnv) -> Option<JObject> {
+    let raw = crate::keyboard::virtual_character_map_parcel();
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let parcel = env.call_static_object(parcel_class, obtain, &[])?;
+    if parcel.is_null() {
+        return None;
+    }
+    let bytes = env.new_byte_array(raw.len() as i32)?;
+    env.set_byte_array_region(bytes, 0, &raw);
+    let unmarshall = env.method_id(parcel_class, "unmarshall", "([BII)V")?;
+    if !env.call_void(
+        parcel,
+        unmarshall,
+        &[JValue { l: bytes }, JValue { i: 0 }, JValue { i: raw.len() as i32 }],
+    ) {
+        return None;
+    }
+    let reset = env.method_id(parcel_class, "setDataPosition", "(I)V")?;
+    if !env.call_void(parcel, reset, &[JValue { i: 0 }]) {
+        return None;
+    }
+    let map_class = env.find_class("android/view/KeyCharacterMap")?;
+    let ctor = env.method_id(map_class, "<init>", "(Landroid/os/Parcel;)V")?;
+    let map = env.new_object(map_class, ctor, &[JValue { l: parcel }]);
+    if let Some(recycle) = env.method_id(parcel_class, "recycle", "()V") {
+        let _ = env.call_void(parcel, recycle, &[]);
+    }
+    map.filter(|m| !m.is_null())
+}
+
+fn install_virtual_gamepad(env: &JniEnv) -> Option<()> {
+    let legacy = std::env::var("PENGUDROID_GAMEPAD_PROFILE").as_deref() == Ok("xbox360");
+    let name = env.new_string(if legacy { "Xbox 360 Controller" } else { "Xbox One Controller" });
+    let descriptor = env.new_string(if legacy { "pengudroid:xbox360-gamepad" } else { "pengudroid:xbox-one-gamepad" });
+    let (class, builder) = new_instance(env, "android/view/InputDevice$Builder")?;
+    // SOURCE_KEYBOARD (0x101) | SOURCE_DPAD (0x201) | SOURCE_GAMEPAD (0x401) | SOURCE_JOYSTICK (0x01000010)
+    const SOURCES_XBOX: i32 = 0x0100_0711;
+    const SOURCE_JOYSTICK: i32 = 0x0100_0010;
+    for (method, value) in [
+        ("setId", 2),
+        ("setGeneration", 1),
+        ("setControllerNumber", 1),
+        ("setVendorId", 0x045e),
+        ("setProductId", if legacy { 0x028e } else { 0x02dd }),
+        ("setSources", SOURCES_XBOX),
+        ("setKeyboardType", 1),
+    ] {
+        let m = env.method_id(class, method, "(I)Landroid/view/InputDevice$Builder;")?;
+        env.call_object(builder, m, &[JValue { i: value }])?;
+    }
+    for (method, value) in [("setName", name), ("setDescriptor", descriptor)] {
+        let m = env.method_id(class, method, "(Ljava/lang/String;)Landroid/view/InputDevice$Builder;")?;
+        env.call_object(builder, m, &[JValue { l: value }])?;
+    }
+    for method in ["setExternal", "setEnabled"] {
+        let m = env.method_id(class, method, "(Z)Landroid/view/InputDevice$Builder;")?;
+        env.call_object(builder, m, &[JValue { z: 1 }])?;
+    }
+    let kcm = build_virtual_key_character_map(env)?;
+    let set_map = env.method_id(
+        class,
+        "setKeyCharacterMap",
+        "(Landroid/view/KeyCharacterMap;)Landroid/view/InputDevice$Builder;",
+    )?;
+    env.call_object(builder, set_map, &[JValue { l: kcm }])?;
+    let add_range = env.method_id(
+        class,
+        "addMotionRange",
+        "(IIFFFFF)Landroid/view/InputDevice$Builder;",
+    )?;
+    for &(axis, min, max, flat, fuzz) in &[
+        (0, -1.0f32, 1.0f32, 0.05f32, 0.01f32),  // AXIS_X
+        (1, -1.0, 1.0, 0.05, 0.01),              // AXIS_Y
+        (11, -1.0, 1.0, 0.05, 0.01),             // AXIS_Z (RX)
+        (14, -1.0, 1.0, 0.05, 0.01),             // AXIS_RZ (RY)
+        (15, -1.0, 1.0, 0.0, 0.0),               // AXIS_HAT_X
+        (16, -1.0, 1.0, 0.0, 0.0),               // AXIS_HAT_Y
+        (17, 0.0, 1.0, 0.0, 0.0),                // AXIS_LTRIGGER
+        (18, 0.0, 1.0, 0.0, 0.0),                // AXIS_RTRIGGER
+        (22, 0.0, 1.0, 0.0, 0.0),                // AXIS_GAS
+        (23, 0.0, 1.0, 0.0, 0.0),                // AXIS_BRAKE
+    ] {
+        env.call_object(
+            builder,
+            add_range,
+            &[
+                JValue { i: axis },
+                JValue { i: SOURCE_JOYSTICK },
+                JValue { f: min },
+                JValue { f: max },
+                JValue { f: flat },
+                JValue { f: fuzz },
+                JValue { f: 0.0 },
+            ],
+        )?;
+    }
+    let build = env.method_id(class, "build", "()Landroid/view/InputDevice;")?;
+    let device = env.call_object(builder, build, &[])?;
+    if device.is_null() {
+        return None;
+    }
+    let device_class = env.find_class("android/view/InputDevice")?;
+    for (method, expected) in [("getId", 2), ("getVendorId", 0x045e),
+        ("getProductId", if legacy { 0x028e } else { 0x02dd })] {
+        let get = env.method_id(device_class, method, "()I")?;
+        if env.call_int(device, get, &[])? != expected { return None; }
+    }
+    let range = env.method_id(device_class, "getMotionRange", "(I)Landroid/view/InputDevice$MotionRange;")?;
+    for axis in [0, 1, 11, 14, 15, 16, 17, 18, 22, 23] {
+        if env.call_object(device, range, &[JValue { i: axis }])?.is_null() { return None; }
+    }
+    let data = marshal_object(env, device, "android/view/InputDevice")?;
+    install_reply(&data, "__pengudroid_binder_set_gamepad_device");
+    println!("apphost: normalized Xbox {} Controller (id=2) installed", if legacy { "360" } else { "One" });
     Some(())
 }
 

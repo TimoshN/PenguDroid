@@ -2,7 +2,25 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current — 0.2.0 portable release and Genshin gameplay (2026-11-15)
+## Current — 0.2.1 Vulkan ZZZ boot, upright presentation, and AppImage X11 fix (2026-11-15)
+
+Pick up here. See [ZZZ_HANDOFF.md](ZZZ_HANDOFF.md) for the full Vulkan / Zenless Zone Zero handoff.
+
+Summary of what landed in 0.2.1:
+
+- **Vulkan loader shadowing fix** (`crates/pengudroid-cli/src/sysroot.rs`): preloaded `libpengudroid_vkshim.so` and host `libvulkan.so.1` in `LD_PRELOAD` so driverless `art-libs/libvulkan.so` no longer shadows `vkGetInstanceProcAddr` / `vkCreateInstance`.
+- **Direct `libvulkan.so.1` host resolution** (`crates/pengudroid-vkshim/src/lib.rs`): `HostLoader` resolves `vkDestroyInstance`, `vkEnumerateDeviceExtensionProperties`, `vkCreateDevice`, and `vkDestroyDevice` directly from `libvulkan.so.1` via `dlsym`, preventing `LD_PRELOAD` recursion segfaults.
+- **OpenSL ES `SL_IID_*` `.rodata` backing** (`crates/pengudroid-shim/src/lib.rs`): `SL_IID_*` symbols now point to real 64-byte `SLInterfaceID_` structs instead of `0x5044_00xx` integer sentinels, fixing the `SIGSEGV` at `0x50440030` in `libAkSoundEngine.so` (Wwise).
+- **Vulkan top-down orientation** (`pengudroid-proto`, `pengudroid-daemon`, `pengudroid-vkshim`, `pengudroid-gleshim`, `pengudroid-cli`): added `top_down: bool` to `Message::PresentDmabuf`. Vulkan presents with `top_down: true` (`wl_output::Transform::Normal`), while GL paths keep `top_down: false` (`Flipped180`).
+- **AppImage `libxkbcommon-x11` bundling** (`tools/package-portable.py`): added `libxkbcommon-x11.so.0` (and unversioned `libxkbcommon-x11.so` symlink) to the portable closure for `appimage.github.io` / X11-only containers.
+
+Live ZZZ (`com.HoYoverse.Nap` 3.3.0) launches via `PenguDroid-x86_64.AppImage --cli launch` and reaches continuous upright Vulkan presentation (`492` frames by `t=140s`, `failed=0`).
+
+Next (for ZZZ playability):
+1. Wire `SubscribeInput` / `pengudroid_input_poll` for Vulkan surfaces (`pengudroid-vkshim` currently creates the daemon surface without subscribing to compositor input, so clicks/touches do not reach the game).
+2. Profile/reduce cold-start Berberis JIT warmup (~100–480 s) and optimize `vkQueuePresentKHR` frame pacing (currently `vkQueueWaitIdle` + synchronous `PresentDmabuf` IPC per frame).
+
+## Previous — 0.2.0 portable release and Genshin gameplay (2026-11-15)
 
 Genshin Impact 7.2.0 now has user-supplied in-world gameplay evidence on RTX 3080
 Founders Edition / Core i3-12100F with ARM64 Digitalis. The README includes that

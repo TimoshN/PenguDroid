@@ -20,6 +20,7 @@ ARTIFACTS = (
     "pengudroid-daemon",
     "libpengudroid_shim.so",
     "libpengudroid_gleshim.so",
+    "libpengudroid_vkshim.so",
 )
 
 

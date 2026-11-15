@@ -92,6 +92,24 @@ pub fn find_gleshim() -> Option<PathBuf> {
     }
 }
 
+/// Locate `libpengudroid_vkshim.so` (the Android Vulkan WSI shim) next to this
+/// executable.
+pub fn find_vkshim() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("PENGUDROID_VKSHIM") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidate = dir.join("libpengudroid_vkshim.so");
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 /// Create (or refresh) the compat directory. Returns its path.
 ///
 /// Every Bionic soname an Android object might `DT_NEEDED` resolves to the
@@ -146,11 +164,12 @@ pub fn ensure_compat_dir() -> Result<PathBuf, String> {
         let _ = symlink(&dir.join("libGLESv1_CM.so"), &gles1);
     }
 
-    // Vulkan: Android's `libvulkan.so` is a loader; the host's loader is the
-    // right implementation (it finds the NVIDIA/AMD/Intel ICDs), so map the
-    // Bionic soname straight onto it. No translation layer is needed because
-    // Vulkan's ABI is identical on Android and Linux.
-    if let Some(vk) = find_host_lib(&["libvulkan.so.1"]) {
+    // Vulkan: Android's `libvulkan.so` is routed through `libpengudroid_vkshim.so`
+    // (which adds VK_KHR_android_surface + DMA-BUF swapchain WSI over host
+    // `libvulkan.so.1`), falling back to the host loader when unavailable.
+    if let Some(vkshim) = find_vkshim() {
+        let _ = symlink(&dir.join("libvulkan.so"), &vkshim);
+    } else if let Some(vk) = find_host_lib(&["libvulkan.so.1"]) {
         let _ = symlink(&dir.join("libvulkan.so"), &vk);
         let _ = symlink(&dir.join("libvulkan.so.1"), &vk);
     }

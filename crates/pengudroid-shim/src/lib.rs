@@ -5561,127 +5561,127 @@ static BQ_VTABLE: SLAndroidSimpleBufferQueueItf_ = SLAndroidSimpleBufferQueueItf
 pub struct SlInterfaceId(pub *const u8);
 unsafe impl Sync for SlInterfaceId {}
 #[no_mangle]
-pub static SL_IID_ENGINE: SlInterfaceId = SlInterfaceId((&[96, 194, 151, 141, 212, 221, 219, 17, 143, 149, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ENGINE: SlInterfaceId = SlInterfaceId((&[96, 194, 151, 141, 212, 221, 219, 17, 143, 149, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_BUFFERQUEUE: SlInterfaceId = SlInterfaceId((&[192, 156, 201, 43, 212, 221, 219, 17, 153, 141, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_BUFFERQUEUE: SlInterfaceId = SlInterfaceId((&[192, 156, 201, 43, 212, 221, 219, 17, 153, 141, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_VOLUME: SlInterfaceId = SlInterfaceId((&[224, 237, 232, 9, 222, 221, 219, 17, 246, 180, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_VOLUME: SlInterfaceId = SlInterfaceId((&[224, 237, 232, 9, 222, 221, 219, 17, 246, 180, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_PLAY: SlInterfaceId = SlInterfaceId((&[192, 217, 11, 239, 215, 221, 219, 17, 73, 191, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_PLAY: SlInterfaceId = SlInterfaceId((&[192, 217, 11, 239, 215, 221, 219, 17, 73, 191, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_RECORD: SlInterfaceId = SlInterfaceId((&[160, 122, 101, 197, 219, 221, 219, 17, 247, 130, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_RECORD: SlInterfaceId = SlInterfaceId((&[160, 122, 101, 197, 219, 221, 219, 17, 247, 130, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_SEEK: SlInterfaceId = SlInterfaceId((&[160, 53, 49, 212, 220, 221, 219, 17, 88, 180, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_SEEK: SlInterfaceId = SlInterfaceId((&[160, 53, 49, 212, 220, 221, 219, 17, 88, 180, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_MUTESOLO: SlInterfaceId = SlInterfaceId((&[224, 235, 40, 90, 215, 221, 219, 17, 32, 130, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_MUTESOLO: SlInterfaceId = SlInterfaceId((&[224, 235, 40, 90, 215, 221, 219, 17, 32, 130, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_PRELOADSTATUS: SlInterfaceId = SlInterfaceId((&[8, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+pub static SL_IID_PRELOADSTATUS: SlInterfaceId = SlInterfaceId((&[8, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDSIMPLEBUFFERQUEUE: SlInterfaceId = SlInterfaceId((&[9, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+pub static SL_IID_ANDROIDSIMPLEBUFFERQUEUE: SlInterfaceId = SlInterfaceId((&[9, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDCONFIGURATION: SlInterfaceId = SlInterfaceId((&[224, 167, 246, 137, 172, 190, 223, 17, 92, 139, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ANDROIDCONFIGURATION: SlInterfaceId = SlInterfaceId((&[224, 167, 246, 137, 172, 190, 223, 17, 92, 139, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDEFFECT: SlInterfaceId = SlInterfaceId((&[96, 218, 18, 174, 172, 153, 223, 17, 86, 180, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ANDROIDEFFECT: SlInterfaceId = SlInterfaceId((&[96, 218, 18, 174, 172, 153, 223, 17, 86, 180, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDEFFECTSEND: SlInterfaceId = SlInterfaceId((&[192, 98, 228, 123, 67, 188, 223, 17, 112, 134, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ANDROIDEFFECTSEND: SlInterfaceId = SlInterfaceId((&[192, 98, 228, 123, 67, 188, 223, 17, 112, 134, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDEFFECTCAPABILITIES: SlInterfaceId = SlInterfaceId((&[96, 109, 79, 106, 230, 181, 223, 17, 59, 187, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ANDROIDEFFECTCAPABILITIES: SlInterfaceId = SlInterfaceId((&[96, 109, 79, 106, 230, 181, 223, 17, 59, 187, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_EQUALIZER: SlInterfaceId = SlInterfaceId((&[0, 67, 237, 11, 214, 221, 219, 17, 52, 143, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_EQUALIZER: SlInterfaceId = SlInterfaceId((&[0, 67, 237, 11, 214, 221, 219, 17, 52, 143, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ENVIRONMENTALREVERB: SlInterfaceId = SlInterfaceId((&[240, 213, 229, 194, 189, 148, 99, 71, 172, 156, 78, 35, 77, 6, 131, 158]).as_ptr());
+pub static SL_IID_ENVIRONMENTALREVERB: SlInterfaceId = SlInterfaceId((&[240, 213, 229, 194, 189, 148, 99, 71, 172, 156, 78, 35, 77, 6, 131, 158, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_PRESETREVERB: SlInterfaceId = SlInterfaceId((&[96, 45, 56, 71, 216, 221, 219, 17, 58, 191, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_PRESETREVERB: SlInterfaceId = SlInterfaceId((&[96, 45, 56, 71, 216, 221, 219, 17, 58, 191, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_VIRTUALIZER: SlInterfaceId = SlInterfaceId((&[0, 44, 204, 55, 221, 221, 219, 17, 119, 133, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_VIRTUALIZER: SlInterfaceId = SlInterfaceId((&[0, 44, 204, 55, 221, 221, 219, 17, 119, 133, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_BASSBOOST: SlInterfaceId = SlInterfaceId((&[32, 242, 52, 6, 212, 221, 219, 17, 252, 160, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_BASSBOOST: SlInterfaceId = SlInterfaceId((&[32, 242, 52, 6, 212, 221, 219, 17, 252, 160, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_OUTPUTMIX: SlInterfaceId = SlInterfaceId((&[96, 15, 117, 151, 215, 221, 219, 17, 177, 146, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_OUTPUTMIX: SlInterfaceId = SlInterfaceId((&[96, 15, 117, 151, 215, 221, 219, 17, 177, 146, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_AUDIODECODERCAPABILITIES: SlInterfaceId = SlInterfaceId((&[160, 163, 229, 63, 198, 252, 219, 17, 172, 148, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_AUDIODECODERCAPABILITIES: SlInterfaceId = SlInterfaceId((&[160, 163, 229, 63, 198, 252, 219, 17, 172, 148, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_AUDIOENCODERCAPABILITIES: SlInterfaceId = SlInterfaceId((&[64, 163, 82, 15, 209, 252, 219, 17, 147, 169, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_AUDIOENCODERCAPABILITIES: SlInterfaceId = SlInterfaceId((&[64, 163, 82, 15, 209, 252, 219, 17, 147, 169, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_AUDIOENCODER: SlInterfaceId = SlInterfaceId((&[122, 175, 213, 215, 28, 53, 166, 65, 236, 148, 26, 201, 92, 113, 130, 44]).as_ptr());
+pub static SL_IID_AUDIOENCODER: SlInterfaceId = SlInterfaceId((&[122, 175, 213, 215, 28, 53, 166, 65, 236, 148, 26, 201, 92, 113, 130, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_AUDIOIODEVICECAPABILITIES: SlInterfaceId = SlInterfaceId((&[192, 77, 86, 178, 211, 221, 219, 17, 98, 189, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_AUDIOIODEVICECAPABILITIES: SlInterfaceId = SlInterfaceId((&[192, 77, 86, 178, 211, 221, 219, 17, 98, 189, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_DEVICEVOLUME: SlInterfaceId = SlInterfaceId((&[96, 71, 99, 225, 226, 243, 219, 17, 169, 156, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_DEVICEVOLUME: SlInterfaceId = SlInterfaceId((&[96, 71, 99, 225, 226, 243, 219, 17, 169, 156, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_DYNAMICINTERFACEMANAGEMENT: SlInterfaceId = SlInterfaceId((&[64, 101, 147, 99, 117, 247, 219, 17, 196, 156, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_DYNAMICINTERFACEMANAGEMENT: SlInterfaceId = SlInterfaceId((&[64, 101, 147, 99, 117, 247, 219, 17, 196, 156, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_EFFECTSEND: SlInterfaceId = SlInterfaceId((&[0, 210, 231, 86, 212, 221, 219, 17, 251, 174, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_EFFECTSEND: SlInterfaceId = SlInterfaceId((&[0, 210, 231, 86, 212, 221, 219, 17, 251, 174, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_LED: SlInterfaceId = SlInterfaceId((&[128, 205, 193, 44, 214, 221, 219, 17, 126, 128, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_LED: SlInterfaceId = SlInterfaceId((&[128, 205, 193, 44, 214, 221, 219, 17, 126, 128, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_METADATAEXTRACTION: SlInterfaceId = SlInterfaceId((&[128, 31, 91, 170, 214, 221, 219, 17, 142, 172, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_METADATAEXTRACTION: SlInterfaceId = SlInterfaceId((&[128, 31, 91, 170, 214, 221, 219, 17, 142, 172, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_METADATATRAVERSAL: SlInterfaceId = SlInterfaceId((&[192, 98, 54, 196, 214, 221, 219, 17, 171, 167, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_METADATATRAVERSAL: SlInterfaceId = SlInterfaceId((&[192, 98, 54, 196, 214, 221, 219, 17, 171, 167, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_NULL: SlInterfaceId = SlInterfaceId((&[236, 120, 113, 236, 225, 229, 50, 68, 244, 163, 70, 87, 230, 121, 82, 16]).as_ptr());
+pub static SL_IID_NULL: SlInterfaceId = SlInterfaceId((&[236, 120, 113, 236, 225, 229, 50, 68, 244, 163, 70, 87, 230, 121, 82, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_OBJECT: SlInterfaceId = SlInterfaceId((&[96, 99, 33, 121, 215, 221, 219, 17, 22, 172, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_OBJECT: SlInterfaceId = SlInterfaceId((&[96, 99, 33, 121, 215, 221, 219, 17, 22, 172, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_PLAYBACKRATE: SlInterfaceId = SlInterfaceId((&[64, 42, 59, 46, 218, 221, 219, 17, 73, 163, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_PLAYBACKRATE: SlInterfaceId = SlInterfaceId((&[64, 42, 59, 46, 218, 221, 219, 17, 73, 163, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_RATEPITCH: SlInterfaceId = SlInterfaceId((&[96, 46, 182, 97, 218, 221, 219, 17, 184, 158, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_RATEPITCH: SlInterfaceId = SlInterfaceId((&[96, 46, 182, 97, 218, 221, 219, 17, 184, 158, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_STREAMINFORMATION: SlInterfaceId = SlInterfaceId((&[224, 143, 98, 58, 56, 18, 222, 17, 159, 173, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_STREAMINFORMATION: SlInterfaceId = SlInterfaceId((&[224, 143, 98, 58, 56, 18, 222, 17, 159, 173, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_VIBRA: SlInterfaceId = SlInterfaceId((&[96, 141, 154, 22, 221, 221, 219, 17, 61, 146, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_VIBRA: SlInterfaceId = SlInterfaceId((&[96, 141, 154, 22, 221, 221, 219, 17, 61, 146, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_VISUALIZATION: SlInterfaceId = SlInterfaceId((&[160, 38, 107, 228, 221, 221, 219, 17, 253, 138, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_VISUALIZATION: SlInterfaceId = SlInterfaceId((&[160, 38, 107, 228, 221, 221, 219, 17, 253, 138, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_XAUDIO2EFFECTSEND: SlInterfaceId = SlInterfaceId((&[37, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+pub static SL_IID_XAUDIO2EFFECTSEND: SlInterfaceId = SlInterfaceId((&[37, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_AUDIOPLAYER: SlInterfaceId = SlInterfaceId((&[38, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+pub static SL_IID_AUDIOPLAYER: SlInterfaceId = SlInterfaceId((&[38, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_AUDIORECORDER: SlInterfaceId = SlInterfaceId((&[39, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+pub static SL_IID_AUDIORECORDER: SlInterfaceId = SlInterfaceId((&[39, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DDOPPLER: SlInterfaceId = SlInterfaceId((&[128, 154, 92, 180, 210, 221, 219, 17, 40, 176, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_3DDOPPLER: SlInterfaceId = SlInterfaceId((&[128, 154, 92, 180, 210, 221, 219, 17, 40, 176, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DGROUPING: SlInterfaceId = SlInterfaceId((&[224, 68, 232, 235, 210, 221, 219, 17, 16, 181, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_3DGROUPING: SlInterfaceId = SlInterfaceId((&[224, 68, 232, 235, 210, 221, 219, 17, 16, 181, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DHEADPHONEREFLECTIONS: SlInterfaceId = SlInterfaceId((&[42, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+pub static SL_IID_3DHEADPHONEREFLECTIONS: SlInterfaceId = SlInterfaceId((&[42, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DLOCATION: SlInterfaceId = SlInterfaceId((&[32, 128, 135, 43, 211, 221, 219, 17, 1, 138, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_3DLOCATION: SlInterfaceId = SlInterfaceId((&[32, 128, 135, 43, 211, 221, 219, 17, 1, 138, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DMACROSCOPIC: SlInterfaceId = SlInterfaceId((&[192, 174, 137, 80, 211, 221, 219, 17, 211, 154, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_3DMACROSCOPIC: SlInterfaceId = SlInterfaceId((&[192, 174, 137, 80, 211, 221, 219, 17, 211, 154, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DSOURCE: SlInterfaceId = SlInterfaceId((&[0, 123, 188, 112, 211, 221, 219, 17, 115, 168, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_3DSOURCE: SlInterfaceId = SlInterfaceId((&[0, 123, 188, 112, 211, 221, 219, 17, 115, 168, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DDISTANCEDAMPING: SlInterfaceId = SlInterfaceId((&[46, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+pub static SL_IID_3DDISTANCEDAMPING: SlInterfaceId = SlInterfaceId((&[46, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DDISTANCEATTENUATION: SlInterfaceId = SlInterfaceId((&[47, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
+pub static SL_IID_3DDISTANCEATTENUATION: SlInterfaceId = SlInterfaceId((&[47, 0, 68, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_3DCOMMIT: SlInterfaceId = SlInterfaceId((&[128, 173, 100, 53, 15, 221, 219, 17, 25, 158, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_3DCOMMIT: SlInterfaceId = SlInterfaceId((&[128, 173, 100, 53, 15, 221, 219, 17, 25, 158, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_DYNAMICSOURCE: SlInterfaceId = SlInterfaceId((&[0, 193, 92, 197, 139, 3, 220, 17, 69, 187, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_DYNAMICSOURCE: SlInterfaceId = SlInterfaceId((&[0, 193, 92, 197, 139, 3, 220, 17, 69, 187, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ENGINECAPABILITIES: SlInterfaceId = SlInterfaceId((&[160, 208, 32, 131, 213, 221, 219, 17, 177, 161, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ENGINECAPABILITIES: SlInterfaceId = SlInterfaceId((&[160, 208, 32, 131, 213, 221, 219, 17, 177, 161, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_MIDIMESSAGE: SlInterfaceId = SlInterfaceId((&[32, 168, 244, 221, 214, 221, 219, 17, 116, 177, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_MIDIMESSAGE: SlInterfaceId = SlInterfaceId((&[32, 168, 244, 221, 214, 221, 219, 17, 116, 177, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_MIDIMUTESOLO: SlInterfaceId = SlInterfaceId((&[128, 175, 158, 3, 215, 221, 219, 17, 2, 154, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_MIDIMUTESOLO: SlInterfaceId = SlInterfaceId((&[128, 175, 158, 3, 215, 221, 219, 17, 2, 154, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_MIDITEMPO: SlInterfaceId = SlInterfaceId((&[0, 116, 52, 31, 215, 221, 219, 17, 206, 167, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_MIDITEMPO: SlInterfaceId = SlInterfaceId((&[0, 116, 52, 31, 215, 221, 219, 17, 206, 167, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_MIDITIME: SlInterfaceId = SlInterfaceId((&[224, 29, 165, 61, 215, 221, 219, 17, 112, 175, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_MIDITIME: SlInterfaceId = SlInterfaceId((&[224, 29, 165, 61, 215, 221, 219, 17, 112, 175, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_PITCH: SlInterfaceId = SlInterfaceId((&[0, 238, 232, 199, 215, 221, 219, 17, 44, 164, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_PITCH: SlInterfaceId = SlInterfaceId((&[0, 238, 232, 199, 215, 221, 219, 17, 44, 164, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_PREFETCHSTATUS: SlInterfaceId = SlInterfaceId((&[128, 238, 65, 42, 216, 221, 219, 17, 31, 164, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_PREFETCHSTATUS: SlInterfaceId = SlInterfaceId((&[128, 238, 65, 42, 216, 221, 219, 17, 31, 164, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_THREADSYNC: SlInterfaceId = SlInterfaceId((&[64, 107, 172, 246, 220, 221, 219, 17, 46, 166, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_THREADSYNC: SlInterfaceId = SlInterfaceId((&[64, 107, 172, 246, 220, 221, 219, 17, 46, 166, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDBUFFERQUEUESOURCE: SlInterfaceId = SlInterfaceId((&[96, 164, 193, 127, 193, 238, 223, 17, 6, 163, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ANDROIDBUFFERQUEUESOURCE: SlInterfaceId = SlInterfaceId((&[96, 164, 193, 127, 193, 238, 223, 17, 6, 163, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDACOUSTICECHOCANCELLATION: SlInterfaceId = SlInterfaceId((&[96, 20, 73, 123, 77, 141, 224, 17, 97, 189, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ANDROIDACOUSTICECHOCANCELLATION: SlInterfaceId = SlInterfaceId((&[96, 20, 73, 123, 77, 141, 224, 17, 97, 189, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDAUTOMATICGAINCONTROL: SlInterfaceId = SlInterfaceId((&[224, 191, 138, 10, 76, 101, 224, 17, 38, 186, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ANDROIDAUTOMATICGAINCONTROL: SlInterfaceId = SlInterfaceId((&[224, 191, 138, 10, 76, 101, 224, 17, 38, 186, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 #[no_mangle]
-pub static SL_IID_ANDROIDNOISESUPPRESSION: SlInterfaceId = SlInterfaceId((&[96, 178, 180, 88, 6, 142, 224, 17, 142, 170, 0, 2, 165, 213, 197, 27]).as_ptr());
+pub static SL_IID_ANDROIDNOISESUPPRESSION: SlInterfaceId = SlInterfaceId((&[96, 178, 180, 88, 6, 142, 224, 17, 142, 170, 0, 2, 165, 213, 197, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).as_ptr());
 
 
 /// `SLresult slCreateEngine(SLObjectItf*, ...)` — create a usable engine.

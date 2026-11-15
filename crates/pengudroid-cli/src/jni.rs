@@ -197,6 +197,19 @@ impl JniEnv {
         Some(c)
     }
 
+    /// `FindClass(name)`, clearing any pending exception quietly without printing a stack trace.
+    pub fn find_class_quiet(&self, name: &str) -> Option<JClass> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let f: unsafe extern "C" fn(*mut c_void, *const i8) -> JClass =
+            unsafe { self.func(slot::FIND_CLASS) };
+        let c = unsafe { f(self.0, cname.as_ptr()) };
+        if c.is_null() {
+            self.exception_clear();
+            return None;
+        }
+        Some(c)
+    }
+
     /// `GetObjectClass(obj)`.
     pub fn object_class(&self, obj: JObject) -> Option<JClass> {
         if obj.is_null() {
@@ -240,6 +253,20 @@ impl JniEnv {
         let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if m.is_null() {
             self.describe_exception();
+            return None;
+        }
+        Some(m)
+    }
+
+    /// `GetStaticMethodID(clazz, name, sig)`, clearing any exception quietly without printing a stack trace.
+    pub fn static_method_id_quiet(&self, class: JClass, name: &str, sig: &str) -> Option<JMethodId> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let csig = std::ffi::CString::new(sig).ok()?;
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JMethodId =
+            unsafe { self.func(slot::GET_STATIC_METHOD_ID) };
+        let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
+        if m.is_null() {
+            self.exception_clear();
             return None;
         }
         Some(m)
@@ -302,6 +329,20 @@ impl JniEnv {
         let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if m.is_null() {
             self.describe_exception();
+            return None;
+        }
+        Some(m)
+    }
+
+    /// `GetMethodID(clazz, name, sig)`, clearing any pending exception quietly.
+    pub fn method_id_quiet(&self, class: JClass, name: &str, sig: &str) -> Option<JMethodId> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let csig = std::ffi::CString::new(sig).ok()?;
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JMethodId =
+            unsafe { self.func(slot::GET_METHOD_ID) };
+        let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
+        if m.is_null() {
+            self.exception_clear();
             return None;
         }
         Some(m)
@@ -681,6 +722,17 @@ impl JniEnv {
             unsafe { self.func(slot::CALL_STATIC_OBJECT_METHOD_A) };
         let v = unsafe { f(self.0, class, method, args.as_ptr()) };
         self.exception_check().then_some(v)
+    }
+
+    /// Clear any pending JNI exception without logging it.
+    pub fn exception_clear(&self) {
+        unsafe {
+            let check: unsafe extern "C" fn(*mut c_void) -> u8 = self.func(slot::EXCEPTION_CHECK);
+            if check(self.0) != 0 {
+                let clear: unsafe extern "C" fn(*mut c_void) = self.func(slot::EXCEPTION_CLEAR);
+                clear(self.0);
+            }
+        }
     }
 
     /// `ExceptionOccurred` + `ExceptionDescribe` + `ExceptionClear`.

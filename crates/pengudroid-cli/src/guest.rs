@@ -227,6 +227,7 @@ pub fn guest_main(args: &[String]) -> i32 {
                         fourcc: d.fourcc,
                         modifier: d.modifier,
                         offset: d.offset,
+                        top_down: false,
                     };
                     if matches!(
                         client.request_with_fds(&msg, &[d.fd.as_raw_fd()]),

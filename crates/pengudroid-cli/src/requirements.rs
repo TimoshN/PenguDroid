@@ -141,10 +141,11 @@ const BRIDGED_GUEST_LIBS: &[&str] = &[
     "libGLESv2.so",
     "libGLESv3.so",
     "libandroid.so",
+    "libvulkan.so",
 ];
 
-/// Find which of `needles` occur in `hay`, in one pass.
-fn scan(hay: &[u8], needles: &[&[u8]], found: &mut [bool]) {
+/// Find which of `needles` occur in `hay`, in one pass (scalar fallback).
+fn scan_scalar(hay: &[u8], needles: &[&[u8]], found: &mut [bool]) {
     let mut firsts = [false; 256];
     for needle in needles {
         if let Some(first) = needle.first() {
@@ -162,6 +163,104 @@ fn scan(hay: &[u8], needles: &[&[u8]], found: &mut [bool]) {
             }
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn find_needle_sse42(hay: &[u8], needle: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let len = needle.len();
+    if len == 0 {
+        return true;
+    }
+    if hay.len() < len {
+        return false;
+    }
+    let first = _mm_set1_epi8(needle[0] as i8);
+    let last_start = hay.len() - len;
+    let mut i = 0usize;
+    while i + 16 <= last_start + 1 {
+        let chunk = _mm_loadu_si128(hay.as_ptr().add(i).cast());
+        let eq = _mm_cmpeq_epi8(chunk, first);
+        let mut mask = _mm_movemask_epi8(eq) as u32;
+        while mask != 0 {
+            let bit = mask.trailing_zeros() as usize;
+            let pos = i + bit;
+            if pos <= last_start && &hay[pos..pos + len] == needle {
+                return true;
+            }
+            mask &= mask - 1;
+        }
+        i += 16;
+    }
+    while i <= last_start {
+        if hay[i] == needle[0] && &hay[i..i + len] == needle {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_needle_avx2(hay: &[u8], needle: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let len = needle.len();
+    if len == 0 {
+        return true;
+    }
+    if hay.len() < len {
+        return false;
+    }
+    let first = _mm256_set1_epi8(needle[0] as i8);
+    let last_start = hay.len() - len;
+    let mut i = 0usize;
+    while i + 32 <= last_start + 1 {
+        let chunk = _mm256_loadu_si256(hay.as_ptr().add(i).cast());
+        let eq = _mm256_cmpeq_epi8(chunk, first);
+        let mut mask = _mm256_movemask_epi8(eq) as u32;
+        while mask != 0 {
+            let bit = mask.trailing_zeros() as usize;
+            let pos = i + bit;
+            if pos <= last_start && &hay[pos..pos + len] == needle {
+                return true;
+            }
+            mask &= mask - 1;
+        }
+        i += 32;
+    }
+    while i <= last_start {
+        if hay[i] == needle[0] && &hay[i..i + len] == needle {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Find which of `needles` occur in `hay`, dispatching to AVX2 or SSE4.2 when supported.
+fn scan(hay: &[u8], needles: &[&[u8]], found: &mut [bool]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            for (index, needle) in needles.iter().enumerate() {
+                if !found[index] && unsafe { find_needle_avx2(hay, needle) } {
+                    found[index] = true;
+                }
+            }
+            return;
+        }
+        if std::arch::is_x86_feature_detected!("sse4.2") {
+            for (index, needle) in needles.iter().enumerate() {
+                if !found[index] && unsafe { find_needle_sse42(hay, needle) } {
+                    found[index] = true;
+                }
+            }
+            return;
+        }
+    }
+    scan_scalar(hay, needles, found);
 }
 
 /// System sonames referenced anywhere in a native library.
@@ -259,9 +358,8 @@ pub fn assess(facts: &Facts) -> Vec<Requirement> {
             match *lib {
                 "libvulkan.so" => out.push(requirement(
                     lib,
-                    Status::Partial,
-                    "maps to the host loader, but there is no Android surface \
-                     (vkCreateAndroidSurfaceKHR), so nothing can be presented",
+                    Status::Ready,
+                    "routed through PenguDroid Vulkan WSI shim (vkCreateAndroidSurfaceKHR + DMA-BUF)",
                 )),
                 "libaaudio.so" => {
                     out.push(requirement(lib, Status::Missing, "AAudio is not implemented"))
@@ -361,7 +459,7 @@ mod tests {
             has_keymap_preset: true,
         };
         let reqs = assess(&facts);
-        assert_eq!(names(&reqs, Status::Missing), vec!["libOpenSLES.so", "libvulkan.so", "WebView"]);
+        assert_eq!(names(&reqs, Status::Missing), vec!["libOpenSLES.so", "WebView"]);
         assert_eq!(names(&reqs, Status::Ready), vec!["Landscape display"]);
         assert_eq!(
             names(&reqs, Status::Partial),
@@ -380,7 +478,7 @@ mod tests {
         };
         let reqs = assess(&facts);
         assert!(names(&reqs, Status::Missing).is_empty());
-        assert_eq!(names(&reqs, Status::Partial), vec!["libvulkan.so"]);
+        assert_eq!(names(&reqs, Status::Ready), vec!["libvulkan.so"]);
     }
 
     #[test]

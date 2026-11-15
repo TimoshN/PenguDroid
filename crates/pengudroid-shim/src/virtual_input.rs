@@ -3,6 +3,8 @@
 //! `reply` accepts internal semantic operation IDs, not Binder transaction
 //! numbers. The broker maps the API-37 Stub's installed codes to these IDs.
 
+pub const GAMEPAD_DEVICE_ID: i32 = 2;
+
 fn int(args: &[u8], index: usize) -> Option<i32> {
     Some(i32::from_le_bytes(args.get(index * 4..index * 4 + 4)?.try_into().ok()?))
 }
@@ -11,13 +13,34 @@ fn supported(key: i32) -> bool {
     matches!(key, 7..=16 | 19..=22 | 29..=62 | 66..=76 | 92 | 93 | 111..=115 | 117 | 118 | 122..=124)
 }
 
+fn supported_gamepad_key(key: i32) -> bool {
+    matches!(key, 19..=23 | 96..=110)
+}
+
 /// Reply body following AIDL's exception status. Unknown transactions are left
 /// to the broker. Unknown device ids never alias the virtual keyboard.
 pub fn reply(code: u32, args: &[u8], device: &[u8]) -> Option<Vec<u8>> {
+    reply_with_devices(code, args, device, &[])
+}
+
+/// Like [`reply`], exposing both the virtual keyboard (`-1`) and the virtual
+/// Xbox 360 gamepad (`2`) when registered.
+pub fn reply_with_devices(
+    code: u32,
+    args: &[u8],
+    keyboard: &[u8],
+    gamepad: &[u8],
+) -> Option<Vec<u8>> {
     let mut words = Vec::<i32>::new();
     match code {
         1 => {
-            if int(args, 0) == Some(-1) && !device.is_empty() {
+            let id = int(args, 0);
+            let chosen = match id {
+                Some(-1) if !keyboard.is_empty() => Some(keyboard),
+                Some(GAMEPAD_DEVICE_ID) if !gamepad.is_empty() => Some(gamepad),
+                _ => None,
+            };
+            if let Some(device) = chosen {
                 let mut out = 1i32.to_le_bytes().to_vec();
                 out.extend_from_slice(device);
                 return Some(out);
@@ -25,27 +48,51 @@ pub fn reply(code: u32, args: &[u8], device: &[u8]) -> Option<Vec<u8>> {
             words.push(0); // null InputDevice
         }
         2 => {
-            if device.is_empty() { words.push(0); } else { words.extend([1, -1]); }
+            let mut ids = Vec::with_capacity(2);
+            if !gamepad.is_empty() {
+                ids.push(GAMEPAD_DEVICE_ID);
+            }
+            if !keyboard.is_empty() {
+                ids.push(-1);
+            }
+            words.push(ids.len() as i32);
+            words.extend(ids);
         }
-        3 => words.push((int(args, 0) == Some(-1) && !device.is_empty()) as i32),
-        4 | 5 | 22 => {} // immutable device; no hotplug notifications
+        3 => {
+            let id = int(args, 0);
+            let enabled = (id == Some(-1) && !keyboard.is_empty())
+                || (id == Some(GAMEPAD_DEVICE_ID) && !gamepad.is_empty());
+            words.push(enabled as i32);
+        }
+        4 | 5 | 22 => {} // immutable devices; no hotplug notifications
         6 => {
             let count = int(args, 2)?;
             if !(0..=768).contains(&count) { return None; }
             let count = count as usize;
             let output = int(args, 3 + count)?;
             if !(0..=768).contains(&output) { return None; }
+            let id = int(args, 0)?;
             let source = int(args, 1)?;
-            let valid = int(args, 0) == Some(-1) && !device.is_empty()
-                && (source == 0 || source & 0x100 != 0) && output as usize == count;
+            let is_kb = id == -1 && !keyboard.is_empty() && (source == 0 || source & 0x100 != 0);
+            let is_pad = id == GAMEPAD_DEVICE_ID
+                && !gamepad.is_empty()
+                && (source == 0 || source & 0x401 != 0 || source & 0x200 != 0);
+            let valid = (is_kb || is_pad) && output as usize == count;
             words.extend([valid as i32, output]);
             for i in 0..output as usize {
-                words.push((valid && int(args, 3 + i).map_or(false, supported)) as i32);
+                let has = valid
+                    && int(args, 3 + i).is_some_and(|key| {
+                        (is_kb && supported(key)) || (is_pad && supported_gamepad_key(key))
+                    });
+                words.push(has as i32);
             }
         }
         7 => {
+            let id = int(args, 0)?;
             let key = int(args, 1)?;
-            words.push(if int(args, 0) == Some(-1) && !device.is_empty() && supported(key) { key } else { 0 });
+            let has = (id == -1 && !keyboard.is_empty() && supported(key))
+                || (id == GAMEPAD_DEVICE_ID && !gamepad.is_empty() && supported_gamepad_key(key));
+            words.push(if has { key } else { 0 });
         }
         8 => {
             // `getVelocityTrackerStrategy()`. `VelocityTracker.toStrategyId`
@@ -121,5 +168,25 @@ mod tests {
         data.extend_from_slice(&(-1i32).to_le_bytes());
         assert_eq!(arguments(&data), Some((-1i32).to_le_bytes().as_slice()));
         assert!(arguments(&data[..data.len() - 5]).is_none());
+    }
+
+    #[test]
+    fn exposes_virtual_xbox_gamepad_alongside_keyboard() {
+        assert_eq!(
+            reply_with_devices(2, &[], &[10], &[20]),
+            Some(bytes(&[2, GAMEPAD_DEVICE_ID, -1]))
+        );
+        assert_eq!(
+            reply_with_devices(1, &bytes(&[GAMEPAD_DEVICE_ID]), &[10], &[20]),
+            Some([bytes(&[1]), vec![20]].concat())
+        );
+        assert_eq!(
+            reply_with_devices(3, &bytes(&[GAMEPAD_DEVICE_ID]), &[10], &[20]),
+            Some(bytes(&[1]))
+        );
+        assert_eq!(
+            reply_with_devices(6, &bytes(&[GAMEPAD_DEVICE_ID, 0x401, 3, 96, 108, 29, 3]), &[10], &[20]),
+            Some(bytes(&[1, 3, 1, 1, 0]))
+        );
     }
 }

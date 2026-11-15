@@ -57,11 +57,11 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "building release binaries"
     cargo build --release --offline \
         -p pengudroid-cli -p pengudroid-gui \
-        -p pengudroid-shim -p pengudroid-gleshim -p pengudroid-daemon
+        -p pengudroid-shim -p pengudroid-gleshim -p pengudroid-vkshim -p pengudroid-daemon
 fi
 
 missing=""
-for f in pengudroid pengudroid-gui pengudroid-daemon libpengudroid_shim.so libpengudroid_gleshim.so; do
+for f in pengudroid pengudroid-gui pengudroid-daemon libpengudroid_shim.so libpengudroid_gleshim.so libpengudroid_vkshim.so; do
     [ -f "$TARGET/release/$f" ] || missing="$missing $f"
 done
 if [ -n "$missing" ]; then
@@ -80,6 +80,7 @@ install -m 0755 "$TARGET/release/pengudroid" "$APPDIR/usr/bin/pengudroid"
 install -m 0755 "$TARGET/release/pengudroid-daemon" "$APPDIR/usr/bin/pengudroid-daemon"
 install -m 0755 "$TARGET/release/libpengudroid_shim.so" "$APPDIR/usr/bin/libpengudroid_shim.so"
 install -m 0755 "$TARGET/release/libpengudroid_gleshim.so" "$APPDIR/usr/bin/libpengudroid_gleshim.so"
+install -m 0755 "$TARGET/release/libpengudroid_vkshim.so" "$APPDIR/usr/bin/libpengudroid_vkshim.so"
 install -m 0644 "$ROOT/logo.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/pengudroid.png"
 cp "$APPDIR/usr/share/icons/hicolor/256x256/apps/pengudroid.png" "$APPDIR/pengudroid.png"
 
@@ -210,19 +211,15 @@ if [ "$NO_IMAGE" -eq 1 ]; then
 fi
 
 # appimagetool is not packaged by every distribution; use a cached copy when the
-# caller did not pin one.
+# caller did not pin one. When building a portable image with uruntime, fall
+# back to mksquashfs directly if appimagetool is absent.
 tool=${PENGUDROID_APPIMAGETOOL:-}
 if [ -z "$tool" ]; then
     for candidate in "$HOME/.cache/pengudroid/appimagetool.AppImage" "$(command -v appimagetool || true)"; do
         if [ -n "$candidate" ] && [ -x "$candidate" ]; then tool=$candidate; break; fi
     done
 fi
-if [ -z "$tool" ]; then
-    echo "error: appimagetool not found" >&2
-    echo "hint: download appimagetool-x86_64.AppImage to ~/.cache/pengudroid/appimagetool.AppImage" >&2
-    echo "      or set PENGUDROID_APPIMAGETOOL to its path" >&2
-    exit 1
-fi
+
 # AppImages need FUSE to self-mount; extraction is enough to run the tool.
 run_tool() {
     case "$tool" in
@@ -231,14 +228,26 @@ run_tool() {
     esac
 }
 
-rm -f "$OUT"
+rm -f "$OUT" "$OUT.sqfs"
 # zstd keeps a runtime-carrying image well under GitHub's 2 GiB asset limit
 # and decompresses fast at launch; PENGUDROID_APPIMAGE_COMP=xz is smaller.
-if [ "$PORTABLE" -eq 1 ]; then
+if [ -n "$tool" ]; then
+    if [ "$PORTABLE" -eq 1 ]; then
+        runtime=$(python3 -B "$ROOT/tools/prepare-appimage-runtime.py")
+        ARCH=x86_64 run_tool --runtime-file "$runtime" --comp "${PENGUDROID_APPIMAGE_COMP:-zstd}" "$APPDIR" "$OUT"
+    else
+        ARCH=x86_64 run_tool --comp "${PENGUDROID_APPIMAGE_COMP:-zstd}" "$APPDIR" "$OUT"
+    fi
+elif [ "$PORTABLE" -eq 1 ] && command -v mksquashfs >/dev/null 2>&1; then
     runtime=$(python3 -B "$ROOT/tools/prepare-appimage-runtime.py")
-    ARCH=x86_64 run_tool --runtime-file "$runtime" --comp "${PENGUDROID_APPIMAGE_COMP:-zstd}" "$APPDIR" "$OUT"
+    mksquashfs "$APPDIR" "$OUT.sqfs" -root-owned -noappend -comp "${PENGUDROID_APPIMAGE_COMP:-zstd}" -mkfs-time 0
+    cat "$runtime" "$OUT.sqfs" > "$OUT"
+    rm -f "$OUT.sqfs"
 else
-    ARCH=x86_64 run_tool --comp "${PENGUDROID_APPIMAGE_COMP:-zstd}" "$APPDIR" "$OUT"
+    echo "error: appimagetool not found" >&2
+    echo "hint: download appimagetool-x86_64.AppImage to ~/.cache/pengudroid/appimagetool.AppImage" >&2
+    echo "      or set PENGUDROID_APPIMAGETOOL to its path" >&2
+    exit 1
 fi
 
 if [ ! -s "$OUT" ]; then

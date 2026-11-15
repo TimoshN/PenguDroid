@@ -28,13 +28,13 @@ export component KeymapWindow inherits Window {
     background: #151921;
     in-out property <string> profile;
     in property <string> app-name;
-    in property <string> message: "Use Linux key names and app pixel coordinates.";
+    in property <string> message: "Use Linux key names, PAD_* controls and app pixel coordinates.";
     callback save-profile(string);
     VerticalLayout {
         padding: 24px; spacing: 16px;
         Text { text: "Controls for " + root.app-name; color: #f2f5fa; font-size: 23px; font-weight: 700; }
         Text {
-            text: "W = hold 120 900\nSPACE = tap 650 1100\nSHIFT = swipe 100 500 400 500 12";
+            text: "W = hold 120 900\nSPACE = tap 650 1100\nPAD_A = key SPACE";
             color: #a7b4c8; font-size: 13px;
         }
         TextEdit { text <=> root.profile; vertical-stretch: 1; }
@@ -155,7 +155,7 @@ export component MainWindow inherits Window {
                             padding: 22px; spacing: 20px;
                             Text { text: "App preferences"; color: #e9eff9; font-size: 17px; font-weight: 600; }
                             Text { text: "Saved separately for this application."; color: #91a2bc; font-size: 12px; }
-                            CheckBox { text: "Show FPS meter"; checked: root.fps-meter-on; toggled => { root.fps-meter-toggled(self.checked); } }
+                            CheckBox { text: "Show MangoHud FPS meter"; checked: root.fps-meter-on; toggled => { root.fps-meter-toggled(self.checked); } }
                             CheckBox { text: "Enable keymapper profile"; checked: root.keymapper-on; toggled => { root.keymapper-toggled(self.checked); } }
                             Button { text: "Configure controls"; clicked => { root.edit-keymap(); } }
                         }

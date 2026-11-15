@@ -405,11 +405,13 @@ pub fn launch(args: &[String]) -> i32 {
     // layout also names components that live beside the base. `art-test` puts
     // each extra `--classpath` into `ApplicationInfo.splitSourceDirs`.
     let mut split_paths: Vec<String> = Vec::new();
+    let mut bundle_selected_abi: Option<String> = None;
     if crate::bundle::is_bundle(std::path::Path::new(&apk_path)) {
         match crate::bundle::Bundle::open(std::path::Path::new(&apk_path)) {
             Ok(b) => {
                 let dir = prefix.join("bundle");
                 let abi = bundle_abi(&b, backend);
+                bundle_selected_abi = abi.clone();
                 match b.extract_to(&dir, abi.as_deref()) {
                     Ok(written) => {
                         println!("  bundle  : {} ({} members -> {})", b.kind.name(), written.len(), dir.display());
@@ -457,11 +459,21 @@ pub fn launch(args: &[String]) -> i32 {
     }
     println!("  apk     : {apk_path}");
     println!("  prefix  : {}", prefix.display());
+    println!("  cpu     : {}", host_simd_tier());
     println!("  backend : {} ({})", backend.name(), planned.reason);
     if backend != planned.backend {
         println!("  note    : forced with --backend");
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    if bundle_selected_abi.as_deref() == Some("armeabi-v7a") {
+        eprintln!(
+            "pengudroid launch: {} only ships 32-bit armeabi-v7a libraries; \
+             PenguDroid's runtime and Berberis translator require 64-bit arm64-v8a or x86_64",
+            info.package
+        );
+        return 1;
+    }
 
     match backend {
         Backend::Native => {
@@ -595,6 +607,15 @@ pub fn launch(args: &[String]) -> i32 {
                 "PENGUDROID_KEYMAP_PATH",
                 pengudroid_input::keymap::keymap_path(&info.package),
             );
+            // Export MangoHud configuration to the guest runtime when enabled.
+            if std::env::var_os("MANGOHUD").is_none()
+                && std::env::var("PENGUDROID_FPS_METER").is_ok_and(|v| v == "1" || v == "true")
+            {
+                cmd.env("MANGOHUD", "1");
+            }
+            if std::env::var_os("MANGOHUD_CONFIG").is_none() {
+                cmd.env("MANGOHUD_CONFIG", "fps,frametime,gpu_stats,position=top-left");
+            }
             // Same for app data: resolved against the host's HOME, before the
             // prefix replaces it, so data persists across launches and prefixes.
             if std::env::var_os("PENGUDROID_DATA_ROOT").is_none() {
@@ -603,35 +624,74 @@ pub fn launch(args: &[String]) -> i32 {
                 }
             }
             cmd.arg("--main").arg(main);
-            // ARM-only apps need the native bridge. This stays opt-in so the
-            // existing x86_64 app path (NewPipe and friends) is unchanged; the
-            // translator is not yet able to finish guest execution for every
-            // app, so enabling it by default would regress working launches.
-            // The default name is the Android 17 / Digitalis ARM64 bridge
-            // (`frameworks/libs/binary_translation`, ARM64-to-x86_64 build); set
-            // PENGUDROID_NATIVE_BRIDGE_NAME for a different build. The 128 MiB
-            // heap is required once the bridge has reserved the guest address
-            // layout (see LIMITATIONS.md §2.1 and NATIVE_BRIDGE.md).
-            // The AppImage sets the bridge for every launch, but an app that
-            // ships x86_64 libraries (or none) must run them natively: the
-            // guest side would otherwise pick its arm64 libraries and translate
-            // everything, which is slow and far less compatible.
-            let mut apks = vec![app_path.clone()];
-            apks.extend(split_paths.iter().cloned());
-            let use_bridge = needs_native_bridge(&apks);
-            if !use_bridge {
-                cmd.env_remove("PENGUDROID_NATIVE_BRIDGE_LIB");
-            }
-            if let Some(bridge_lib) = std::env::var("PENGUDROID_NATIVE_BRIDGE_LIB")
-                .ok()
-                .filter(|_| use_bridge)
-            {
-                cmd.arg("--bridge-lib").arg(bridge_lib);
+            // Enable the ARM64 translator whenever explicitly requested via
+            // `PENGUDROID_NATIVE_BRIDGE_LIB` OR automatically when launching an
+            // ARM64-only app (`arm64-v8a` without `x86_64`) and an installed
+            // bridge tree (next to the exe or in the AppImage cache) is found.
+            let arm64_only = is_arm64_only_payload(
+                bundle_selected_abi.as_deref(),
+                &app_path,
+                &split_paths,
+            );
+            let use_bridge = needs_native_bridge(&std::iter::once(app_path.clone()).chain(split_paths.iter().cloned()).collect::<Vec<_>>());
+            if !use_bridge { cmd.env_remove("PENGUDROID_NATIVE_BRIDGE_LIB"); }
+            let explicit_bridge = std::env::var("PENGUDROID_NATIVE_BRIDGE_LIB").ok().filter(|_| use_bridge);
+            let bridge_setup = if let Some(explicit) = explicit_bridge {
+                let path = PathBuf::from(&explicit);
+                let dir = if path.is_dir() {
+                    path.clone()
+                } else {
+                    path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone())
+                };
+                let guest = std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT")
+                    .map(PathBuf::from)
+                    .or_else(|| guest_root_for_bridge(&dir));
+                Some((path, dir, guest))
+            } else if arm64_only {
+                find_arm64_bridge_dir().map(|(dir, guest)| (dir.clone(), dir, guest))
+            } else {
+                None
+            };
+            if let Some((bridge_arg, bridge_dir, guest_root)) = bridge_setup {
+                cmd.arg("--bridge-lib").arg(&bridge_arg);
                 let name = std::env::var("PENGUDROID_NATIVE_BRIDGE_NAME")
                     .unwrap_or_else(|_| "libberberis_arm64.so".to_string());
                 cmd.arg("--native-bridge").arg(name);
                 cmd.arg("--init-bridge").arg(pengudroid_nativebridge::ARM64_ISA);
                 cmd.arg("--xmx").arg("128m");
+                if std::env::var_os("PENGUDROID_NATIVE_BRIDGE_LIB").is_none() {
+                    cmd.env("PENGUDROID_NATIVE_BRIDGE_LIB", &bridge_arg);
+                }
+                if std::env::var_os("PENGUDROID_GL_FORWARDERS").is_none()
+                    && bridge_dir.join("libEGL.so").exists()
+                {
+                    cmd.env("PENGUDROID_GL_FORWARDERS", &bridge_dir);
+                }
+                if std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT").is_none() {
+                    if let Some(root) = guest_root {
+                        cmd.env("PENGUDROID_ARM64_GUEST_ROOT", root);
+                    }
+                }
+                if std::env::var_os("PENGUDROID_BRIDGE_TLS").is_none() {
+                    cmd.env("PENGUDROID_BRIDGE_TLS", "1");
+                }
+                if std::env::var_os("BERBERIS_FLAGS").is_none() {
+                    cmd.env("BERBERIS_FLAGS", "glibc-host-thread-id-handoff");
+                }
+                if std::env::var_os("BERBERIS_MODE").is_none() {
+                    cmd.env("BERBERIS_MODE", "two-gear");
+                }
+                if std::env::var_os("PENGUDROID_GLESHIM").is_none() {
+                    if let Some(g) = crate::nativelib::find_gleshim() {
+                        cmd.env("PENGUDROID_GLESHIM", g);
+                    }
+                }
+                println!("  bridge  : arm64 ({})", bridge_dir.display());
+            } else if arm64_only {
+                eprintln!(
+                    "  warning : ARM64-only payload detected, but libberberis_arm64.so was not found \
+                     (set PENGUDROID_NATIVE_BRIDGE_LIB)"
+                );
             }
             // The JIT crashes in `nterp_op_invoke_virtual` on this framework
             // build, so the interpreter is the only working execution mode.
@@ -654,21 +714,27 @@ pub fn launch(args: &[String]) -> i32 {
     }
 }
 
-/// Whether the app's native code needs the ARM translator: it ships ARM
-/// libraries and no libraries for the host ABI.
-fn needs_native_bridge(apks: &[String]) -> bool {
-    let mut arm = false;
-    for apk in apks {
-        let Ok(libs) = crate::apk::native_libs(apk) else { continue };
-        for lib in libs {
-            match lib.abi.as_str() {
-                "x86_64" => return false,
-                "arm64-v8a" | "armeabi-v7a" => arm = true,
-                _ => {}
-            }
+/// Highest SIMD ISA tier supported by the host CPU at runtime.
+fn host_simd_tier() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("bmi2")
+        {
+            return "x86_64 (AVX2+FMA+BMI2)";
         }
+        if std::arch::is_x86_feature_detected!("sse4.2")
+            && std::arch::is_x86_feature_detected!("popcnt")
+        {
+            return "x86_64 (SSE4.2+POPCNT)";
+        }
+        "x86_64 (baseline SSE2)"
     }
-    arm
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        std::env::consts::ARCH
+    }
 }
 
 /// Which ABI split to keep for the chosen backend: the host ABI for a native
@@ -705,6 +771,84 @@ fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
             }
         }
     }
+}
+
+/// True when the payload ships `arm64-v8a` native libraries and no `x86_64` ones.
+fn is_arm64_only_payload(
+    bundle_abi: Option<&str>,
+    app_path: &str,
+    split_paths: &[String],
+) -> bool {
+    if let Some(abi) = bundle_abi {
+        return abi == "arm64-v8a";
+    }
+    let mut has_arm64 = false;
+    let mut has_x86_64 = false;
+    for path in std::iter::once(app_path).chain(split_paths.iter().map(String::as_str)) {
+        if let Ok(entries) = apk::apk_entries(path) {
+            has_arm64 |= entries
+                .iter()
+                .any(|e| e.starts_with("lib/arm64-v8a/") && e.ends_with(".so"));
+            has_x86_64 |= entries
+                .iter()
+                .any(|e| e.starts_with("lib/x86_64/") && e.ends_with(".so"));
+        }
+    }
+    has_arm64 && !has_x86_64
+}
+
+/// Find the companion `guest-arm64` sysroot tree next to an installed bridge directory.
+fn guest_root_for_bridge(bridge_dir: &Path) -> Option<PathBuf> {
+    for anc in bridge_dir.ancestors().take(5) {
+        for rel in ["share/pengudroid/guest-arm64", "guest-arm64"] {
+            let candidate = anc.join(rel);
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Discover an installed ARM64 native-bridge directory (`libberberis_arm64.so`)
+/// next to the running binary or inside the cached AppImage tree.
+fn find_arm64_bridge_dir() -> Option<(PathBuf, Option<PathBuf>)> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("../lib/pengudroid/bridge"));
+            candidates.push(dir.join("bridge"));
+        }
+    }
+    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    {
+        if let Ok(entries) = std::fs::read_dir(cache.join("pengudroid/appimage")) {
+            let mut dirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path().join("usr/lib/pengudroid/bridge"))
+                .collect();
+            dirs.sort();
+            candidates.extend(dirs);
+        }
+    }
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    {
+        candidates.push(data.join("pengudroid/bridge"));
+    }
+    candidates.push(PathBuf::from("/usr/lib/pengudroid/bridge"));
+
+    for dir in candidates {
+        if dir.join("libberberis_arm64.so").is_file() {
+            let canon = std::fs::canonicalize(&dir).unwrap_or(dir);
+            let guest = guest_root_for_bridge(&canon);
+            return Some((canon, guest));
+        }
+    }
+    None
 }
 
 fn apply_env(cmd: &mut std::process::Command, env: &[(String, String)]) {
@@ -816,4 +960,19 @@ mod tests {
         assert_eq!(Backend::Native.name(), "native");
         assert_eq!(Backend::Art.name(), "art");
     }
+}
+
+fn needs_native_bridge(apks: &[String]) -> bool {
+    let mut arm = false;
+    for apk in apks {
+        let Ok(libs) = crate::apk::native_libs(apk) else { continue };
+        for lib in libs {
+            match lib.abi.as_str() {
+                "x86_64" => return false,
+                "arm64-v8a" | "armeabi-v7a" => arm = true,
+                _ => {}
+            }
+        }
+    }
+    arm
 }

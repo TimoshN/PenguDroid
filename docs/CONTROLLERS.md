@@ -5,7 +5,13 @@ readable for the seat's user through logind). Wayland has no gamepad protocol,
 so this is the only path; controllers are not grabbed, other programs keep
 seeing them, and they can be plugged in or out while an app runs.
 
-## Default: a real Android controller
+## Default: normalized Xbox One controller
+
+Controllers are exposed to Android as one logical **Xbox One Controller**
+(device ID 2, Microsoft vendor `045e`, product `02dd`). Device enumeration,
+key events and joystick events use the same device ID. Physical device names
+remain unchanged on Linux. `PENGUDROID_GAMEPAD_PROFILE=xbox360` selects the legacy
+`045e:028e` identity when a game requires it. Rumble is not advertised.
 
 A control that the app's keymap does not bind reaches the app the way a
 Bluetooth/USB controller does on a phone:

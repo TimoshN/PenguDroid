@@ -1056,7 +1056,7 @@ mod imp {
             let Some(surface) = self.state.surfaces.get_mut(&id) else { return false };
             surface.fps_meter = enabled;
             let title = surface.title.clone();
-            if !enabled { self.state.update_frame_title(id, title); }
+            self.state.update_frame_title(id, title);
             let _ = self.conn.flush();
             true
         }
@@ -1074,11 +1074,10 @@ mod imp {
             entry.0 += 1;
             let elapsed = now.duration_since(entry.1).as_secs_f32();
             if elapsed >= 1.0 {
-                let fps = entry.0 as f32 / elapsed;
+                let _fps = entry.0 as f32 / elapsed;
                 entry.0 = 0; entry.1 = now;
-                let title = format!("{} · {fps:.0} FPS", root.title);
-                self.state.update_frame_title(parent, title);
-                let _ = self.conn.flush();
+                // FPS meter overlay is rendered in-frame via MangoHud (`MANGOHUD=1`),
+                // leaving the window title clean.
             }
         }
 
@@ -1365,6 +1364,7 @@ mod imp {
             fourcc: u32,
             modifier: u64,
             offset: u32,
+            top_down: bool,
         ) -> Result<(), String> {
             if !self.frame_slot_available(id)? { return Ok(()); }
             let dmabuf = self
@@ -1410,9 +1410,13 @@ mod imp {
             //
             // A subsurface is fed by a decoder writing rows top-down, so it must
             // not be flipped.
-            if s.subsurface.is_none() && std::env::var_os("PENGUDROID_NO_PRESENT_FLIP").is_none() {
-                s.wl_surface
-                    .set_buffer_transform(wl_output::Transform::Flipped180);
+            if s.subsurface.is_none() {
+                let transform = if !top_down && std::env::var_os("PENGUDROID_NO_PRESENT_FLIP").is_none() {
+                    wl_output::Transform::Flipped180
+                } else {
+                    wl_output::Transform::Normal
+                };
+                s.wl_surface.set_buffer_transform(transform);
             }
             s.wl_surface.attach(Some(&buffer), 0, 0);
             s.wl_surface.damage(0, 0, s.display_width as i32, s.display_height as i32);
@@ -2137,6 +2141,7 @@ mod imp {
             _fourcc: u32,
             _modifier: u64,
             _offset: u32,
+            _top_down: bool,
         ) -> Result<(), String> {
             Err("graphics built without the `wayland` feature".into())
         }

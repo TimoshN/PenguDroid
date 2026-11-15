@@ -1,0 +1,16 @@
+[package]
+name = "pengudroid-vkshim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Android Vulkan WSI (VK_KHR_android_surface + DMA-BUF swapchain) shim on the host GPU for PenguDroid."
+
+[lib]
+name = "pengudroid_vkshim"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc.workspace = true
+pengudroid-proto.workspace = true
+pengudroid-socket.workspace = true

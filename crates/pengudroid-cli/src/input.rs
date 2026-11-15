@@ -43,12 +43,8 @@ pub fn test(args: &[String]) -> i32 {
     }
     println!("input: swipe injected");
 
-    // Show what a keymap for this panel would look like, so the format is
-    // discoverable from the CLI.
-    let sample = keymap::Keymap::parse(&format!(
-        "W = hold {cx} {cy}\nSPACE = tap {cx} {}\n",
-        cy + 100.0
-    ));
+    // Show what a keymap for this panel/controller looks like.
+    let sample = keymap::Keymap::parse("W = lstick up\nSPACE = pad a\n");
     match sample {
         Ok(map) => {
             println!("input: sample keymap ({} binding(s)):", map.bindings.len());
@@ -63,5 +59,7 @@ pub fn test(args: &[String]) -> i32 {
         keymap::keymap_path("<package>").display()
     );
     let _ = uinput::keyboards();
+    let _ = uinput::gamepads(&[]);
+    let _ = uinput::touchscreens(&[]);
     0
 }
