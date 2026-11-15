@@ -277,6 +277,9 @@ pub fn steps(action: &Action, code: u16, pressed: bool, held: &mut HeldPoints) -
         return release(action, code, held);
     }
     match action {
+        // Not touch gestures: the input pump turns these into keys and
+        // cursor motion (see `crate::gamepad`).
+        Action::Key { .. } | Action::Pointer { .. } => Vec::new(),
         Action::Tap { x, y } => {
             let Some(id) = held.free_id() else { return Vec::new() };
             held.keys.insert(code, Held::Done);

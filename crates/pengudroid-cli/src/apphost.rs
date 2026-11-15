@@ -5330,7 +5330,114 @@ fn spawn_input_pump(env: &JniEnv) {
         let mut input_heartbeat = std::time::Instant::now();
         let mut last_geometry = std::time::Instant::now();
         let mut root_sizes = None;
+        // Game controllers (see `crate::gamepad`): read from evdev, turned
+        // into keymap actions or Android controller events, and fed through
+        // the same records the compositor's input uses.
+        let pad_mode = std::env::var("PENGUDROID_GAMEPAD").unwrap_or_default();
+        let pad_rx = (pad_mode != "off").then(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::gamepad::spawn_readers(tx);
+            rx
+        });
+        let has_pad_bindings = keymap.as_ref().is_some_and(|map| {
+            map.bindings.iter().any(|b| pengudroid_input::keymap::keyname(b.code).starts_with("PAD_"))
+        });
+        let pad_keymap = if pad_mode == "mouse" && !has_pad_bindings {
+            println!("input: gamepad uses the built-in mouse/keyboard layout");
+            Some(crate::gamepad::desktop_layout())
+        } else {
+            keymap.clone()
+        };
+        let mut pad = crate::gamepad::PadMapper::new(pad_keymap, surface_w() as f32, surface_h() as f32);
+        let mut pad_tick = std::time::Instant::now();
+        let mut pad_down_times: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
+        let joystick_jni = MultiTouchJni::resolve(&env, motion_class);
+        let set_axis_coord = env.find_class("android/view/MotionEvent$PointerCoords")
+            .and_then(|c| env.method_id(c, "setAxisValue", "(IF)V"));
+        // Records queued by the controller, ahead of the compositor's.
+        let mut synthetic: std::collections::VecDeque<(u32, f32, f32)> = std::collections::VecDeque::new();
         loop {
+            if let Some(rx) = &pad_rx {
+                let mut outs = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    outs.extend(pad.event(event));
+                }
+                let dt = pad_tick.elapsed().as_secs_f32() * 1000.0;
+                if dt >= 16.0 {
+                    pad_tick = std::time::Instant::now();
+                    outs.extend(pad.tick(dt.min(100.0)));
+                }
+                for out in outs {
+                    use crate::gamepad::Out;
+                    match out {
+                        Out::Key { code, pressed } => synthetic.push_back((6, code as f32, pressed as u8 as f32)),
+                        Out::MouseButton { code, pressed } => synthetic.push_back((4, code as f32, pressed as u8 as f32)),
+                        Out::Cursor { x, y } => synthetic.push_back((3, x, y)),
+                        Out::AndroidKey { keycode, pressed } => {
+                            let Some(_frame) = env.local_frame(16) else { continue };
+                            let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                            let down = if pressed {
+                                *pad_down_times.entry(keycode).or_insert(now)
+                            } else {
+                                pad_down_times.remove(&keycode).unwrap_or(now)
+                            };
+                            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else { continue };
+                            let roots = env.object_field(wmg, roots_field);
+                            if roots.is_null() { continue; }
+                            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else { continue };
+                            if trace_input {
+                                println!("input: gamepad key android={keycode} pressed={pressed}");
+                            }
+                            if let Some(event) = env.new_object(key_class, key_ctor, &[
+                                JValue { j: down }, JValue { j: now },
+                                JValue { i: if pressed { 0 } else { 1 } }, JValue { i: keycode },
+                                JValue { i: 0 }, JValue { i: 0 },
+                                JValue { i: -1 }, JValue { i: 0 }, JValue { i: 0 },
+                                JValue { i: 0x401 }, // SOURCE_GAMEPAD | SOURCE_KEYBOARD
+                            ]) {
+                                if !event.is_null() {
+                                    env.call_void(root, dispatch, &[JValue { l: event }]);
+                                }
+                            }
+                        }
+                        Out::Motion => {
+                            let (Some(jni), Some(set_axis)) = (&joystick_jni, set_axis_coord) else { continue };
+                            let Some(_frame) = env.local_frame(32) else { continue };
+                            let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                            let (Some(props), Some(coords)) = (
+                                env.new_object_array(1, jni.props_class, std::ptr::null_mut()),
+                                env.new_object_array(1, jni.coords_class, std::ptr::null_mut()),
+                            ) else { continue };
+                            let (Some(prop), Some(coord)) = (
+                                env.new_object(jni.props_class, jni.props_ctor, &[]),
+                                env.new_object(jni.coords_class, jni.coords_ctor, &[]),
+                            ) else { continue };
+                            env.set_int_field(prop, jni.props_id, 0);
+                            for (axis, value) in pad.android_axes() {
+                                env.call_void(coord, set_axis, &[JValue { i: axis }, JValue { f: value }]);
+                            }
+                            env.set_object_array_element(props, 0, prop);
+                            env.set_object_array_element(coords, 0, coord);
+                            let Some(event) = env.call_static_object(motion_class, jni.obtain, &[
+                                JValue { j: now }, JValue { j: now }, JValue { i: ACTION_MOVE },
+                                JValue { i: 1 }, JValue { l: props }, JValue { l: coords },
+                                JValue { i: 0 }, JValue { i: 0 }, JValue { f: 1.0 }, JValue { f: 1.0 },
+                                JValue { i: -1 }, JValue { i: 0 },
+                                JValue { i: 0x0100_0010 }, // SOURCE_JOYSTICK
+                                JValue { i: 0 },
+                            ]) else { continue };
+                            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else { continue };
+                            let roots = env.object_field(wmg, roots_field);
+                            if roots.is_null() || event.is_null() { continue; }
+                            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else { continue };
+                            if trace_input {
+                                println!("input: gamepad motion {:?}", pad.android_axes());
+                            }
+                            env.call_void(root, dispatch, &[JValue { l: event }]);
+                        }
+                    }
+                }
+            }
             if last_geometry.elapsed() >= std::time::Duration::from_millis(500) {
                 last_geometry = std::time::Instant::now();
                 if let Some(_frame) = env.local_frame(64) {
@@ -5365,7 +5472,13 @@ fn spawn_input_pump(env: &JniEnv) {
                 last_trace = std::time::Instant::now();
                 trace_surface_views(&env);
             }
-            if unsafe { poll(buf.as_mut_ptr()) } == 0 {
+            let from_pad = synthetic.pop_front().map(|(tag, a, b)| {
+                buf[0..4].copy_from_slice(&0u32.to_le_bytes());
+                buf[4..8].copy_from_slice(&tag.to_le_bytes());
+                buf[8..12].copy_from_slice(&a.to_le_bytes());
+                buf[12..16].copy_from_slice(&b.to_le_bytes());
+            });
+            if from_pad.is_none() && unsafe { poll(buf.as_mut_ptr()) } == 0 {
                 if mapped_held.look_finger_down() && last_look_motion.elapsed() >= LOOK_IDLE {
                     for step in mapped_held.look_idle() {
                         send_touch(step.event);

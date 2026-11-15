@@ -98,6 +98,9 @@ impl KeyMapper {
                         // Mouse-look needs a pointer lock from the compositor,
                         // which only the app host's input path has.
                         Action::Look { .. } => {}
+                        // Controller-to-keyboard/mouse bindings are the app
+                        // host's: it owns the keyboard path and the cursor.
+                        Action::Key { .. } | Action::Pointer { .. } => {}
                         // This panel has one slot, so a stick direction is a
                         // finger dragged from the centre to the rim; combining
                         // directions needs the multitouch path in the app host.

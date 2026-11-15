@@ -63,6 +63,14 @@ pub enum Action {
         radius: f32,
         dir: Dir,
     },
+    /// Act as another key or mouse button (`key ESC`, `key MOUSE_LEFT`):
+    /// how a controller drives an app that expects a keyboard and mouse.
+    /// The emitted key goes through the keyboard path, so it may itself be
+    /// bound to a touch.
+    Key { code: u16 },
+    /// On a whole controller stick (`PAD_LS`, `PAD_RS`): the stick moves a
+    /// mouse cursor, `speed` guest pixels per frame at full deflection.
+    Pointer { speed: f32 },
 }
 
 /// A joystick direction, in screen space (`Up` is toward smaller `y`).
@@ -161,6 +169,8 @@ impl Keymap {
                 Action::Look { cx, cy, radius, sensitivity } => {
                     format!("look {cx} {cy} {radius} {sensitivity}")
                 }
+                Action::Key { code } => format!("key {}", keyname(code)),
+                Action::Pointer { speed } => format!("pointer {speed}"),
             };
             out.push_str(&format!("{key} = {action}\n"));
         }
@@ -258,6 +268,25 @@ fn parse_action(text: &str) -> Result<Action, String> {
             }
             Ok(Action::Stick { cx: values[0], cy: values[1], radius: values[2], dir })
         }
+        "key" => {
+            let [name] = words.as_slice() else {
+                return Err("key needs one key name".into());
+            };
+            let code = keycode(name).ok_or_else(|| format!("unknown key `{name}`"))?;
+            Ok(Action::Key { code })
+        }
+        "pointer" => {
+            let n = nums()?;
+            let speed = match n.as_slice() {
+                [] => 12.0,
+                [speed] => *speed,
+                _ => return Err("pointer takes an optional speed".into()),
+            };
+            if !(0.5..=200.0).contains(&speed) {
+                return Err("pointer speed must be between 0.5 and 200".into());
+            }
+            Ok(Action::Pointer { speed })
+        }
         other => Err(format!("unknown action `{other}`")),
     }
 }
@@ -270,10 +299,40 @@ pub const BTN_MIDDLE: u16 = 0x112;
 pub const BTN_SIDE: u16 = 0x113;
 pub const BTN_EXTRA: u16 = 0x114;
 
+/// Controller sticks as bindable codes, after the `BTN_*` range: each
+/// stick's four directions (up, down, left, right) act like buttons, and the
+/// whole stick takes `pointer`.
+pub const PAD_LS_UP: u16 = 0x2e0;
+pub const PAD_RS_UP: u16 = 0x2e4;
+pub const PAD_LS: u16 = 0x2e8;
+pub const PAD_RS: u16 = 0x2e9;
+
+/// Controller names, `PAD_*`, onto Linux `BTN_*` codes.
+const PAD_NAMES: &[(u16, &str)] = &[
+    (0x130, "PAD_A"), (0x131, "PAD_B"), (0x133, "PAD_X"), (0x134, "PAD_Y"),
+    (0x136, "PAD_LB"), (0x137, "PAD_RB"), (0x138, "PAD_LT"), (0x139, "PAD_RT"),
+    (0x13a, "PAD_SELECT"), (0x13b, "PAD_START"), (0x13c, "PAD_HOME"),
+    (0x13d, "PAD_L3"), (0x13e, "PAD_R3"),
+    (0x220, "PAD_UP"), (0x221, "PAD_DOWN"), (0x222, "PAD_LEFT"), (0x223, "PAD_RIGHT"),
+    (PAD_LS_UP, "PAD_LS_UP"), (PAD_LS_UP + 1, "PAD_LS_DOWN"),
+    (PAD_LS_UP + 2, "PAD_LS_LEFT"), (PAD_LS_UP + 3, "PAD_LS_RIGHT"),
+    (PAD_RS_UP, "PAD_RS_UP"), (PAD_RS_UP + 1, "PAD_RS_DOWN"),
+    (PAD_RS_UP + 2, "PAD_RS_LEFT"), (PAD_RS_UP + 3, "PAD_RS_RIGHT"),
+    (PAD_LS, "PAD_LS"), (PAD_RS, "PAD_RS"),
+];
+
 /// Linux keycode for a name, accepting both `KEY_W` and `W`.
 pub fn keycode(name: &str) -> Option<u16> {
     let upper = name.trim().to_ascii_uppercase();
     let bare = upper.strip_prefix("KEY_").unwrap_or(&upper);
+    let pad_alias = match bare {
+        "PAD_BACK" => "PAD_SELECT",
+        "PAD_GUIDE" => "PAD_HOME",
+        other => other,
+    };
+    if let Some((code, _)) = PAD_NAMES.iter().find(|(_, name)| *name == pad_alias) {
+        return Some(*code);
+    }
     let code = match bare {
         "ESC" | "ESCAPE" => 1,
         "1" => 2,
@@ -464,6 +523,7 @@ pub fn keyname(code: u16) -> String {
     ];
     NAMES
         .iter()
+        .chain(PAD_NAMES.iter())
         .find(|(c, _)| *c == code)
         .map(|(_, n)| (*n).to_string())
         .unwrap_or_else(|| format!("KEY_{code}"))
@@ -620,5 +680,17 @@ SHIFT = swipe 400 800 700 800 12
             assert_eq!(keyname(code), name);
         }
         assert_eq!(keycode("KEY_W"), keycode("W"));
+    }
+
+    #[test]
+    fn controller_bindings_round_trip() {
+        let text = "PAD_A = tap 1100 600\nPAD_LS_UP = stick 230 520 110 up\nPAD_B = key ESC\nPAD_LS = pointer 14\nPAD_X = key MOUSE_LEFT\n";
+        let map = Keymap::parse(text).unwrap();
+        assert_eq!(map.bindings[0].code, 0x130);
+        assert_eq!(map.bindings[2].action, Action::Key { code: 1 });
+        assert_eq!(map.bindings[3].action, Action::Pointer { speed: 14.0 });
+        assert_eq!(keycode("PAD_BACK"), keycode("PAD_SELECT"));
+        assert_eq!(Keymap::parse(&map.render()).unwrap().bindings, map.bindings);
+        assert!(Keymap::parse("PAD_A = key NOPE").is_err());
     }
 }

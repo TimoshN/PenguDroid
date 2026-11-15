@@ -15,6 +15,7 @@ mod apk;
 mod apphost;
 mod audio;
 mod bundle;
+mod gamepad;
 mod client;
 mod deps;
 mod display;

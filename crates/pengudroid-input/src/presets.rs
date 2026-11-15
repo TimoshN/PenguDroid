@@ -157,6 +157,8 @@ mod tests {
                         Action::Stick { cx, cy, radius, .. }
                         | Action::Look { cx, cy, radius, .. } => (cx, cy, radius),
                         Action::Swipe { x0, y0, .. } => (x0, y0, 0.0),
+                        // Not on-screen points.
+                        Action::Key { .. } | Action::Pointer { .. } => (0.0, 0.0, 0.0),
                     };
                     assert!(x - reach >= 0.0 && x + reach <= w, "{package} {b:?}");
                     assert!(y - reach >= 0.0 && y + reach <= h, "{package} {b:?}");
