@@ -8634,6 +8634,24 @@ fn install_display_replies(env: &JniEnv) {
             },
         );
     }
+/// A marshalled one-entry `ParceledListSlice<ResolveInfo>` whose `field`
+/// (`serviceInfo`, `activityInfo`, ...) is `info`.
+fn resolve_info_slice(env: &JniEnv, field: &str, sig: &str, info: JObject) -> Option<Vec<u8>> {
+    let _frame = env.local_frame(16)?;
+    let (ri_class, ri) = new_instance(env, "android/content/pm/ResolveInfo")?;
+    let id = env.field_id(ri_class, field, sig)?;
+    env.set_object_field(ri, id, info);
+    let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
+    let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
+    if env.call_boolean(list, add, &[JValue { l: ri }]) != Some(true) {
+        return None;
+    }
+    let pls_class = env.find_class("android/content/pm/ParceledListSlice")?;
+    let ctor = env.method_id(pls_class, "<init>", "(Ljava/util/List;)V")?;
+    let pls = env.new_object(pls_class, ctor, &[JValue { l: list }])?;
+    marshal_object(env, pls, "android/content/pm/ParceledListSlice")
+}
+
     // `DisplayInfo` has no `densityDpi` field in this build; the density is
     // derived from the logical size and the display metrics.
     // `Display.getRealMetrics()` reads `logicalDensityDpi`, and a zero there
@@ -8643,6 +8661,12 @@ fn install_display_replies(env: &JniEnv) {
     set_int("logicalDensityDpi", density_dpi());
     // Display.STATE_ON = 2, Display.TYPE_INTERNAL = 1, Surface.ROTATION_0 = 0.
     set_int("state", 2);
+    // The same entries answer explicit `queryIntentServices` probes (see the
+    // shim's SERVICE_QUERY_REPLIES): a device resolves an Intent naming one
+    // of the package's own services to that service.
+    let add_query: Option<unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> bool> =
+        shim_symbol("__pengudroid_binder_add_service_query_reply")
+            .map(|symbol| unsafe { std::mem::transmute(symbol) });
     set_int("committedState", 2);
     set_int("type", 1);
     set_int("rotation", 0);
@@ -8662,6 +8686,17 @@ fn install_display_replies(env: &JniEnv) {
         let ctor = env.method_id(class, "<init>", "(IIIF)V")?;
         let mode = env.new_object(class, ctor, &[
             JValue { i: 1 }, JValue { i: surface_w() }, JValue { i: surface_h() }, JValue { f: 60.0 },
+        if let Some(add_query) = add_query {
+            // The Intent carries the fully qualified class; the manifest may not.
+            let full = match service.name.strip_prefix('.') {
+                Some(rest) => format!("{}.{rest}", spec.package),
+                None if !service.name.contains('.') => format!("{}.{}", spec.package, service.name),
+                None => service.name.clone(),
+            };
+            if let Some(slice) = resolve_info_slice(env, "serviceInfo", "Landroid/content/pm/ServiceInfo;", info) {
+                unsafe { add_query(full.as_ptr(), full.len(), slice.as_ptr(), slice.len()) };
+            }
+        }
         ])?;
         let modes = env.new_object_array(1, class, std::ptr::null_mut())?;
         env.set_object_array_element(modes, 0, mode);

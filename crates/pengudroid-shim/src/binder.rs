@@ -1412,6 +1412,58 @@ pub unsafe extern "C" fn __pengudroid_binder_set_vending_query_reply(
     true
 }
 
+/// Explicit-component `queryIntentServices` answers for the app's own
+/// manifest services: `(class name, marshalled ParceledListSlice body)`.
+///
+/// Android resolves an Intent that names one of the package's own services to
+/// that service; libraries use the answer as a capability probe. Google's
+/// `DirectBootUtils` (YouTube) queries its `DirectBootHelperService` and reads
+/// an empty list as "credential-encrypted storage is still locked", which
+/// makes every file read throw "Cannot access credential-protected data from
+/// direct boot". The answer applies only when the vending reply did not and
+/// the request payload names the class (longest match wins).
+static SERVICE_QUERY_REPLIES: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
+
+/// Add one manifest service to [`SERVICE_QUERY_REPLIES`].
+///
+/// # Safety
+/// `name`/`bytes` must point to `name_len`/`len` readable bytes; both are copied.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_add_service_query_reply(
+    name: *const u8,
+    name_len: usize,
+    bytes: *const u8,
+    len: usize,
+) -> bool {
+    if name.is_null() || name_len == 0 || bytes.is_null() || len == 0 {
+        return false;
+    }
+    let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(name, name_len)) else {
+        return false;
+    };
+    let body = std::slice::from_raw_parts(bytes, len).to_vec();
+    let mut replies = SERVICE_QUERY_REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    replies.retain(|(existing, _)| existing != name);
+    replies.push((name.to_string(), body));
+    true
+}
+
+/// The service whose class name the raw request payload names, if any:
+/// UTF-16 (`String16`) or UTF-8 (`String8`), longest match first so that
+/// `a.Foo` does not answer for `a.FooBar`.
+fn service_query_reply(data: &[u8]) -> Option<(String, Vec<u8>)> {
+    let replies = SERVICE_QUERY_REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    let contains = |needle: &[u8]| data.len() >= needle.len() && data.windows(needle.len()).any(|w| w == needle);
+    replies
+        .iter()
+        .filter(|(name, _)| {
+            let wide: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+            contains(&wide) || contains(name.as_bytes())
+        })
+        .max_by_key(|(name, _)| name.len())
+        .cloned()
+}
+
 #[no_mangle]
 pub extern "C" fn __pengudroid_binder_set_audio_focus_transactions(
     request: u32, abandon: u32, unregister: u32, current: u32,
@@ -3149,6 +3201,16 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     if trace_enabled() {
                         diag(&format!(
                             "[binder]   -> queryIntentServices code={} vending ResolveInfo list ({} bytes)\n",
+                            tr.code,
+                            body.len()
+                        ));
+                    }
+                } else if let Some((name, body)) = service_query_reply(data) {
+                    parcel.extend_from_slice(&1u32.to_ne_bytes());
+                    parcel.extend_from_slice(&body);
+                    if trace_enabled() {
+                        diag(&format!(
+                            "[binder]   -> queryIntentServices code={} own service {name} ({} bytes)\n",
                             tr.code,
                             body.len()
                         ));
