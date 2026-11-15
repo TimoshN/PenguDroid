@@ -859,7 +859,8 @@ fn install_system_features_cache(env: &JniEnv) -> Option<()> {
     // Describe implemented virtual input/audio and screen modes. Do not claim
     // camera, sensors, telephony, multitouch, or Vulkan hardware capabilities.
     for name in ["android.hardware.audio.output", "android.hardware.touchscreen",
-        "android.hardware.screen.portrait", "android.hardware.screen.landscape"] {
+        "android.hardware.screen.portrait", "android.hardware.screen.landscape",
+        "android.hardware.wifi"] {
         let (feature_class, feature) = new_instance(env, "android/content/pm/FeatureInfo")?;
         let name_field = env.field_id(feature_class, "name", "Ljava/lang/String;")?;
         env.set_object_field(feature, name_field, env.new_string(name));
@@ -916,6 +917,10 @@ pub fn probe_platform_state(env: &JniEnv) -> bool {
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
     let _ = APP_PACKAGE.set(spec.package.to_string());
     if install_hosted_package(env, spec.package).is_none()
+    // Wi-Fi is claimed because ConnectivityManager publishes a Wi-Fi network
+    // and the daemon hosts the `wifi` service: without the feature,
+    // `getSystemService("wifi")` returns null and apps that assume a
+    // WifiManager (Rockstar's GTA ports) crash in `onCreate`.
         || install_hosted_activities(spec.activities.iter().map(|entry| entry.name.as_str())).is_none() {
         eprintln!("apphost: cannot publish the hosted package to the binder broker");
         return false;
