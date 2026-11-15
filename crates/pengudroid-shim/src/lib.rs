@@ -5603,6 +5603,23 @@ sl_iids! {
     SL_IID_3DSOURCE = 0x5044_002d,
     SL_IID_3DDISTANCEDAMPING = 0x5044_002e,
     SL_IID_3DDISTANCEATTENUATION = 0x5044_002f,
+    // The rest of the OpenSL ES 1.0.1 and Android set: the native-bridge proxy
+    // for libOpenSLES binds every interface id the platform library exports,
+    // and refuses to load (aborting the guest) if one is missing.
+    SL_IID_3DCOMMIT = 0x5044_0030,
+    SL_IID_DYNAMICSOURCE = 0x5044_0031,
+    SL_IID_ENGINECAPABILITIES = 0x5044_0032,
+    SL_IID_MIDIMESSAGE = 0x5044_0033,
+    SL_IID_MIDIMUTESOLO = 0x5044_0034,
+    SL_IID_MIDITEMPO = 0x5044_0035,
+    SL_IID_MIDITIME = 0x5044_0036,
+    SL_IID_PITCH = 0x5044_0037,
+    SL_IID_PREFETCHSTATUS = 0x5044_0038,
+    SL_IID_THREADSYNC = 0x5044_0039,
+    SL_IID_ANDROIDBUFFERQUEUESOURCE = 0x5044_003a,
+    SL_IID_ANDROIDACOUSTICECHOCANCELLATION = 0x5044_003b,
+    SL_IID_ANDROIDAUTOMATICGAINCONTROL = 0x5044_003c,
+    SL_IID_ANDROIDNOISESUPPRESSION = 0x5044_003d,
 }
 
 /// `SLresult slCreateEngine(SLObjectItf*, ...)` — create a usable engine.

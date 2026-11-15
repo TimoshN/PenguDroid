@@ -269,6 +269,15 @@ App data moved from `/tmp/pengudroid-data` (a 16 GB RAM tmpfs here) to
 `$XDG_DATA_HOME/pengudroid/data/<pkg>` (`PENGUDROID_DATA_ROOT`), migrated on
 first use, so the 20+ GB of game resources fit and survive a reboot.
 
+Audio on the ART path: the prepared library tree held Android's own
+`libaaudio.so`/`libOpenSLES.so`, which cannot open a stream without
+AudioFlinger. Genshin opened 77 AAudio streams (all `AAUDIO_ERROR_NULL`) and
+Unity then aborted on a null array (`GetArrayLength` from `nativeRender`).
+Both sonames now point at the shim's implementations (the native launcher's
+compat directory already did this), and the shim exports every `SL_IID_*` the
+libOpenSLES native-bridge proxy binds (14 were missing, which made the proxy
+refuse to load and abort the guest).
+
 Still missing for Genshin: `AndroidKeyStore` (keystore2 service): the SDK's
 Tink keyset cannot be created, `CryptoUtils.encrypt` returns null and logs an
 NPE on every account event; login still succeeds.

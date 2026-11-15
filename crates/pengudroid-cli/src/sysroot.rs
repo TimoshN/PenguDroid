@@ -481,6 +481,21 @@ fn prepare_art_libs(layout: &Layout, work: &Path) -> Result<PathBuf, String> {
         }
         println!("art: installed explicit host EGL/GLES forwarders");
     }
+    // Audio: there is no AudioFlinger, so Android's own libaaudio/libOpenSLES
+    // fail every stream (Genshin opened 77 AAudio streams, all
+    // AAUDIO_ERROR_NULL, then Unity aborted on the result). The shim
+    // implements both NDK APIs on the host sink; the native-bridge proxies and
+    // x86_64 apps dlopen these sonames, so point them at it, as the native
+    // launcher's compat directory already does. Nothing in the image links them.
+    if let Some(shim) = crate::deps::find_shim() {
+        for name in ["libaaudio.so", "libOpenSLES.so"] {
+            let target = out.join(name);
+            let _ = std::fs::remove_file(&target);
+            std::os::unix::fs::symlink(&shim, &target)
+                .map_err(|e| format!("cannot point {name} at the shim: {e}"))?;
+        }
+        println!("art: AAudio and OpenSL ES served by the shim");
+    }
     println!("art: prepared {written} libraries in {}", out.display());
     Ok(out)
 }
