@@ -636,6 +636,12 @@ fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
     match backend {
         Backend::Native => {
             let host = crate::nativelib::host_abi();
+            // Android 17 permits JNI initialization of a previously unset final
+            // static field only in a debuggable-at-init runtime. Native-compiled
+            // initializers (including Kotlin Companion objects) need this.
+            // This enables runtime semantics, not a JDWP listening endpoint.
+            cmd.arg("--vm-option").arg("-Xcompiler-option")
+                .arg("--vm-option").arg("--debuggable");
             if b.abis.iter().any(|a| a == host) {
                 Some(host.to_string())
             } else {

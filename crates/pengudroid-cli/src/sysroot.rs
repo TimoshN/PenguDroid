@@ -986,7 +986,12 @@ pub fn art_test(args: &[String]) -> i32 {
                 }
             }
         }
-        ld_path = format!("{}:{ld_path}", dir.display());
+        // ARM libraries belong to the native-bridge namespace only. Letting
+        // them shadow host public libraries (notably an app's libz.so) makes
+        // nativeloader attempt to preload an ARM ELF through glibc.
+        if native_abi == "x86_64" {
+            ld_path = format!("{}:{ld_path}", dir.display());
+        }
         native_lib_dirs.push(dir);
     }
     if let Some(dir) = &bridge_lib {
@@ -1160,7 +1165,8 @@ const JNI_ERR: c_int = -1;
 /// namespace and `System.loadLibrary` reaches glibc, which cannot load an
 /// ARM64 guest library.
 fn java_library_path(layout: &Layout) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    // Public framework libraries must win over same-named APK libraries.
+    let mut parts: Vec<String> = vec![layout.ld_library_path()];
     if let Some(dirs) = std::env::var_os("PENGUDROID_NATIVE_LIB_DIRS") {
         parts.extend(
             std::env::split_paths(&dirs)
@@ -1168,7 +1174,6 @@ fn java_library_path(layout: &Layout) -> String {
                 .map(|p| p.display().to_string()),
         );
     }
-    parts.push(layout.ld_library_path());
     parts.join(":")
 }
 

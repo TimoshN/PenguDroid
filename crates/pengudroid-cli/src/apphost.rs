@@ -1182,11 +1182,10 @@ fn surface_video_dimensions(env: &JniEnv, view: JObject) -> (i32, i32) {
         (width > 0 && height > 0).then_some((width, height))
     })();
     let (container_w, container_h) = root_size.unwrap_or(surface_size());
-    let (mut w, mut h) = if container_w.saturating_mul(9) > container_h.saturating_mul(16) {
-        (container_h.saturating_mul(16) / 9, container_h)
-    } else {
-        (container_w, container_w.saturating_mul(9) / 16)
-    };
+    // SurfaceView is also the rendering surface of games, not just video.
+    // Imposing a 16:9 video rectangle clips/stretches other desktop aspect
+    // ratios. Let the app render into the full client area by default.
+    let (mut w, mut h) = (container_w, container_h);
     if let Some(configured_w) = configured("PENGUDROID_VIDEO_W") { w = configured_w; }
     if let Some(configured_h) = configured("PENGUDROID_VIDEO_H") { h = configured_h; }
     (w.max(1), h.max(1))
@@ -1735,8 +1734,7 @@ fn report_surface_views(env: &JniEnv, verbose: bool) {
                                 }
                             }
                         }
-                        let m = env.method_id(vri_class, "scheduleTraversals", "()V")?;
-                        env.call_void(vri, m, &[]).then_some(())
+                        poke_relayout(env, vri).then_some(())
                     })
                     .is_some();
                 // `performDraw` only dispatches the pre-draw listeners when the
@@ -2068,7 +2066,7 @@ const MAX_FORCE_PASSES: u32 = 4;
 
 fn spawn_resized_pump(env: &JniEnv) {
     let pump = std::env::var_os("PENGUDROID_PUMP_RESIZED").is_some();
-    let follow = std::env::var_os("PENGUDROID_FOLLOW_RESIZE").is_some();
+    let follow = follow_enabled();
     if !pump && !follow {
         return;
     }
@@ -2083,11 +2081,13 @@ fn spawn_resized_pump(env: &JniEnv) {
             std::collections::HashMap::new();
         let mut follow = FollowResize::new();
         loop {
-            if pump {
-                pump_resized(&env, &mut seen);
-            }
-            if follow_enabled() {
-                follow.poll(&env);
+            if let Some(_frame) = env.local_frame(256) {
+                if pump {
+                    pump_resized(&env, &mut seen);
+                }
+                if follow_enabled() {
+                    follow.poll(&env);
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
@@ -2095,7 +2095,7 @@ fn spawn_resized_pump(env: &JniEnv) {
 }
 
 fn follow_enabled() -> bool {
-    std::env::var_os("PENGUDROID_FOLLOW_RESIZE").is_some()
+    std::env::var("PENGUDROID_FOLLOW_RESIZE").as_deref() != Ok("0")
 }
 
 /// `PENGUDROID_FOLLOW_RESIZE=1`: let the guest relayout when the window changes
@@ -2128,7 +2128,9 @@ impl FollowResize {
         // The GL shim publishes this each time it creates a window. It is re-read
         // on every tick because an app replaces its window — a splash handing over
         // to the game — and the daemon keeps only the live one.
-        self.surface_id = ["PENGUDROID_LAST_SURFACE_ID", "PENGUDROID_SURFACE_ID"]
+        // Follow the desktop toplevel, not a SurfaceView child recreated by
+        // relayout. The child's buffer dimensions lag the next configure.
+        self.surface_id = ["PENGUDROID_SURFACE_ID", "PENGUDROID_LAST_SURFACE_ID"]
             .iter()
             .find_map(|key| std::env::var(key).ok().and_then(|v| v.parse().ok()));
         let Some(surface_id) = self.surface_id else { return };
@@ -2150,7 +2152,10 @@ impl FollowResize {
         let (_, _, display_w, display_h) = match sizes {
             Ok(Some(sizes)) => sizes,
             // Between two windows there is nothing to size against yet.
-            Ok(None) => return,
+            Ok(None) => {
+                self.surface_id = None;
+                return;
+            }
             Err(e) => {
                 // A daemon that went away must not wedge the pump: drop the
                 // connection and try again on the next tick.
@@ -2173,7 +2178,11 @@ impl FollowResize {
             return;
         }
         self.applied = Some((display_w, display_h));
-        let g = geometry().for_resize(display_w, display_h);
+        let current = geometry();
+        if current.width as u32 == display_w && current.height as u32 == display_h {
+            return;
+        }
+        let g = current.for_resize(display_w, display_h);
         for (key, value) in g.export() {
             std::env::set_var(key, value);
         }
@@ -2265,9 +2274,35 @@ fn poke_relayout(env: &JniEnv, root: JObject) -> bool {
     if let Some(f) = env.field_id(vri_class, "mLayoutRequested", "Z") {
         env.set_boolean_field(root, f, true);
     }
-    env.method_id(vri_class, "scheduleTraversals", "()V")
-        .map(|m| env.call_void(root, m, &[]))
-        .unwrap_or(false)
+    // API 37 checks the caller thread in scheduleTraversals. Queue its
+    // framework VsyncCallback instead; drawing and SurfaceHolder callbacks
+    // still execute on the owning Choreographer's UI Looper.
+    let scheduled = (|| -> Option<bool> {
+        let pending = env.field_id(vri_class, "mTraversalScheduled", "Z")?;
+        if env.boolean_field(root, pending) { return Some(true); }
+        let choreographer_field = env.field_id(vri_class, "mChoreographer", "Landroid/view/Choreographer;")?;
+        let callback_field = env.field_id(vri_class, "mTraversalCallback", "Landroid/view/ViewRootImpl$TraversalCallback;")?;
+        let choreographer = env.object_field(root, choreographer_field);
+        let callback = env.object_field(root, callback_field);
+        if choreographer.is_null() || callback.is_null() { return None; }
+        let barrier = env.method_id(vri_class, "postTraversalBarrier", "()V")?;
+        let choreographer_class = env.find_class("android/view/Choreographer")?;
+        let post = env.method_id(choreographer_class, "postVsyncCallback", "(ILandroid/view/Choreographer$VsyncCallback;)V")?;
+        env.set_boolean_field(root, pending, true);
+        if !env.call_void(root, barrier, &[]) {
+            env.set_boolean_field(root, pending, false);
+            return Some(false);
+        }
+        let posted = env.call_void(choreographer, post, &[JValue { i: 3 }, JValue { l: callback }]);
+        if !posted {
+            if let Some(remove) = env.method_id(vri_class, "removeTraversalBarrier", "()V") {
+                env.call_void(root, remove, &[]);
+            }
+            env.set_boolean_field(root, pending, false);
+        }
+        Some(posted)
+    })();
+    scheduled.unwrap_or(false)
 }
 
 /// `PENGUDROID_PUMP_RESIZED=1`: play the window manager's `IWindow.resized`.
@@ -2375,10 +2410,7 @@ fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, (i32, 
         if let Some(f) = env.field_id(vri_class, "mLayoutRequested", "Z") {
             env.set_boolean_field(root, f, true);
         }
-        let ok = env
-            .method_id(vri_class, "scheduleTraversals", "()V")
-            .map(|m| env.call_void(root, m, &[]))
-            .unwrap_or(false);
+        let ok = poke_relayout(env, root);
 
         println!(
             "apphost: nudge relayout root {index} seq={seq} ok={ok} at +{} ms",
@@ -4959,6 +4991,13 @@ fn spawn_input_pump(env: &JniEnv) {
                 };
                 let mut parts = coords.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
                 if let (Some(x), Some(y)) = (parts.next(), parts.next()) {
+                // MotionEvent.obtain's short overload leaves SOURCE_UNKNOWN.
+                // Native game/WebView input handlers may reject it even though
+                // ordinary Android Views still react to the same coordinates.
+                if let Some(set_source) = env.method_id(motion_class, "setSource", "(I)V") {
+                    let source = if action == ACTION_HOVER_MOVE { 0x2002 } else { 0x1002 };
+                    env.call_void(event, set_source, &[JValue { i: source }]);
+                }
                     taps.push((x, y, delay));
                 }
             }
