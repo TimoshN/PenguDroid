@@ -100,7 +100,7 @@ def package(appdir, repo):
     shutil.copy2(cert, usr / "portable/ca-certificates.crt")
     setup = usr / "share/pengudroid/setup/tools"
     (setup / "art").mkdir(parents=True, exist_ok=True)
-    for name in ["prepare-android17.py", "art/unpack-apex.py", "art/sysroot-relink.py"]:
+    for name in ["prepare-android17.py", "runtime-modules.py", "art/unpack-apex.py", "art/sysroot-relink.py"]:
         shutil.copy2(repo / "tools" / name, setup / name)
     shutil.copy2(repo / "tools/appimage-bootstrap.py", usr / "share/pengudroid/bootstrap.py")
     digest = hashlib.sha256()

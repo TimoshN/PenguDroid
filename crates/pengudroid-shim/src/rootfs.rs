@@ -116,11 +116,29 @@ fn map_with_roots(host: Option<&[u8]>, arm64: Option<&[u8]>, path: &[u8]) -> Opt
             return map_with_root(arm64, path);
         }
     }
+    if path == b"/system" {
+        if let Some(host) = host {
+            return map_with_root(host, path);
+        }
+        if let Some(arm64) = arm64 {
+            return map_with_root(arm64, path);
+        }
+    }
     map_with_root(host?, path)
 }
 
 /// Map `path` into the selected runtime root, or leave host paths untouched.
 pub fn map_bytes(path: &[u8]) -> Option<Vec<u8>> {
+    // Never initialize a descriptor while its own host file is being opened.
+    if !guest_path(path) { return None; }
+    if arm64_runtime_path(path) {
+        if let Some(arm64) = arm64_root() { return map_with_root(arm64, path); }
+    }
+    if let Some(runtime) = pengudroid_runtime::configured() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        return runtime.resolve(std::path::Path::new(std::ffi::OsStr::from_bytes(path)))
+            .map(|path| path.into_os_string().into_vec());
+    }
     map_with_roots(root(), arm64_root(), path)
 }
 
@@ -346,6 +364,9 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     if is_emulated_device(path) {
         return 0;
     }
+    if hosted_service_access(path, mode) {
+        return 0;
+    }
     match next::<AccessFn>(b"access\0") {
         Some(f) => with_path(path, |p| f(p, mode)),
         None => -1,
@@ -361,6 +382,27 @@ unsafe fn is_emulated_device(path: *const c_char) -> bool {
     crate::binder::is_binder_device(bytes) || bytes == b"/dev/ashmem"
 }
 
+// API-37 libhidlbase uses access(F_OK) on the Android hwservicemanager
+// executable as its HIDL capability check. Our manager is the real in-process
+// dispatcher in binder.rs, so this probe must not depend on a GSI executable.
+// This is an existence capability only: execution/read/write checks still go
+// to the filesystem and no executable or HAL service is fabricated.
+fn hosted_service_probe(path: &[u8], mode: c_int, configured: bool) -> bool {
+    configured && mode == libc::F_OK && matches!(path,
+        b"/system/system_ext/bin/hwservicemanager"
+        | b"/system_ext/bin/hwservicemanager"
+        | b"/system/bin/hwservicemanager")
+}
+
+unsafe fn hosted_service_access(path: *const c_char, mode: c_int) -> bool {
+    if path.is_null() { return false; }
+    let bytes = CStr::from_ptr(path).to_bytes();
+    let legacy = root();
+    let configured = legacy.is_some() || std::env::var_os(pengudroid_runtime::ENV).is_some();
+    let bytes = legacy.and_then(|root| bytes.strip_prefix(root)).unwrap_or(bytes);
+    hosted_service_probe(bytes, mode, configured)
+}
+
 /// `faccessat(dirfd, path, mode, flags)`.
 #[no_mangle]
 pub unsafe extern "C" fn faccessat(
@@ -372,6 +414,9 @@ pub unsafe extern "C" fn faccessat(
     if is_emulated_device(path) {
         return 0;
     }
+    if flags == 0 && hosted_service_access(path, mode) {
+        return 0;
+    }
     match next::<AccessAtFn>(b"faccessat\0") {
         Some(f) => with_path(path, |p| f(dirfd, p, mode, flags)),
         None => -1,
@@ -380,16 +425,22 @@ pub unsafe extern "C" fn faccessat(
 
 fn virtual_arm64_path<'a>(root: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
     let path = path.strip_prefix(root)?;
-    arm64_runtime_path(path).then_some(path)
+    (arm64_runtime_path(path) || path == b"/system").then_some(path)
 }
 
-fn virtual_runtime_path(path: &[u8]) -> Option<&[u8]> {
+fn virtual_runtime_path(path: &[u8]) -> Option<Vec<u8>> {
+    if let Some(runtime) = pengudroid_runtime::configured() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let path = runtime.virtualize(std::path::Path::new(std::ffi::OsStr::from_bytes(path)))?;
+        let bytes = path.into_os_string().into_vec();
+        return (arm64_runtime_path(&bytes) || bytes == b"/system").then_some(bytes);
+    }
     let arm64 = arm64_root()?;
-    if let Some(path) = virtual_arm64_path(arm64, path) { return Some(path); }
+    if let Some(path) = virtual_arm64_path(arm64, path) { return Some(path.to_vec()); }
     // The config reader canonicalizes dir.system=/system as well as the
     // executable. Both must remain in the same virtual coordinate space.
     let path = path.strip_prefix(root()?)?;
-    guest_path(path).then_some(path)
+    guest_path(path).then_some(path.to_vec())
 }
 
 /// Linker config sections are selected by executable realpath. Returning the
@@ -398,14 +449,14 @@ fn virtual_runtime_path(path: &[u8]) -> Option<&[u8]> {
 unsafe fn with_link_output(
     buf: *mut c_char, size: usize, mut read: impl FnMut(*mut c_char, usize) -> isize,
 ) -> isize {
-    if arm64_root().is_none() { return read(buf, size); }
+    if arm64_root().is_none() && std::env::var_os(pengudroid_runtime::ENV).is_none() { return read(buf, size); }
     if buf.is_null() || size == 0 { return read(buf, size); }
     let mut link = [0u8; 4096 + 64];
     let len = read(link.as_mut_ptr().cast(), link.len());
     if len < 0 { return len; }
     if len as usize == link.len() { return read(buf, size); }
     let path = &link[..len as usize];
-    let path = virtual_runtime_path(path).unwrap_or(path);
+    let path = virtual_runtime_path(path).unwrap_or_else(|| path.to_vec());
     let count = size.min(path.len());
     std::ptr::copy_nonoverlapping(path.as_ptr(), buf.cast(), count);
     count as isize
@@ -524,12 +575,17 @@ pub unsafe extern "C" fn freopen(
 pub unsafe extern "C" fn realpath(path: *const c_char, resolved: *mut c_char) -> *mut c_char {
     match next::<RealpathFn>(b"realpath\0") {
         Some(f) => with_path(path, |p| {
-            let out = f(p, resolved);
+            let mut out = f(p, resolved);
             if !out.is_null() {
                 {
                     let host = CStr::from_ptr(out).to_bytes();
                     if let Some(virtual_path) = virtual_runtime_path(host) {
                         let len = virtual_path.len();
+                        if resolved.is_null() && len > host.len() {
+                            let larger = libc::realloc(out.cast(), len + 1).cast::<c_char>();
+                            if larger.is_null() { libc::free(out.cast()); return std::ptr::null_mut(); }
+                            out = larger;
+                        }
                         std::ptr::copy(virtual_path.as_ptr(), out.cast(), len);
                         *out.add(len) = 0;
                     }
@@ -576,6 +632,22 @@ mod tests {
     use super::*;
 
     const ROOT: &[u8] = b"/opt/android";
+
+    #[test]
+    fn hosted_hidl_probe_needs_no_android_executable() {
+        for path in [b"/system/system_ext/bin/hwservicemanager".as_slice(),
+            b"/system_ext/bin/hwservicemanager", b"/system/bin/hwservicemanager"] {
+            assert!(hosted_service_probe(path, libc::F_OK, true));
+            assert!(!hosted_service_probe(path, libc::F_OK, false));
+            for mode in [libc::X_OK, libc::R_OK, libc::W_OK, libc::R_OK | libc::X_OK] {
+                assert!(!hosted_service_probe(path, mode, true));
+            }
+        }
+        for path in [b"/usr/bin/hwservicemanager".as_slice(),
+            b"/system/system_ext/bin/hwservicemanager-other", b"/system/bin/other"] {
+            assert!(!hosted_service_probe(path, libc::F_OK, true));
+        }
+    }
 
     #[test]
     fn maps_guest_mount_points() {

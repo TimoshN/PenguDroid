@@ -66,6 +66,7 @@ def main():
     env["PYTHONHOME"] = str(destination / "usr/python")
     env["PENGUDROID_PYTHON"] = str(destination / "usr/python/bin/python3")
     env["PENGUDROID_PREPARE_SCRIPT"] = str(destination / "usr/share/pengudroid/setup/tools/prepare-android17.py")
+    env["PENGUDROID_MODULES_SCRIPT"] = str(destination / "usr/share/pengudroid/setup/tools/runtime-modules.py")
     env["SSL_CERT_FILE"] = str(destination / "usr/portable/ca-certificates.crt")
     env["PIPEWIRE_MODULE_DIR"] = str(destination / "usr/portable/pipewire-0.3")
     env["SPA_PLUGIN_DIR"] = str(destination / "usr/portable/spa-0.2")

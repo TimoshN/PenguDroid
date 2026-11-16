@@ -144,6 +144,7 @@ pub fn ensure_compat_dir() -> Result<PathBuf, String> {
         // the linker and its `libdl_android` wrapper resolve here too.
         "libdl_android.so",
         "ld-android.so",
+        "libbase.so",
     ];
     for name in BIONIC_SONAMES {
         symlink(&dir.join(name), &shim).map_err(|e| format!("symlink {name}: {e}"))?;
@@ -289,7 +290,7 @@ fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
         match a.as_str() {
             "--call" => call = Some(it.next().ok_or("--call needs a SYMBOL")?.clone()),
             "--lib-dir" => lib_dir = Some(PathBuf::from(it.next().ok_or("--lib-dir needs a DIR")?)),
-            "--sysroot" => sysroot = Some(PathBuf::from(it.next().ok_or("--sysroot needs a DIR")?)),
+            "--runtime" | "--sysroot" => sysroot = Some(PathBuf::from(it.next().ok_or("--sysroot needs a DIR")?)),
             "--apk" => apk = Some(it.next().ok_or("--apk needs a PATH")?.clone()),
             "--abi" => abi = Some(it.next().ok_or("--abi needs a NAME")?.clone()),
             "--dlclose" => dlclose = true,

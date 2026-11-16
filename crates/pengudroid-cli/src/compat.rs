@@ -45,6 +45,15 @@ fn config_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), Strin
 
 pub fn disabled_changes(root: &Path, target_sdk: u32) -> Result<Vec<i64>, String> {
     let mut files = Vec::new();
+    if root.join(pengudroid_runtime::DESCRIPTOR).is_file() {
+        let runtime = pengudroid_runtime::Runtime::load(&root.join(pengudroid_runtime::DESCRIPTOR))?;
+        for guest in ["/system/etc/compatconfig", "/product/etc/compatconfig", "/system_ext/etc/compatconfig"] {
+            if let Some(directory) = runtime.resolve(Path::new(guest)) { config_files(&directory, &mut files)?; }
+        }
+        for (name, directory) in &runtime.components {
+            if name.starts_with("apex-") { config_files(&directory.join("etc/compatconfig"), &mut files)?; }
+        }
+    }
     for partition in ["system", "product", "system_ext", "system/product", "system/system_ext"] {
         config_files(&root.join(partition).join("etc/compatconfig"), &mut files)?;
     }

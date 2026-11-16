@@ -11,9 +11,10 @@ This document describes PenguDroid's control protocol and CLI. See [LIMITATIONS.
 | `pengudroid stop` | Stop the daemon and wait for its socket to disappear. | Working |
 | `pengudroid demo` | Open the built-in demo window; no APK required. | Working; requires a Wayland session |
 | `pengudroid native <apk>` / `--lib lib.so` | Run a NativeActivity app without ART; `--isolate` adds seccomp. | Working |
-| `pengudroid launch <app.apk>` | Launch with an app-specific prefix under `~/.local/share/pengudroid/prefixes/<pkg>`. Reads overrides from `pengudroid.env` and selects the `native` or `art` backend from the APK. Supports `--backend`, `--prefix`, and `--sysroot`. | Working |
+| `pengudroid launch <app.apk>` | Launch with an app-specific prefix under `~/.local/share/pengudroid/prefixes/<pkg>`. Reads overrides from `pengudroid.env` and selects the `native` or `art` backend from the APK. Supports `--backend`, `--prefix`, and `--runtime` (`--sysroot` remains a legacy alias). | Working |
 | `pengudroid extract <file> [--dest DIR] [--abi A]` | Extract `.apk`, `.apkm`, `.xapk`, or `.apks` packages, including base APK, ABI-filtered splits, and OBB data under `Android/obb/<pkg>/`. | Working |
 | `pengudroid doctor <apk>` | Report whether an APK can run and what it is missing. | Working |
+| `pengudroid runtime --modules <store>` | Install/update descriptor-backed runtime components without materializing a sysroot; atomic activation retains previous generations. See [modular runtime](MODULAR_RUNTIME.md). | Working |
 | `pengudroid sysroot <dir>` | Inspect an extracted Android system tree. | Working |
 | `pengudroid art-test --sysroot <dir>` | Try `JNI_CreateJavaVM`; also supports `--classpath <apk>`, `--find-class <C>`, `--main <C>`, `--jni-lib <so>`, and `--register-natives <so>`. | Working; returns a live `JavaVM` (`JNI_OK`) |
 | `pengudroid run app.apk` | Run the guest under the CLI and stop it with Ctrl-C; reports an error for a missing APK. | Working; requires a Wayland session |

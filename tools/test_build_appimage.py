@@ -100,6 +100,58 @@ class AppDirTests(unittest.TestCase):
             (self.appdir / "usr/share/applications/pengudroid.desktop").read_bytes(),
         )
 
+    def test_module_store_is_bundled_with_its_offline_installer(self):
+        if not all((RELEASE / name).is_file() for name in ARTIFACTS):
+            self.skipTest("release artifacts are not built")
+        store = self.fake / "store"
+        store.mkdir()
+        (store / "runtime-modules.json").write_text('{"format":2}')
+        (store / "native.tar").write_bytes(b"archive fixture")
+        result = run("--skip-build", "--no-image", "--with-modules", str(store))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundled = self.appdir / "usr/share/pengudroid"
+        self.assertEqual((bundled / "runtime-modules/native.tar").read_bytes(), b"archive fixture")
+        self.assertTrue((bundled / "setup/tools/runtime-modules.py").is_file())
+        self.assertIn("PENGUDROID_RUNTIME_MODULES", (self.appdir / "AppRun").read_text())
+
+    def test_arm64_component_store_omits_legacy_guest_sysroot(self):
+        bridge = REPO / ".toolchain/nativebridge-stage"
+        if not all((RELEASE / name).is_file() for name in ARTIFACTS) or not (bridge / "libberberis_arm64.so").is_file():
+            self.skipTest("release binaries/native bridge are not built")
+        store = self.fake / "components"
+        store.mkdir()
+        (store / "runtime-modules.json").write_text('{"format":2,"arm64_guest":true}')
+        (store / "arm64-guest.tar").write_bytes(b"archive fixture")
+        result = run("--skip-build", "--no-image", "--with-bridge", "--bridge-dir", str(bridge), "--with-modules", str(store))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundled = self.appdir / "usr/share/pengudroid"
+        self.assertFalse((bundled / "sysroot").exists())
+        self.assertFalse((bundled / "guest-arm64").exists())
+        self.assertTrue((self.appdir / "usr/lib/pengudroid/bridge/libberberis_arm64.so").is_file())
+
+    def test_bundled_modules_do_not_auto_select_a_user_legacy_sysroot(self):
+        if not all((RELEASE / name).is_file() for name in ARTIFACTS):
+            self.skipTest("release artifacts are not built")
+        store = self.fake / "store"
+        store.mkdir()
+        (store / "runtime-modules.json").write_text('{"format":2}')
+        result = run("--skip-build", "--no-image", "--with-modules", str(store))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cli = self.appdir / "usr/bin/pengudroid"
+        cli.write_text('#!/bin/sh\nprintf "%s" "${PENGUDROID_SYSROOT-unset}"\n')
+        data = self.fake / "data"
+        (data / "pengudroid/sysroot").mkdir(parents=True)
+        env = {k:v for k,v in os.environ.items() if not k.startswith("PENGUDROID_")}
+        env["XDG_DATA_HOME"] = str(data)
+        observed = subprocess.run(["sh", str(self.appdir / "AppRun"), "--cli", "--version"],
+            env=env, capture_output=True, text=True)
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(observed.stdout, "unset")
+        env["PENGUDROID_SYSROOT"] = "/explicit/override"
+        observed = subprocess.run(["sh", str(self.appdir / "AppRun"), "--cli", "--version"],
+            env=env, capture_output=True, text=True)
+        self.assertEqual(observed.stdout, "/explicit/override")
+
     def test_bundled_cli_reports_its_version(self):
         if not all((RELEASE / name).is_file() for name in ARTIFACTS):
             self.skipTest("release artifacts are not built")

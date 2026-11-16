@@ -2192,3 +2192,21 @@ mod tests {
         }
     }
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetAndroidHardwareBufferPropertiesANDROID(
+    _device: VkDevice,
+    _buffer: *const c_void,
+    _pProperties: *mut c_void,
+) -> VkResult {
+    -8 // VK_ERROR_FEATURE_NOT_PRESENT
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetMemoryAndroidHardwareBufferANDROID(
+    _device: VkDevice,
+    _pInfo: *const c_void,
+    _pBuffer: *mut *mut c_void,
+) -> VkResult {
+    -8 // VK_ERROR_FEATURE_NOT_PRESENT
+}

@@ -11,6 +11,8 @@ name = "pengudroid"
 path = "src/main.rs"
 
 [dependencies]
+pengudroid-runtime.workspace = true
+pengudroid-dexvm.workspace = true
 pengudroid-input.workspace = true
 pengudroid-proto.workspace = true
 pengudroid-socket.workspace = true

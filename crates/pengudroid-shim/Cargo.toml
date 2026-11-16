@@ -11,6 +11,7 @@ name = "pengudroid_shim"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+pengudroid-runtime.workspace = true
 pengudroid-proto.workspace = true
 pengudroid-device.workspace = true
 pengudroid-socket.workspace = true

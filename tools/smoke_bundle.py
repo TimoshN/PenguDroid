@@ -8,7 +8,10 @@ Writes daemon.log, app.log and result.json next to the bundle run directory
 
 `PENGUDROID_DAEMON` selects the daemon binary and `PENGUDROID_DAEMON_ARGS` adds
 arguments to it (for example `-v` to see successful frame presents, which are
-otherwise only logged at debug level).
+otherwise only logged at debug level). `PENGUDROID_APPIMAGE` selects the actual
+AppImage entry point for both daemon and game, from a working directory outside
+the checkout. Set XDG_CACHE_HOME/XDG_DATA_HOME to isolated paths to exercise its
+bundled runtime rather than an existing developer install.
 """
 import json
 import os
@@ -19,10 +22,13 @@ import sys
 import time
 
 repo = Path(__file__).resolve().parents[1]
-work = Path(os.environ.get("SMOKE_DIR", repo / "target" / "bundle-smoke"))
+work = Path(os.environ.get("SMOKE_DIR", repo / "target" / "bundle-smoke")).resolve()
 bundle = Path(sys.argv[1]).resolve()
 extra = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv[2:] else []
-duration = int(os.environ.get("SMOKE_SECONDS", "45"))
+duration = int(os.environ.get("SMOKE_SECONDS", sys.argv[2] if len(sys.argv) > 2 and sys.argv[2].isdigit() else "45"))
+appimage = os.environ.get("PENGUDROID_APPIMAGE")
+entry = [str(Path(appimage).resolve()), "--cli"] if appimage else [str(repo / "target/debug/pengudroid")]
+cwd = work.resolve() if appimage else repo
 socket = work / "daemon.sock"
 env = dict(os.environ)
 # The run owns a private daemon on this socket, so an inherited
@@ -31,7 +37,10 @@ env = dict(os.environ)
 # be dropped" and the run looks like a rendering failure.
 env["PENGUDROID_SOCKET"] = str(socket)
 processes = []
-result = {"bundle": str(bundle), "runtime": "Android 17 / API 37 x86_64", "samples": []}
+actions = json.loads(os.environ.get("SMOKE_ACTIONS", "[]"))
+control_entry = json.loads(os.environ["SMOKE_CONTROL_ENTRY"]) if os.environ.get("SMOKE_CONTROL_ENTRY") else entry
+result = {"bundle": str(bundle), "runtime": "Android 17 / API 37 x86_64",
+          "entry": entry, "working_directory": str(cwd), "samples": []}
 
 
 def sample(group):
@@ -57,29 +66,43 @@ try:
     work.mkdir(parents=True, exist_ok=True)
     with (work / "daemon.log").open("wb") as dlog, (work / "app.log").open("wb") as alog:
         daemon_args = os.environ.get("PENGUDROID_DAEMON_ARGS", "").split()
-        daemon = subprocess.Popen(
+        daemon_command = (entry + ["daemon", "--foreground"] if appimage else
             [os.environ.get("PENGUDROID_DAEMON", str(repo / "target/debug/pengudroid-daemon")),
-             "--socket", str(socket)] + daemon_args,
-            cwd=repo, env=env, stdin=subprocess.DEVNULL,
+             "--socket", str(socket)] + daemon_args)
+        daemon = subprocess.Popen(
+            daemon_command,
+            cwd=cwd, env=env, stdin=subprocess.DEVNULL,
             stdout=dlog, stderr=subprocess.STDOUT, start_new_session=True)
         processes.append(daemon)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + (60 if appimage else 5)
         while not socket.exists():
             if daemon.poll() is not None or time.monotonic() >= deadline:
                 raise RuntimeError("private daemon socket unavailable")
             time.sleep(0.05)
         # The launcher resolves its own runtime (cache or in-checkout tree), so a
         # plain smoke run exercises the same no---sysroot path users take.
-        args = [str(repo / "target/debug/pengudroid"), "launch", str(bundle),
+        args = entry + ["launch", str(bundle),
                 "--backend", os.environ.get("SMOKE_BACKEND", "auto"),
                 "--prefix", str(work / "prefix")] + extra
         if os.environ.get("SMOKE_SYSROOT"):
             args += ["--sysroot", os.environ["SMOKE_SYSROOT"]]
-        app = subprocess.Popen(args, cwd=repo, env=env, stdin=subprocess.DEVNULL,
+        result["daemon_command"] = daemon_command
+        result["launch_command"] = args
+        app = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=alog, stderr=subprocess.STDOUT, start_new_session=True)
         processes.append(app)
         started = time.monotonic()
         while time.monotonic() - started < duration:
+            for action in actions:
+                if action.get("done") or time.monotonic() - started < action["at"]:
+                    continue
+                action["done"] = True
+                controlled = subprocess.run(control_entry + action["args"], cwd=cwd, env=env,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+                record = {"elapsed": round(time.monotonic() - started, 2), "args": action["args"],
+                    "exit": controlled.returncode, "output": controlled.stdout.decode(errors="replace")[-2000:]}
+                result.setdefault("actions", []).append(record)
+                (work / "controls.json").write_text(json.dumps(result["actions"], indent=2) + "\n")
             result["samples"].append({"elapsed": round(time.monotonic() - started, 2),
                                       "app": sample(app.pid)})
             if app.poll() is not None:

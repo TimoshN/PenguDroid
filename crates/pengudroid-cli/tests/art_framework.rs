@@ -67,7 +67,7 @@ fn optional_android17_sysroot() -> Option<PathBuf> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
     let root = explicit.as_ref().map(PathBuf::from)
         .unwrap_or_else(|| workspace.join(".toolchain/sysroot-android17"));
-    if !root.join("system/framework/framework.jar").exists() {
+    if !root.join("system/framework/framework.jar").exists() && !root.join(pengudroid_runtime::DESCRIPTOR).is_file() {
         assert!(explicit.is_none(), "explicit API-37 sysroot is incomplete or missing: {}", root.display());
         eprintln!("skipping: no API-37 runtime (set PENGUDROID_TEST_ANDROID17_SYSROOT)");
         return None;

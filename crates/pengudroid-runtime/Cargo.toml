@@ -1,0 +1,10 @@
+[package]
+name = "pengudroid-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Component runtime descriptors and virtual Android path resolution."
+
+[dependencies]
+serde_json = "1.0.154"

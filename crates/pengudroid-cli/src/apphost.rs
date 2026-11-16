@@ -1143,7 +1143,8 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     }
     // Respect the image's default compat policy for this APK, rather than
     // implicitly enabling all optional platform changes with an empty list.
-    let disabled = match std::env::var_os("PENGUDROID_ROOT") {
+    let disabled = match std::env::var_os("PENGUDROID_ROOT")
+        .or_else(|| pengudroid_runtime::configured().map(|runtime| runtime.root.clone().into_os_string())) {
         Some(root) => match crate::compat::disabled_changes(std::path::Path::new(&root), spec.target_sdk.max(0) as u32) {
             Ok(changes) => changes,
             Err(e) => { eprintln!("apphost: platform compat policy: {e}"); return false; }

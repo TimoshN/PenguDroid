@@ -30,7 +30,7 @@ pub const AASSET_MODE_STREAMING: c_int = 2;
 pub const AASSET_MODE_BUFFER: c_int = 3;
 
 struct AssetManager {
-    archive: Option<zip::Archive>,
+    archives: Vec<zip::Archive>,
     /// Kept for diagnostics (`AAssetManager` has no accessor for it).
     #[allow(dead_code)]
     apk: Option<String>,
@@ -52,21 +52,31 @@ static ASSET_MANAGER: OnceLock<AssetManager> = OnceLock::new();
 fn asset_manager() -> &'static AssetManager {
     ASSET_MANAGER.get_or_init(|| {
         let apk = std::env::var("PENGUDROID_APK").ok().filter(|p| !p.is_empty());
-        let archive = match apk.as_deref() {
-            Some(path) => match zip::Archive::open(path) {
-                Ok(a) => Some(a),
+        let mut paths = Vec::new();
+        if let Some(ref p) = apk {
+            paths.push(p.clone());
+        }
+        if let Ok(splits) = std::env::var("PENGUDROID_SPLIT_APKS") {
+            for s in splits.split(':').filter(|s| !s.is_empty()) {
+                if !paths.iter().any(|p| p == s) {
+                    paths.push(s.to_string());
+                }
+            }
+        }
+        let mut archives = Vec::new();
+        for path in &paths {
+            match zip::Archive::open(path) {
+                Ok(a) => archives.push(a),
                 Err(e) => {
                     crate::log_to_stderr(
                         crate::ANDROID_LOG_WARN,
                         "PenguDroid",
-                        &format!("asset manager: {e}"),
+                        &format!("asset manager ({path}): {e}"),
                     );
-                    None
                 }
-            },
-            None => None,
-        };
-        AssetManager { archive, apk }
+            }
+        }
+        AssetManager { archives, apk }
     })
 }
 
@@ -91,13 +101,22 @@ pub unsafe extern "C" fn AAssetManager_open(
     }
     let name = CStr::from_ptr(filename).to_string_lossy();
     let name = name.trim_start_matches('/');
-    let Some(archive) = asset_manager().archive.as_ref() else {
-        return std::ptr::null_mut();
+    let asset_path = if name.starts_with("assets/") {
+        None
+    } else {
+        Some(format!("assets/{name}"))
     };
-    match archive.read(name) {
-        Ok(data) => Box::into_raw(Box::new(Asset { data, pos: 0 })) as *mut c_void,
-        Err(_) => std::ptr::null_mut(),
+    for archive in &asset_manager().archives {
+        if let Some(ref ap) = asset_path {
+            if let Ok(data) = archive.read(ap) {
+                return Box::into_raw(Box::new(Asset { data, pos: 0 })) as *mut c_void;
+            }
+        }
+        if let Ok(data) = archive.read(name) {
+            return Box::into_raw(Box::new(Asset { data, pos: 0 })) as *mut c_void;
+        }
     }
+    std::ptr::null_mut()
 }
 
 unsafe fn asset_ref<'a>(ptr: *mut c_void) -> Option<&'a mut Asset> {
@@ -244,11 +263,29 @@ pub unsafe extern "C" fn AAssetManager_openDir(
     } else {
         CStr::from_ptr(dir_name).to_string_lossy().into_owned()
     };
-    let names = asset_manager()
-        .archive
-        .as_ref()
-        .map(|a| a.list_dir(name.trim_matches('/')))
-        .unwrap_or_default();
+    let trimmed = name.trim_matches('/');
+    let asset_dir = if trimmed.is_empty() {
+        "assets".to_string()
+    } else if trimmed.starts_with("assets/") || trimmed == "assets" {
+        trimmed.to_string()
+    } else {
+        format!("assets/{trimmed}")
+    };
+    let mut names = Vec::new();
+    for a in &asset_manager().archives {
+        for entry in a.list_dir(&asset_dir) {
+            if !names.contains(&entry) {
+                names.push(entry);
+            }
+        }
+        if asset_dir != trimmed && !trimmed.is_empty() {
+            for entry in a.list_dir(trimmed) {
+                if !names.contains(&entry) {
+                    names.push(entry);
+                }
+            }
+        }
+    }
     Box::into_raw(Box::new(AssetDir { names, index: 0, current: None })) as *mut c_void
 }
 

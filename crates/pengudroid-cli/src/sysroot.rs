@@ -72,6 +72,7 @@ fn validate_runtime(system: &Path) -> Result<(), String> {
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub root: PathBuf,
+    pub components: Option<pengudroid_runtime::Runtime>,
     /// Directories to put on `LD_LIBRARY_PATH`.
     pub lib_dirs: Vec<PathBuf>,
     pub art_root: PathBuf,
@@ -217,6 +218,9 @@ impl Layout {
         // so a relative `--sysroot` would make them cwd-dependent or plain wrong.
         let root = std::fs::canonicalize(root)
             .map_err(|e| format!("cannot resolve sysroot {}: {e}", root.display()))?;
+        if root.join(pengudroid_runtime::DESCRIPTOR).is_file() {
+            return Self::component_runtime(pengudroid_runtime::Runtime::load(&root.join(pengudroid_runtime::DESCRIPTOR))?);
+        }
         if !root.join("system").is_dir() {
             return Err(format!(
                 "unsupported sysroot {}: expected an extracted Android 17 / API 37 x86_64 \
@@ -303,6 +307,7 @@ impl Layout {
 
         Ok(Layout {
             root: root.to_path_buf(),
+            components: None,
             lib_dirs,
             art_root,
             framework: framework.clone(),
@@ -312,6 +317,61 @@ impl Layout {
             apex_manifest: system.join("apex/com.android.art/apex_manifest.pb"),
             android_root: system,
         })
+    }
+
+    fn component_runtime(runtime: pengudroid_runtime::Runtime) -> Result<Layout, String> {
+        let art_root = runtime.component("apex-com.android.art")?;
+        let framework = runtime.component("framework")?;
+        let mut lib_dirs = vec![runtime.component("native")?, art_root.join("lib64")];
+        for (name, directory) in &runtime.components {
+            let lib = directory.join("lib64");
+            if name.starts_with("apex-") && lib.is_dir() && !lib_dirs.contains(&lib) {
+                lib_dirs.push(lib);
+            }
+        }
+        let fragment = runtime.resolve(Path::new("/system/etc/classpaths/bootclasspath.pb"))
+            .ok_or("no boot classpath component mapping")?;
+        let data = std::fs::read(&fragment).map_err(|e| format!("cannot read required boot classpath fragment {}: {e}", fragment.display()))?;
+        let framework_locations: Vec<_> = jar_paths_in_bootclasspath_pb(&data)?.into_iter()
+            .filter(|p| p.starts_with("/system/framework/")).collect();
+        if framework_locations.is_empty() { return Err("boot classpath fragment has no framework jars".into()); }
+        let mut boot_locations: Vec<String> = ["core-oj", "core-libart", "okhttp", "bouncycastle", "apache-xml"]
+            .into_iter().map(|name| format!("/apex/com.android.art/javalib/{name}.jar")).collect();
+        for location in framework_locations.into_iter().chain(std::iter::once("/apex/com.android.i18n/javalib/core-icu4j.jar".into())) {
+            if !boot_locations.contains(&location) { boot_locations.push(location); }
+        }
+        for (name, directory) in &runtime.components {
+            if !name.starts_with("apex-") { continue; }
+            let fragment = directory.join("etc/classpaths/bootclasspath.pb");
+            let data = match std::fs::read(&fragment) {
+                Ok(data) => data,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("cannot read {}: {e}", fragment.display())),
+            };
+            for location in jar_paths_in_bootclasspath_pb(&data)? {
+                if !location.starts_with("/apex/") { return Err(format!("unsupported APEX boot classpath location: {location:?}")); }
+                if !boot_locations.contains(&location) { boot_locations.push(location); }
+            }
+        }
+        let boot_jars = boot_locations.iter().map(|location| {
+            if location.contains(':') || location.contains('\0') || Path::new(location).components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(format!("invalid boot classpath location: {location:?}"));
+            }
+            let path = runtime.resolve(Path::new(location)).ok_or_else(|| format!("unmapped boot classpath jar: {location}"))?;
+            if !path.is_file() { return Err(format!("required boot classpath jar {location} is missing: {}", path.display())); }
+            Ok(path)
+        }).collect::<Result<Vec<_>, String>>()?;
+        Ok(Layout {
+            root: runtime.root.clone(), lib_dirs, art_root: art_root.clone(),
+            framework: framework.clone(), boot_images: framework.join("x86_64"),
+            boot_jars, boot_locations, apex_manifest: art_root.join("apex_manifest.pb"),
+            android_root: PathBuf::from("/system"), components: Some(runtime),
+        })
+    }
+
+    fn platform_path(&self, guest: &str) -> PathBuf {
+        self.components.as_ref().and_then(|runtime| runtime.resolve(Path::new(guest)))
+            .unwrap_or_else(|| self.root.join(guest.trim_start_matches('/')))
     }
 
     /// Files ART needs, with a description.
@@ -326,7 +386,7 @@ impl Layout {
             ("boot image (oat)".into(), self.boot_images.join("boot.oat")),
             ("framework classes".into(), self.framework.join("framework.jar")),
             ("ART APEX manifest".into(), self.apex_manifest.clone()),
-            ("boot classpath fragment".into(), self.android_root.join("etc/classpaths/bootclasspath.pb")),
+            ("boot classpath fragment".into(), self.platform_path("/system/etc/classpaths/bootclasspath.pb")),
         ]
     }
 
@@ -417,8 +477,8 @@ pub fn sysroot(args: &[String]) -> i32 {
 /// `ANDROID_DATA` for ART (its `dalvik-cache`): the runtime's own `data`
 /// directory when it is writable, else a per-user one. A runtime embedded in
 /// the AppImage is a read-only mount.
-fn android_data_dir(root: &Path) -> PathBuf {
-    let own = root.join("data");
+fn android_data_dir(layout: &Layout) -> PathBuf {
+    let own = layout.platform_path("/data");
     let probe = own.join(format!(".pengudroid-write-{}", std::process::id()));
     if std::fs::create_dir_all(own.join("dalvik-cache/x86_64")).is_ok() && std::fs::write(&probe, b"").is_ok() {
         let _ = std::fs::remove_file(&probe);
@@ -587,6 +647,10 @@ const GUEST_VDSO_HOOKS: &[&str] = &[
 /// The shim uses this same root for only `/system/{bin,lib64}/arm64` and the
 /// guest linker configuration. No missing-file fallback to a stock GSI exists.
 fn bridge_guest_root(host: &Path, configured: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
+    if host.join(pengudroid_runtime::DESCRIPTOR).is_file() {
+        let runtime = pengudroid_runtime::Runtime::load(&host.join(pengudroid_runtime::DESCRIPTOR))?;
+        if runtime.components.contains_key("arm64-guest") { return Ok(host.to_path_buf()); }
+    }
     let Some(configured) = configured else { return Ok(host.to_path_buf()); };
     let path = Path::new(configured);
     if !path.is_absolute() || path == Path::new("/") {
@@ -613,13 +677,18 @@ fn validate_bridge_guest(root: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("cannot inspect ARM64 guest manifest {}: {error}", manifest.display())),
     }
+    let runtime = if root.join(pengudroid_runtime::DESCRIPTOR).is_file() {
+        Some(pengudroid_runtime::Runtime::load(&root.join(pengudroid_runtime::DESCRIPTOR))?)
+    } else { None };
+    let guest_path = |path: &str| runtime.as_ref().and_then(|r| r.resolve(Path::new(path)))
+        .unwrap_or_else(|| root.join(path.trim_start_matches('/')));
     // These are necessary source-defined contracts, not proof that a bundle can
     // boot. Manifest-free, manually supplied native-bridge bundles remain usable.
-    guest_elf_contract(&root.join("system/bin/arm64/linker64"), GUEST_LINKER_HOOKS, &[])?;
-    guest_elf_contract(&root.join("system/lib64/arm64/libc.so"), &["__libc_init", "pthread_self"],
+    guest_elf_contract(&guest_path("/system/bin/arm64/linker64"), GUEST_LINKER_HOOKS, &[])?;
+    guest_elf_contract(&guest_path("/system/lib64/arm64/libc.so"), &["__libc_init", "pthread_self"],
                        &["native_bridge_intercept_symbol"])?;
-    guest_elf_contract(&root.join("system/lib64/arm64/libnative_bridge_vdso.so"), GUEST_VDSO_HOOKS, &[])?;
-    guest_elf_contract(&root.join("system/bin/arm64/app_process64"), &[], &[])?;
+    guest_elf_contract(&guest_path("/system/lib64/arm64/libnative_bridge_vdso.so"), GUEST_VDSO_HOOKS, &[])?;
+    guest_elf_contract(&guest_path("/system/bin/arm64/app_process64"), &[], &[])?;
     Ok(())
 }
 
@@ -814,7 +883,7 @@ pub fn art_test(args: &[String]) -> i32 {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--sysroot" => {
+            "--runtime" | "--sysroot" => {
                 root = it.next().map(PathBuf::from);
             }
             // Guest window geometry. These are consumed here rather than
@@ -924,7 +993,7 @@ pub fn art_test(args: &[String]) -> i32 {
         Command::new(&exe)
     };
     cmd.arg("__art")
-        .arg("--sysroot")
+        .arg("--runtime")
         .arg(&root)
         .arg("--libs")
         .arg(&art_libs);
@@ -1085,11 +1154,11 @@ pub fn art_test(args: &[String]) -> i32 {
         .env("LD_LIBRARY_PATH", crate::runtime::host_library_path(&ld_path))
         .env("ANDROID_ROOT", &layout.android_root)
         .env("ANDROID_ART_ROOT", &layout.art_root)
-        .env("ANDROID_DATA", android_data_dir(&layout.root))
-        .env("ANDROID_TZDATA_ROOT", layout.root.join("system/apex/com.android.tzdata"))
-        .env("ANDROID_RUNTIME_ROOT", layout.root.join("system/apex/com.android.runtime"))
-        .env("ANDROID_I18N_ROOT", layout.root.join("system/apex/com.android.i18n"))
-        .env("ANDROID_CONSCRYPT_ROOT", layout.root.join("system/apex/com.android.conscrypt"))
+        .env("ANDROID_DATA", android_data_dir(&layout))
+        .env("ANDROID_TZDATA_ROOT", layout.components.as_ref().and_then(|r| r.components.get("apex-com.android.tzdata")).cloned().unwrap_or_else(|| layout.root.join("system/apex/com.android.tzdata")))
+        .env("ANDROID_RUNTIME_ROOT", layout.components.as_ref().and_then(|r| r.components.get("apex-com.android.runtime")).cloned().unwrap_or_else(|| layout.root.join("system/apex/com.android.runtime")))
+        .env("ANDROID_I18N_ROOT", layout.components.as_ref().and_then(|r| r.components.get("apex-com.android.i18n")).cloned().unwrap_or_else(|| layout.root.join("system/apex/com.android.i18n")))
+        .env("ANDROID_CONSCRYPT_ROOT", layout.components.as_ref().and_then(|r| r.components.get("apex-com.android.conscrypt")).cloned().unwrap_or_else(|| layout.root.join("system/apex/com.android.conscrypt")))
         .env("BOOTCLASSPATH", layout.boot_classpath())
         // The boot class path *locations* ART recorded (`/apex/...`,
         // `/system/...`) do not exist on the host. The shim rewrites lookups
@@ -1100,6 +1169,12 @@ pub fn art_test(args: &[String]) -> i32 {
             std::fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone()),
         )
         .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1");
+    if let Some(runtime) = &layout.components {
+        cmd.env_remove("PENGUDROID_ROOT").env(pengudroid_runtime::ENV, runtime.descriptor());
+        if runtime.components.contains_key("arm64-guest") { cmd.env_remove("PENGUDROID_ARM64_GUEST_ROOT"); }
+    } else {
+        cmd.env_remove(pengudroid_runtime::ENV);
+    }
     // One surface geometry for the whole tree: the shim reports these through
     // `ANativeWindow_getWidth`/`_getHeight`, the gleshim sizes its FBO from them,
     // apphost derives `DisplayInfo`/`Configuration` from them, and the host lays
@@ -1217,7 +1292,7 @@ pub fn art_main(args: &[String]) -> i32 {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--sysroot" => root = it.next().map(PathBuf::from),
+            "--runtime" | "--sysroot" => root = it.next().map(PathBuf::from),
             "--libs" => libs = it.next().map(PathBuf::from),
             "--main" => main_class = it.next().cloned(),
             "--find-class" => probe_class = it.next().cloned(),
