@@ -128,6 +128,7 @@ pub struct Heap {
     objects: Vec<Option<HeapObject>>,
     interned_strings: HashMap<String, ObjId>,
     class_objects: HashMap<String, ObjId>,
+    utf16_strings: HashMap<ObjId, Vec<u16>>,
 }
 
 impl Heap {
@@ -137,6 +138,7 @@ impl Heap {
             objects: vec![None],
             interned_strings: HashMap::new(),
             class_objects: HashMap::new(),
+            utf16_strings: HashMap::new(),
         }
     }
 
@@ -161,6 +163,17 @@ impl Heap {
         let id = self.alloc(HeapObject::StringObj(s.to_string()));
         self.interned_strings.insert(s.to_string(), id);
         id
+    }
+
+    pub fn new_utf16_string(&mut self, units: &[u16]) -> ObjId {
+        let id = self.new_string(String::from_utf16_lossy(units));
+        self.utf16_strings.insert(id, units.to_vec());
+        id
+    }
+
+    pub fn utf16(&self, id: ObjId) -> Option<Vec<u16>> {
+        if let Some(units) = self.utf16_strings.get(&id) { return Some(units.clone()); }
+        self.as_str(id).map(|text| text.encode_utf16().collect())
     }
 
     pub fn new_string(&mut self, s: String) -> ObjId {

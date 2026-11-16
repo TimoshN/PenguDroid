@@ -21,6 +21,9 @@
 #                   and the ARM64 guest root (.toolchain/guest-arm64-bridge):
 #                   the image then needs nothing but a Wayland desktop
 #   --with-modules DIR  embed an offline modular runtime store (no GSI needed)
+#   --pengu         independent DexVM image; excludes ART/framework provisioning
+#   --guest-root DIR  explicit ARM64 guest support bundle
+#   --bridge-support DIR  embed only host libc++.so for the ARM64 translator
 #   --bridge-dir    where the translator and proxies are
 #   --output PATH   write the AppImage here (default: target/PenguDroid-x86_64.AppImage)
 #   --no-image      assemble the AppDir and stop (no appimagetool needed)
@@ -38,6 +41,9 @@ WITH_BRIDGE=0
 WITH_RUNTIME=0
 MODULES_DIR=""
 BRIDGE_DIR="$ROOT/.toolchain/nativebridge-stage"
+GUEST_ROOT="$ROOT/.toolchain/guest-arm64-bridge"
+BRIDGE_SUPPORT=""
+PENGU=0
 NO_IMAGE=0
 PORTABLE=0
 
@@ -45,6 +51,9 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --skip-build) SKIP_BUILD=1 ;;
         --with-bridge) WITH_BRIDGE=1 ;;
+        --pengu) PENGU=1 ;;
+        --guest-root) shift; GUEST_ROOT=${1:?--guest-root needs a path} ;;
+        --bridge-support) shift; BRIDGE_SUPPORT=${1:?--bridge-support needs a directory containing host libc++.so} ;;
         --with-runtime) WITH_RUNTIME=1 ;;
         --with-modules) shift; MODULES_DIR=${1:?--with-modules needs a path} ;;
         --portable) PORTABLE=1 ;;
@@ -56,6 +65,10 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+if [ "$PENGU" -eq 1 ] && { [ "$WITH_RUNTIME" -eq 1 ] || [ -n "$MODULES_DIR" ]; }; then
+    echo "error: --pengu excludes ART/framework runtime and module stores" >&2
+    exit 2
+fi
 if [ -n "$MODULES_DIR" ] && [ "$WITH_RUNTIME" -eq 1 ]; then
     echo "error: --with-modules and --with-runtime are mutually exclusive" >&2
     exit 2
@@ -112,14 +125,23 @@ if [ "$WITH_BRIDGE" -eq 1 ]; then
     # Only the bridge libraries: the directory is de-bionic'd per run, so it must
     # not contain the interpreter archives that also live beside the translator.
     for lib in "$bridge_src"/*.so; do
+        case "$(basename "$lib")" in libpengudroid_*.so) continue ;; esac
         install -m 0755 "$lib" "$APPDIR/usr/lib/pengudroid/bridge/"
     done
+    if [ -n "$BRIDGE_SUPPORT" ]; then
+        test -f "$BRIDGE_SUPPORT/libc++.so" || { echo "missing host bridge support libc++.so" >&2; exit 1; }
+        "$TARGET/release/pengudroid" de-bionic "$BRIDGE_SUPPORT/libc++.so" "$APPDIR/usr/lib/pengudroid/bridge/libc++.so"
+    fi
     echo "embedded $(ls "$APPDIR/usr/lib/pengudroid/bridge" | wc -l) bridge libraries"
     if [ "$MODULES_HAS_ARM64" -eq 0 ]; then
-        guest_src="$ROOT/.toolchain/guest-arm64-bridge"
+        guest_src="$GUEST_ROOT"
         test -f "$guest_src/pengudroid-arm64-bridge-bundle.json" || { echo "missing built ARM64 guest bundle" >&2; exit 1; }
         mkdir -p "$APPDIR/usr/share/pengudroid/guest-arm64"
-        cp -a "$guest_src"/. "$APPDIR/usr/share/pengudroid/guest-arm64/"
+        if [ "$PENGU" -eq 1 ]; then
+            python3 -B "$ROOT/tools/pengu-guest.py" "$guest_src" "$APPDIR/usr/share/pengudroid/guest-arm64"
+        else
+            cp -a "$guest_src"/. "$APPDIR/usr/share/pengudroid/guest-arm64/"
+        fi
     else
         echo "ARM64 guest is supplied by the component store (no guest sysroot bundled)"
     fi
@@ -171,6 +193,10 @@ StartupWMClass=pengudroid-gui
 DESKTOP
 install -m 0644 "$APPDIR/usr/share/applications/pengudroid.desktop" "$APPDIR/pengudroid.desktop"
 
+if [ "$PENGU" -eq 1 ]; then
+    : > "$APPDIR/usr/share/pengudroid/pengu-backend"
+fi
+
 cat > "$APPDIR/AppRun" <<'APPRUN'
 #!/bin/sh
 # AppRun: make the bundled pieces discoverable, then start the shell.
@@ -189,6 +215,12 @@ fi
 export PATH="$HERE/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$HERE/usr/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# Independent images never discover or provision an ART/framework cache.
+if [ -f "$HERE/usr/share/pengudroid/pengu-backend" ]; then
+    export PENGUDROID_INDEPENDENT=1 PENGUDROID_BACKEND=pengu PENGUDROID_AUTO_RUNTIME=0
+    unset PENGUDROID_SYSROOT PENGUDROID_ART_SYSROOT PENGUDROID_RUNTIME PENGUDROID_RUNTIME_MANIFEST PENGUDROID_RUNTIME_MODULES
+fi
+
 # Bundled ARM64 native bridge (built --with-bridge): the translator, its
 # proxies and the host GL forwarders. Explicit settings always win so a user
 # can test a differently prepared translator.
@@ -200,10 +232,11 @@ if [ -d "$HERE/usr/lib/pengudroid/bridge" ]; then
     : "${BERBERIS_MODE:=lite-translate-or-interpret}"
     export PENGUDROID_NATIVE_BRIDGE_LIB PENGUDROID_GL_FORWARDERS PENGUDROID_BRIDGE_TLS BERBERIS_FLAGS BERBERIS_MODE
 fi
-if [ -z "${PENGUDROID_ARM64_GUEST_ROOT:-}" ] && [ -d "$HERE/usr/share/pengudroid/guest-arm64/system" ]; then
+if [ -z "${PENGUDROID_ARM64_GUEST_ROOT:-}" ] && { [ -d "$HERE/usr/share/pengudroid/guest-arm64/system" ] || [ -f "$HERE/usr/share/pengudroid/guest-arm64/pengudroid-runtime.json" ]; }; then
     export PENGUDROID_ARM64_GUEST_ROOT="$HERE/usr/share/pengudroid/guest-arm64"
 fi
 
+if [ "${PENGUDROID_INDEPENDENT:-0}" != "1" ]; then
 # A bundled module store provisions a verified per-user generation offline.
 if [ -z "${PENGUDROID_RUNTIME_MODULES:-}" ] && [ -f "$HERE/usr/share/pengudroid/runtime-modules/runtime-modules.json" ]; then
     export PENGUDROID_RUNTIME_MODULES="$HERE/usr/share/pengudroid/runtime-modules"
@@ -219,6 +252,8 @@ if [ -z "${PENGUDROID_SYSROOT:-}" ] && [ -d "$HERE/usr/share/pengudroid/sysroot"
 fi
 if [ -z "${PENGUDROID_SYSROOT:-}" ] && [ -z "${PENGUDROID_RUNTIME_MODULES:-}" ] && [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/pengudroid/sysroot" ]; then
     export PENGUDROID_SYSROOT="${XDG_DATA_HOME:-$HOME/.local/share}/pengudroid/sysroot"
+fi
+
 fi
 
 # Android WebView (logins, captchas, in-app pages) through the runtime's own

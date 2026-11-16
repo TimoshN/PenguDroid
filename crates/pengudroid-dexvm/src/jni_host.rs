@@ -29,15 +29,32 @@ pub struct JniRegistry {
     pub natives: HashMap<(String, String, String), usize>,
     pub loaded_libs: Vec<String>,
     pub utf_pins: HashMap<usize, CString>,
+    pub utf16_pins: HashMap<usize, Box<[u16]>>,
 }
 
 static JNI_STATE: OnceLock<Mutex<JniState>> = OnceLock::new();
+static WIRED_JNI_SLOTS: OnceLock<Vec<usize>> = OnceLock::new();
+static MISSING_JNI: [std::sync::atomic::AtomicU64; 233] = [const { std::sync::atomic::AtomicU64::new(0) }; 233];
+
+pub fn wired_jni_slots() -> &'static [usize] {
+    let _ = jni_env_ptr();
+    WIRED_JNI_SLOTS.get().unwrap()
+}
+pub fn missing_jni_calls() -> Vec<(usize, u64)> {
+    MISSING_JNI.iter().enumerate().filter_map(|(slot, count)| {
+        let count = count.load(std::sync::atomic::Ordering::Relaxed);
+        (count != 0).then_some((slot, count))
+    }).collect()
+}
+
 
 pub struct JniState {
     pub heap: Heap,
     pub registry: JniRegistry,
     pub method_ids: Vec<(String, String, String)>,
+    method_index: HashMap<(String, String, String), usize>,
     pub field_ids: Vec<(String, String, String)>,
+    field_index: HashMap<(String, String, String), usize>,
 }
 
 impl JniState {
@@ -46,7 +63,9 @@ impl JniState {
             heap: Heap::new(),
             registry: JniRegistry::default(),
             method_ids: vec![(String::new(), String::new(), String::new())],
+            method_index: HashMap::new(),
             field_ids: vec![(String::new(), String::new(), String::new())],
+            field_index: HashMap::new(),
         }
     }
 }
@@ -148,9 +167,11 @@ struct JNIEnvObj {
 }
 
 static JNI_ENV_TABLE: OnceLock<Vec<usize>> = OnceLock::new();
-static mut JNI_ENV_OBJ: JNIEnvObj = JNIEnvObj {
-    functions: std::ptr::null(),
-};
+std::thread_local! {
+    static JNI_ENV_OBJ: std::cell::UnsafeCell<JNIEnvObj> = const {
+        std::cell::UnsafeCell::new(JNIEnvObj { functions: std::ptr::null() })
+    };
+}
 
 macro_rules! fill_unimpl {
     ($t:expr, $($i:expr),* $(,)?) => {
@@ -177,6 +198,7 @@ pub fn jni_env_ptr() -> *mut c_void {
             200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
             220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232
         );
+        let placeholders = t.clone();
         t[4] = jni_get_version as *const () as usize;
         t[6] = jni_find_class as *const () as usize;
         t[10] = jni_get_superclass as *const () as usize;
@@ -198,38 +220,26 @@ pub fn jni_env_ptr() -> *mut c_void {
         t[31] = jni_get_object_class as *const () as usize;
         t[32] = jni_is_instance_of as *const () as usize;
         t[33] = jni_get_method_id as *const () as usize;
-        t[34] = jni_call_object_method as *const () as usize;
-        t[36] = jni_call_object_method_a as *const () as usize;
-        t[37] = jni_call_boolean_method as *const () as usize;
-        t[39] = jni_call_boolean_method_a as *const () as usize;
-        t[49] = jni_call_int_method as *const () as usize;
-        t[51] = jni_call_int_method_a as *const () as usize;
-        t[52] = jni_call_long_method as *const () as usize;
-        t[54] = jni_call_long_method_a as *const () as usize;
-        t[55] = jni_call_float_method as *const () as usize;
-        t[57] = jni_call_float_method_a as *const () as usize;
-        t[61] = jni_call_void_method as *const () as usize;
-        t[63] = jni_call_void_method_a as *const () as usize;
         t[94] = jni_get_field_id as *const () as usize;
         t[95] = jni_get_object_field as *const () as usize;
         t[100] = jni_get_int_field as *const () as usize;
         t[113] = jni_get_static_method_id as *const () as usize;
-        t[114] = jni_call_static_object_method as *const () as usize;
-        t[115] = jni_call_static_object_method_v as *const () as usize;
-        t[116] = jni_call_static_object_method_a as *const () as usize;
-        t[117] = jni_call_static_boolean_method as *const () as usize;
-        t[119] = jni_call_static_boolean_method_a as *const () as usize;
-        t[129] = jni_call_static_int_method as *const () as usize;
-        t[131] = jni_call_static_int_method_a as *const () as usize;
-        t[141] = jni_call_static_void_method as *const () as usize;
-        t[143] = jni_call_static_void_method_a as *const () as usize;
         t[144] = jni_get_static_field_id as *const () as usize;
         t[145] = jni_get_static_object_field as *const () as usize;
         t[150] = jni_get_static_int_field as *const () as usize;
-        t[167] = jni_new_string_utf as *const () as usize;
-        t[168] = jni_get_string_utf_length as *const () as usize;
-        t[169] = jni_get_string_utf_chars as *const () as usize;
-        t[170] = jni_release_string_utf_chars as *const () as usize;
+        t[163] = crate::jni_strings::new_string as *const () as usize;
+        t[164] = crate::jni_strings::get_string_length as *const () as usize;
+        t[165] = crate::jni_strings::get_string_chars as *const () as usize;
+        t[166] = crate::jni_strings::release_string_chars as *const () as usize;
+        t[169] = crate::jni_strings::get_string_utf_chars as *const () as usize;
+        t[220] = crate::jni_strings::get_string_region as *const () as usize;
+        t[221] = crate::jni_strings::get_string_utf_region as *const () as usize;
+        t[224] = crate::jni_strings::get_string_chars as *const () as usize;
+        t[225] = crate::jni_strings::release_string_chars as *const () as usize;
+        t[167] = crate::jni_strings::new_string_utf as *const () as usize;
+        t[168] = crate::jni_strings::get_string_utf_length as *const () as usize;
+        t[169] = crate::jni_strings::get_string_utf_chars as *const () as usize;
+        t[170] = crate::jni_strings::release_string_utf_chars as *const () as usize;
         t[171] = jni_get_array_length as *const () as usize;
         t[172] = jni_new_object_array as *const () as usize;
         t[173] = jni_get_object_array_element as *const () as usize;
@@ -242,12 +252,15 @@ pub fn jni_env_ptr() -> *mut c_void {
         t[216] = jni_unregister_natives as *const () as usize;
         t[219] = jni_get_java_vm as *const () as usize;
         t[228] = jni_exception_check as *const () as usize;
+        unsafe extern "C" { fn pengu_install_jni_calls(table: *mut usize); }
+        unsafe { pengu_install_jni_calls(t.as_mut_ptr()); }
+        let _ = WIRED_JNI_SLOTS.set((4..t.len()).filter(|&i| t[i] != placeholders[i]).collect());
         t
     });
-    unsafe {
-        JNI_ENV_OBJ.functions = table.as_ptr() as *const *const c_void;
-        &raw mut JNI_ENV_OBJ as *mut c_void
-    }
+    JNI_ENV_OBJ.with(|object| unsafe {
+        (*object.get()).functions = table.as_ptr() as *const *const c_void;
+        object.get().cast()
+    })
 }
 
 pub fn java_vm_ptr() -> *mut c_void {
@@ -278,9 +291,8 @@ unsafe extern "C" fn vm_get_env(_vm: *mut c_void, p_env: *mut *mut c_void, _vers
 }
 
 unsafe extern "C" fn jni_unimplemented<const SLOT: usize>() -> usize {
-    if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
-        eprintln!("[pengu-jni] UNIMPLEMENTED JNI slot {SLOT} called!");
-    }
+    let first = MISSING_JNI.get(SLOT).map(|count| count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0).unwrap_or(true);
+    if first { eprintln!("[pengu-jni] UNIMPLEMENTED JNI slot {SLOT} called"); }
     0
 }
 
@@ -314,25 +326,54 @@ unsafe extern "C" fn jni_get_superclass(_env: *mut c_void, _cls: *mut c_void) ->
     st.heap.class_object("Ljava/lang/Object;") as *mut c_void
 }
 
-unsafe extern "C" fn jni_throw(_env: *mut c_void, _obj: *mut c_void) -> c_int {
-    0
+std::thread_local! {
+    static PENDING_JNI_EXCEPTION: std::cell::Cell<Option<ObjId>> = const { std::cell::Cell::new(None) };
 }
-
-unsafe extern "C" fn jni_throw_new(_env: *mut c_void, _cls: *mut c_void, msg: *const c_char) -> c_int {
-    if std::env::var_os("PENGUDROID_TRACE_VM").is_some() && !msg.is_null() {
-        eprintln!("[pengu-jni] ThrowNew: {:?}", CStr::from_ptr(msg));
+pub(crate) fn set_pending_exception_object(object: ObjId) {
+    PENDING_JNI_EXCEPTION.with(|slot| slot.set(Some(object)));
+}
+pub(crate) fn take_pending_exception() -> Option<ObjId> {
+    PENDING_JNI_EXCEPTION.with(|slot| slot.take())
+}
+pub(crate) fn raise_exception(class: &str, message: &str) {
+    let mut state = jni_state().lock().unwrap();
+    let text = state.heap.new_string(message.into());
+    let object = state.heap.new_instance(class);
+    if let Some(HeapObject::Instance { fields, .. }) = state.heap.get_mut(object) {
+        fields.insert("detailMessage".into(), Value::Ref(Some(text)));
     }
-    0
+    drop(state);
+    set_pending_exception_object(object);
 }
-
+unsafe extern "C" fn jni_throw(_env: *mut c_void, object: *mut c_void) -> c_int {
+    if object.is_null() { return JNI_ERR; }
+    set_pending_exception_object(object as usize);
+    JNI_OK
+}
+unsafe extern "C" fn jni_throw_new(_env: *mut c_void, class: *mut c_void, message: *const c_char) -> c_int {
+    let name = {
+        let state = jni_state().lock().unwrap();
+        match state.heap.get(class as usize) {
+            Some(HeapObject::ClassObj(name)) => name.clone(),
+            _ => return JNI_ERR,
+        }
+    };
+    let message = if message.is_null() { String::new() } else { CStr::from_ptr(message).to_string_lossy().into_owned() };
+    raise_exception(&name, &message);
+    JNI_OK
+}
 unsafe extern "C" fn jni_exception_occurred(_env: *mut c_void) -> *mut c_void {
-    std::ptr::null_mut()
+    PENDING_JNI_EXCEPTION.with(|slot| slot.get().unwrap_or(0) as *mut c_void)
 }
-
-unsafe extern "C" fn jni_exception_describe(_env: *mut c_void) {}
-unsafe extern "C" fn jni_exception_clear(_env: *mut c_void) {}
+unsafe extern "C" fn jni_exception_describe(_env: *mut c_void) {
+    if let Some(object) = PENDING_JNI_EXCEPTION.with(|slot| slot.get()) {
+        let state = jni_state().lock().unwrap();
+        if let Some(value) = state.heap.get(object) { eprintln!("[pengu-jni] pending {}", value.class_name()); }
+    }
+}
+unsafe extern "C" fn jni_exception_clear(_env: *mut c_void) { take_pending_exception(); }
 unsafe extern "C" fn jni_exception_check(_env: *mut c_void) -> u8 {
-    0
+    PENDING_JNI_EXCEPTION.with(|slot| slot.get().is_some() as u8)
 }
 
 unsafe extern "C" fn jni_new_global_ref(_env: *mut c_void, obj: *mut c_void) -> *mut c_void {
@@ -358,6 +399,14 @@ std::thread_local! {
 
 pub fn set_vm_invoker(ctx: usize, f: VmInvokeFn) {
     VM_INVOKER.with(|c| c.set(Some((ctx, f))));
+}
+
+pub struct VmInvokerGuard(Option<(usize, VmInvokeFn)>);
+impl Drop for VmInvokerGuard {
+    fn drop(&mut self) { VM_INVOKER.with(|slot| slot.set(self.0)); }
+}
+pub fn scoped_vm_invoker(ctx: usize, callback: VmInvokeFn) -> VmInvokerGuard {
+    VmInvokerGuard(VM_INVOKER.with(|slot| slot.replace(Some((ctx, callback)))))
 }
 
 fn invoke_via_vm(class_desc: &str, name: &str, sig: &str, args: &[Value]) -> Value {
@@ -494,321 +543,6 @@ unsafe extern "C" fn jni_is_instance_of(
     u8::from(obj_cls == target_cls || target_cls == "Ljava/lang/Object;")
 }
 
-unsafe extern "C" fn jni_call_object_method(
-    _env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> *mut c_void {
-    let raw = [a1, a2, a3];
-    jni_call_object_method_a(_env, obj, mid, raw.as_ptr())
-}
-
-unsafe extern "C" fn jni_call_object_method_a(
-    _env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) -> *mut c_void {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return std::ptr::null_mut();
-        };
-        entry
-    };
-    let mut args = vec![Value::Ref(if obj.is_null() {
-        None
-    } else {
-        Some(obj as ObjId)
-    })];
-    args.extend(unpack_jvalues(&msig, args_ptr));
-    let res = match invoke_via_vm(&cname, &mname, &msig, &args) {
-        Value::Ref(Some(id)) => id as *mut c_void,
-        _ => std::ptr::null_mut(),
-    };
-    if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
-        eprintln!("[pengu-jni] CallStaticObjectMethodA {cname}.{mname}{msig} -> {res:p}");
-    }
-    res
-}
-
-unsafe extern "C" fn jni_call_boolean_method(
-    env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> u8 {
-    let raw = [a1, a2, a3];
-    jni_call_boolean_method_a(env, obj, mid, raw.as_ptr())
-}
-
-unsafe extern "C" fn jni_call_int_method(
-    env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> c_int {
-    let raw = [a1, a2, a3];
-    jni_call_int_method_a(env, obj, mid, raw.as_ptr())
-}
-
-unsafe extern "C" fn jni_call_long_method(
-    env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> i64 {
-    let raw = [a1, a2, a3];
-    jni_call_long_method_a(env, obj, mid, raw.as_ptr())
-}
-
-unsafe extern "C" fn jni_call_float_method(
-    env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> f32 {
-    let raw = [a1, a2, a3];
-    jni_call_float_method_a(env, obj, mid, raw.as_ptr())
-}
-
-unsafe extern "C" fn jni_call_void_method(
-    env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) {
-    let raw = [a1, a2, a3];
-    jni_call_void_method_a(env, obj, mid, raw.as_ptr());
-}
-
-unsafe extern "C" fn jni_call_static_object_method(
-    env: *mut c_void,
-    cls: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> *mut c_void {
-    let raw = [a1, a2, a3];
-    jni_call_static_object_method_a(env, cls, mid, raw.as_ptr())
-}
-
-unsafe extern "C" fn jni_call_static_void_method(
-    env: *mut c_void,
-    cls: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) {
-    let raw = [a1, a2, a3];
-    jni_call_static_void_method_a(env, cls, mid, raw.as_ptr());
-}
-
-unsafe extern "C" fn jni_call_static_boolean_method(
-    env: *mut c_void,
-    cls: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> u8 {
-    let raw = [a1, a2, a3];
-    jni_call_static_boolean_method_a(env, cls, mid, raw.as_ptr())
-}
-
-unsafe extern "C" fn jni_call_static_boolean_method_a(
-    _env: *mut c_void,
-    _cls: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) -> u8 {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return 0;
-        };
-        entry
-    };
-    let args = unpack_jvalues(&msig, args_ptr);
-    match invoke_via_vm(&cname, &mname, &msig, &args) {
-        Value::Int(v) => u8::from(v != 0),
-        _ => 0,
-    }
-}
-
-unsafe extern "C" fn jni_call_static_int_method(
-    env: *mut c_void,
-    cls: *mut c_void,
-    mid: *mut c_void,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> c_int {
-    let raw = [a1, a2, a3];
-    jni_call_static_int_method_a(env, cls, mid, raw.as_ptr())
-}
-
-unsafe extern "C" fn jni_call_static_int_method_a(
-    _env: *mut c_void,
-    _cls: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) -> c_int {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return 0;
-        };
-        entry
-    };
-    let args = unpack_jvalues(&msig, args_ptr);
-    match invoke_via_vm(&cname, &mname, &msig, &args) {
-        Value::Int(v) => v,
-        _ => 0,
-    }
-}
-
-unsafe extern "C" fn jni_call_boolean_method_a(
-    _env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) -> u8 {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return 0;
-        };
-        entry
-    };
-    let mut args = vec![Value::Ref(if obj.is_null() {
-        None
-    } else {
-        Some(obj as ObjId)
-    })];
-    args.extend(unpack_jvalues(&msig, args_ptr));
-    match invoke_via_vm(&cname, &mname, &msig, &args) {
-        Value::Int(v) => u8::from(v != 0),
-        _ => 0,
-    }
-}
-
-unsafe extern "C" fn jni_call_int_method_a(
-    _env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) -> c_int {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return 0;
-        };
-        entry
-    };
-    let mut args = vec![Value::Ref(if obj.is_null() {
-        None
-    } else {
-        Some(obj as ObjId)
-    })];
-    args.extend(unpack_jvalues(&msig, args_ptr));
-    match invoke_via_vm(&cname, &mname, &msig, &args) {
-        Value::Int(v) => v,
-        Value::Long(v) => v as c_int,
-        _ => 0,
-    }
-}
-
-unsafe extern "C" fn jni_call_long_method_a(
-    _env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) -> i64 {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return 0;
-        };
-        entry
-    };
-    let mut args = vec![Value::Ref(if obj.is_null() {
-        None
-    } else {
-        Some(obj as ObjId)
-    })];
-    args.extend(unpack_jvalues(&msig, args_ptr));
-    match invoke_via_vm(&cname, &mname, &msig, &args) {
-        Value::Long(v) => v,
-        Value::Int(v) => v as i64,
-        _ => 0,
-    }
-}
-
-unsafe extern "C" fn jni_call_float_method_a(
-    _env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) -> f32 {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return 0.0;
-        };
-        entry
-    };
-    let mut args = vec![Value::Ref(if obj.is_null() {
-        None
-    } else {
-        Some(obj as ObjId)
-    })];
-    args.extend(unpack_jvalues(&msig, args_ptr));
-    match invoke_via_vm(&cname, &mname, &msig, &args) {
-        Value::Float(v) => v,
-        Value::Double(v) => v as f32,
-        Value::Int(v) => v as f32,
-        _ => 0.0,
-    }
-}
-
-unsafe extern "C" fn jni_call_void_method_a(
-    _env: *mut c_void,
-    obj: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return;
-        };
-        entry
-    };
-    let mut args = vec![Value::Ref(if obj.is_null() {
-        None
-    } else {
-        Some(obj as ObjId)
-    })];
-    args.extend(unpack_jvalues(&msig, args_ptr));
-    let _ = invoke_via_vm(&cname, &mname, &msig, &args);
-}
-
 unsafe extern "C" fn jni_get_object_field(
     _env: *mut c_void,
     obj: *mut c_void,
@@ -858,63 +592,6 @@ unsafe extern "C" fn jni_get_int_field(
         eprintln!("[pengu-jni] GetIntField .{fname} -> {res}");
     }
     res
-}
-
-unsafe extern "C" fn jni_call_static_object_method_a(
-    _env: *mut c_void,
-    cls: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) -> *mut c_void {
-    let (cname, mname, msig) = {
-        let mut st = jni_state().lock().unwrap();
-        let Some(mut entry) = st.method_ids.get(mid as usize).cloned() else {
-            return std::ptr::null_mut();
-        };
-        if entry.0.is_empty() {
-            if let Some(HeapObject::ClassObj(c)) = st.heap.get(cls as ObjId) {
-                entry.0 = c.clone();
-            }
-        }
-        entry
-    };
-    let args = unpack_jvalues(&msig, args_ptr);
-    if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
-        eprintln!("[pengu-jni] CallStaticObjectMethodA {cname}.{mname}{msig}");
-    }
-    let res = match invoke_via_vm(&cname, &mname, &msig, &args) {
-        Value::Ref(Some(id)) => id as *mut c_void,
-        _ => std::ptr::null_mut(),
-    };
-    if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
-        eprintln!("[pengu-jni] CallStaticObjectMethodA {cname}.{mname}{msig} -> {res:p}");
-    }
-    res
-}
-
-unsafe extern "C" fn jni_call_static_void_method_a(
-    _env: *mut c_void,
-    cls: *mut c_void,
-    mid: *mut c_void,
-    args_ptr: *const u64,
-) {
-    let (cname, mname, msig) = {
-        let mut st = jni_state().lock().unwrap();
-        let Some(mut entry) = st.method_ids.get(mid as usize).cloned() else {
-            return;
-        };
-        if entry.0.is_empty() {
-            if let Some(HeapObject::ClassObj(c)) = st.heap.get(cls as ObjId) {
-                entry.0 = c.clone();
-            }
-        }
-        entry
-    };
-    let args = unpack_jvalues(&msig, args_ptr);
-    if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
-        eprintln!("[pengu-jni] CallStaticVoidMethodA {cname}.{mname}{msig}");
-    }
-    let _ = invoke_via_vm(&cname, &mname, &msig, &args);
 }
 
 unsafe extern "C" fn jni_get_static_object_field(
@@ -968,28 +645,6 @@ unsafe extern "C" fn jni_get_static_int_field(
     }
 }
 
-unsafe extern "C" fn jni_call_static_object_method_v(
-    _env: *mut c_void,
-    _cls: *mut c_void,
-    mid: *mut c_void,
-    _va: *mut c_void,
-) -> *mut c_void {
-    let (cname, mname, msig) = {
-        let st = jni_state().lock().unwrap();
-        let Some(entry) = st.method_ids.get(mid as usize).cloned() else {
-            return std::ptr::null_mut();
-        };
-        entry
-    };
-    if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
-        eprintln!("[pengu-jni] CallStaticObjectMethodV {cname}.{mname}{msig}");
-    }
-    match invoke_via_vm(&cname, &mname, &msig, &[]) {
-        Value::Ref(Some(id)) => id as *mut c_void,
-        _ => std::ptr::null_mut(),
-    }
-}
-
 unsafe extern "C" fn jni_get_method_id(
     _env: *mut c_void,
     cls: *mut c_void,
@@ -1006,9 +661,12 @@ unsafe extern "C" fn jni_get_method_id(
     if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
         eprintln!("[pengu-jni] GetMethodID {cname}.{mname}{msig}");
     }
-    let idx = st.method_ids.len();
-    st.method_ids.push((cname, mname, msig));
-    idx as *mut c_void
+    let key = (cname, mname, msig);
+    if let Some(&index) = st.method_index.get(&key) { return index as *mut c_void; }
+    let index = st.method_ids.len();
+    st.method_ids.push(key.clone());
+    st.method_index.insert(key, index);
+    index as *mut c_void
 }
 
 unsafe extern "C" fn jni_get_static_method_id(
@@ -1033,9 +691,12 @@ unsafe extern "C" fn jni_get_field_id(
     };
     let fname = CStr::from_ptr(name).to_string_lossy().into_owned();
     let fsig = CStr::from_ptr(sig).to_string_lossy().into_owned();
-    let idx = st.field_ids.len();
-    st.field_ids.push((cname, fname, fsig));
-    idx as *mut c_void
+    let key = (cname, fname, fsig);
+    if let Some(&index) = st.field_index.get(&key) { return index as *mut c_void; }
+    let index = st.field_ids.len();
+    st.field_ids.push(key.clone());
+    st.field_index.insert(key, index);
+    index as *mut c_void
 }
 
 unsafe extern "C" fn jni_get_static_field_id(
@@ -1045,54 +706,6 @@ unsafe extern "C" fn jni_get_static_field_id(
     sig: *const c_char,
 ) -> *mut c_void {
     jni_get_field_id(env, cls, name, sig)
-}
-
-unsafe extern "C" fn jni_new_string_utf(_env: *mut c_void, bytes: *const c_char) -> *mut c_void {
-    if bytes.is_null() {
-        return std::ptr::null_mut();
-    }
-    let s = CStr::from_ptr(bytes).to_string_lossy().into_owned();
-    let mut st = jni_state().lock().unwrap();
-    st.heap.new_string(s) as *mut c_void
-}
-
-unsafe extern "C" fn jni_get_string_utf_length(_env: *mut c_void, s: *mut c_void) -> c_int {
-    let st = jni_state().lock().unwrap();
-    st.heap.as_str(s as ObjId).map(|x| x.len() as c_int).unwrap_or(0)
-}
-
-unsafe extern "C" fn jni_get_string_utf_chars(
-    _env: *mut c_void,
-    s: *mut c_void,
-    is_copy: *mut u8,
-) -> *const c_char {
-    if !is_copy.is_null() {
-        *is_copy = 1;
-    }
-    let mut st = jni_state().lock().unwrap();
-    let text = st.heap.as_str(s as ObjId).unwrap_or("").to_string();
-    if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
-        eprintln!("[pengu-jni] GetStringUTFChars(id={}) -> {:?}", s as usize, text);
-    }
-    let cs = CString::new(text).unwrap_or_default();
-    let ptr = cs.as_ptr();
-    st.registry.utf_pins.insert(ptr as usize, cs);
-    ptr
-}
-
-unsafe extern "C" fn jni_release_string_utf_chars(
-    _env: *mut c_void,
-    _s: *mut c_void,
-    chars: *const c_char,
-) {
-    if !chars.is_null() {
-        jni_state()
-            .lock()
-            .unwrap()
-            .registry
-            .utf_pins
-            .remove(&(chars as usize));
-    }
 }
 
 unsafe extern "C" fn jni_get_array_length(_env: *mut c_void, arr: *mut c_void) -> c_int {
@@ -1380,4 +993,44 @@ pub unsafe extern "C" fn bridge_get_native_methods(
         };
     }
     entries.len() as u32
+}
+
+#[no_mangle]
+unsafe extern "C" fn pengu_jni_shorty(method: *mut c_void, out: *mut c_char, size: usize) -> c_int {
+    if out.is_null() { return -1; }
+    let state = jni_state().lock().unwrap();
+    let Some((_, _, descriptor)) = state.method_ids.get(method as usize) else { return -1; };
+    let shorty = crate::vm::descriptor_to_shorty(descriptor);
+    if shorty.len() >= size { return -1; }
+    std::ptr::copy_nonoverlapping(shorty.as_ptr(), out.cast(), shorty.len());
+    *out.add(shorty.len()) = 0;
+    shorty.len() as c_int
+}
+
+#[no_mangle]
+unsafe extern "C" fn pengu_jni_dispatch(env: *mut c_void, object: *mut c_void, method: *mut c_void,
+    mode: c_int, values: *const u64) -> u64 {
+    if mode == 3 { return jni_new_object_a(env, object, method, values) as u64; }
+    let (mut class, name, signature) = {
+        let state = jni_state().lock().unwrap();
+        let Some(entry) = state.method_ids.get(method as usize) else { return 0; };
+        entry.clone()
+    };
+    let mut args = Vec::new();
+    if mode != 1 {
+        if mode == 0 && !object.is_null() {
+            let state = jni_state().lock().unwrap();
+            if let Some(value) = state.heap.get(object as usize) { class = value.class_name().into(); }
+        }
+        args.push(Value::Ref(if object.is_null() { None } else { Some(object as usize) }));
+    }
+    args.extend(unpack_jvalues(&signature, values));
+    match invoke_via_vm(&class, &name, &signature, &args) {
+        Value::Void => 0,
+        Value::Int(value) => value as u64,
+        Value::Long(value) => value as u64,
+        Value::Float(value) => value.to_bits() as u64,
+        Value::Double(value) => value.to_bits(),
+        Value::Ref(value) => value.unwrap_or(0) as u64,
+    }
 }

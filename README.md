@@ -10,11 +10,31 @@
 
 </div>
 
-PenguDroid runs Android applications as Linux processes. Java and Kotlin code use real Android ART; ARM64 native libraries run through the **Digitalis / Berberis ARM64-to-x86_64 bridge**. Graphics go to the host GPU and Wayland desktop, and audio goes to PipeWire. No Android virtual machine, container, root access or Android kernel is required at runtime.
+PenguDroid runs Android applications as Linux processes through two Java execution paths. **Pengu** uses our own DEX interpreter, JNI host and core Java/Android implementations, without ART or framework JARs. It is experimental and has substantial compatibility gaps. The optional **ART** backend uses real Android runtime/framework components and carries the existing application evidence below. ARM64 native libraries use the Digitalis / Berberis bridge; graphics use the host GPU and Wayland, and audio uses PipeWire.
 
-The runtime target is **Android 17 / API 37 on x86_64 Linux**. This is a working compatibility layer under active development, not a promise that every Android application is supported.
+The target is Android 17 / API 37 on x86_64 Linux. No booted Android VM, container, root access or Android kernel is required. A component-based ART installation still contains Android binaries; an independent Pengu profile excludes them. See [the dependency audit and independent build](docs/INDEPENDENT_RUNTIME.md).
 
-## Working applications — real screenshots
+## Android compatibility index
+
+![Independent DexVM compatibility audit](docs/compatibility/overview.svg)
+
+This is a scoped audit, **not a whole-Android completion percentage**. JNI wiring includes partial/no-op handlers; a passing foundation scenario covers only its named regression test. Runtime observations list missing calls, not every possible missing API. See the [machine-readable index](docs/compatibility/index.json), [limitations](docs/LIMITATIONS.md) and [architecture](docs/ARCHITECTURE.md).
+
+`pengudroid compat-index` reports the current binary's JNI table and ART/framework mappings. `PENGUDROID_COMPAT_REPORT=/path/report.json` records a Pengu launch when it returns. `PENGUDROID_VM_STRICT=1` rejects unresolved Java calls.
+
+**ZZZ 3.3.0 is not yet working independently.** Pengu loads its DEX and ARM64 engine libraries without ART/framework, but real worker-thread/Looper execution and additional framework calls remain blockers. The ART path reaches the login background; the blank SDK overlay is still unresolved. No responsive login or gameplay claim is made. [Details and remaining work](docs/INDEPENDENT_RUNTIME.md#zzz-330-result-and-remaining-work).
+
+## Independent Pengu profile
+
+```sh
+./target/release/pengudroid launch /path/to/app.apk --backend pengu
+```
+
+`tools/build-appimage.sh --pengu --portable` builds a profile that excludes ART/framework payloads, disables automatic Android runtime setup, and selects DexVM in both GUI and CLI. ARM64 applications additionally need the verified native bridge, guest support and host C++ support. [Build instructions and measured optimizations](docs/INDEPENDENT_RUNTIME.md#build-and-inspect).
+
+The ordinary build keeps its existing `auto` backend selection to preserve compatibility. `PENGUDROID_BACKEND=pengu` selects the independent path explicitly. The published 0.3.0 component AppImage described below is the ART compatibility profile, not an independent DexVM release.
+
+## Hosted ART application evidence — real screenshots
 
 ### Genshin Impact 7.2.0 — historical NVIDIA validation
 

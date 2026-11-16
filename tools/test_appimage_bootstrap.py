@@ -6,6 +6,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("appimage_bootstrap", Path(__file__).with_name("appimage-bootstrap.py"))
 bootstrap = importlib.util.module_from_spec(spec)
@@ -34,6 +35,22 @@ class InterpreterTests(unittest.TestCase):
             length = struct.unpack_from("<Q", patched, segment + 32)[0]
             self.assertEqual(patched[start:start + length], str(loader).encode() + b"\0")
             self.assertEqual(subprocess.run([binary]).returncode, 0)
+
+    def test_independent_profile_marker_survives_first_start_cache_materialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/"source"
+            marker=source/"usr/share/pengudroid/pengu-backend"
+            marker.parent.mkdir(parents=True);marker.write_text("pengu")
+            (source/"AppRun").write_text("#!/bin/sh\n")
+            (source/"build-id").write_text("independent-fixture")
+            with mock.patch.dict(bootstrap.os.environ,{"XDG_CACHE_HOME":str(root/"cache")}):
+                with mock.patch.object(bootstrap.sys,"argv",["bootstrap",str(source),"--cli","compat-index"]):
+                    with mock.patch.object(bootstrap.os,"execve") as execute:
+                        bootstrap.main()
+            destination=root/"cache/pengudroid/appimage/independent-fixture"
+            self.assertEqual((destination/"usr/share/pengudroid/pengu-backend").read_text(),"pengu")
+            self.assertTrue((destination/".complete").is_file())
+            self.assertIn(str(destination/"AppRun"),execute.call_args.args[1])
 
     def test_data_files_are_not_modified(self):
         with tempfile.TemporaryDirectory() as directory:

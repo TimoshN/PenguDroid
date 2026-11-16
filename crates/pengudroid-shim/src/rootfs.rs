@@ -131,6 +131,19 @@ fn map_with_roots(host: Option<&[u8]>, arm64: Option<&[u8]>, path: &[u8]) -> Opt
 pub fn map_bytes(path: &[u8]) -> Option<Vec<u8>> {
     // Never initialize a descriptor while its own host file is being opened.
     if !guest_path(path) { return None; }
+    if let Some(runtime) = pengudroid_runtime::configured() {
+        if runtime.independent {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let native = runtime.component("arm64-guest").ok()?;
+            // The linker canonicalizes dir.system=/system. This is an exact
+            // virtual directory alias, not a physical Android system tree.
+            if path == b"/system" { return Some(native.into_os_string().into_vec()); }
+            let guest = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+            let mapped = runtime.resolve(guest).unwrap_or_else(||
+                native.join("__unsupported__").join(guest.strip_prefix("/").unwrap_or(guest)));
+            return Some(mapped.into_os_string().into_vec());
+        }
+    }
     if arm64_runtime_path(path) {
         if let Some(arm64) = arm64_root() { return map_with_root(arm64, path); }
     }
@@ -431,7 +444,11 @@ fn virtual_arm64_path<'a>(root: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
 fn virtual_runtime_path(path: &[u8]) -> Option<Vec<u8>> {
     if let Some(runtime) = pengudroid_runtime::configured() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        let path = runtime.virtualize(std::path::Path::new(std::ffi::OsStr::from_bytes(path)))?;
+        let host = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+        if runtime.independent && runtime.component("arm64-guest").ok().as_deref() == Some(host) {
+            return Some(b"/system".to_vec());
+        }
+        let path = runtime.virtualize(host)?;
         let bytes = path.into_os_string().into_vec();
         return (arm64_runtime_path(&bytes) || bytes == b"/system").then_some(bytes);
     }

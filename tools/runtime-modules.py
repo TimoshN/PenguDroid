@@ -68,7 +68,7 @@ def library_dirs(source):
     ]
 
 
-def elf_needed(path):
+def elf_needed(path, machine=62):
     """Read DT_NEEDED from ELF64 program headers; section tables are unnecessary."""
     with path.open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
@@ -85,8 +85,8 @@ def elf_needed(path):
         header = stream.read(64)
         if header[:4] != b"\x7fELF":
             return None
-        if len(header) != 64 or header[4:6] != b"\x02\x01" or header[18:20] != b"\x3e\x00":
-            raise ValueError(f"desktop runtime requires ELF64 x86_64: {path.name}")
+        if len(header) != 64 or header[4:6] != b"\x02\x01" or header[18:20] != struct.pack("<H", machine):
+            raise ValueError(f"runtime requires ELF64 {'x86_64' if machine == 62 else 'AArch64'}: {path.name}")
         phoff = struct.unpack_from("<Q", header, 32)[0]
         phsize, phnum = struct.unpack_from("<HH", header, 54)
         if phnum > 4096 or phnum and phsize != 56:

@@ -388,7 +388,8 @@ pub fn launch(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let backend = match backend_arg.as_deref() {
+    let backend_default = std::env::var("PENGUDROID_BACKEND").ok();
+    let backend = match backend_arg.as_deref().or(backend_default.as_deref()) {
         None | Some("auto") => planned.backend,
         Some("native") => Backend::Native,
         Some("art") => Backend::Art,
@@ -398,6 +399,11 @@ pub fn launch(args: &[String]) -> i32 {
             return 2;
         }
     };
+
+    if backend == Backend::Art && std::env::var("PENGUDROID_INDEPENDENT").as_deref() == Ok("1") {
+        eprintln!("pengudroid: this independent build excludes ART/framework runtime setup; choose --backend pengu or native");
+        return 2;
+    }
 
     let prefix = prefix_arg
         .map(PathBuf::from)
@@ -409,6 +415,12 @@ pub fn launch(args: &[String]) -> i32 {
             return 1;
         }
     };
+
+    // Re-exec before unpacking a bundle or extracting hundreds of MiB of native
+    // libraries. Only the preloaded child materializes the application payload.
+    if backend == Backend::Pengu {
+        if let Some(code) = prepare_pengu_process(&info, &prefix) { return code; }
+    }
 
     // A bundle is materialised into the prefix once: `base.apk`, the split for
     // the architecture we intend to use, and the OBB payload. Everything after
@@ -474,7 +486,8 @@ pub fn launch(args: &[String]) -> i32 {
     println!("  apk     : {apk_path}");
     println!("  prefix  : {}", prefix.display());
     println!("  cpu     : {}", host_simd_tier());
-    println!("  backend : {} ({})", backend.name(), planned.reason);
+    let reason = if backend == Backend::Pengu { "independent DEX/JNI; no ART/framework fallback" } else { planned.reason.as_str() };
+    println!("  backend : {} ({reason})", backend.name());
     if backend != planned.backend {
         println!("  note    : forced with --backend");
     }
@@ -829,6 +842,16 @@ fn guest_root_for_bridge(bridge_dir: &Path) -> Option<PathBuf> {
 /// next to the running binary or inside the cached AppImage tree.
 fn find_arm64_bridge_dir() -> Option<(PathBuf, Option<PathBuf>)> {
     let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(explicit) = std::env::var_os("PENGUDROID_NATIVE_BRIDGE_LIB") {
+        let dir = PathBuf::from(explicit);
+        if dir.join("libberberis_arm64.so").is_file() {
+            let guest = std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT").map(PathBuf::from)
+                .or_else(|| guest_root_for_bridge(&dir));
+            return Some((dir, guest));
+        }
+        // An explicit path is authoritative. Never select an unrelated cache.
+        return None;
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("../lib/pengudroid/bridge"));
@@ -913,7 +936,23 @@ fn run_child(mut cmd: std::process::Command) -> i32 {
     }
 }
 
-fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: &Path) -> i32 {
+fn prepare_pengu_process(info: &ApkInfo, prefix: &Path) -> Option<i32> {
+    // The independent backend must never provision or resolve ART/framework
+    // modules from a caller's legacy runtime environment.
+    for name in ["PENGUDROID_SYSROOT", "PENGUDROID_ART_SYSROOT", "PENGUDROID_RUNTIME",
+        "PENGUDROID_RUNTIME_MANIFEST", "PENGUDROID_RUNTIME_MODULES"] {
+        std::env::remove_var(name);
+    }
+    if let Some(root) = std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT") {
+        match pengudroid_runtime::Runtime::from_root_if_component(Path::new(&root)) {
+            Ok(Some(runtime)) if runtime.independent => {
+                std::env::set_var(pengudroid_runtime::ENV, runtime.descriptor());
+            }
+            Ok(Some(_)) => { eprintln!("pengudroid vm: ARM64 support descriptor contains ART/framework components"); return Some(1); }
+            Ok(None) => {}
+            Err(error) => { eprintln!("pengudroid vm: invalid native support descriptor: {error}"); return Some(1); }
+        }
+    }
     if std::env::var_os("PENGUDROID_PENGU_PRELOADED").is_none() {
         let mut preloads: Vec<String> = Vec::new();
         if let Some(s) = crate::deps::find_shim() {
@@ -948,6 +987,14 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
 
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
         cmd.args(std::env::args_os().skip(1));
+        let app_env = match create_prefix(prefix, &info.package) {
+            Ok(env) => env,
+            Err(e) => { eprintln!("pengudroid vm: {e}"); return Some(1); }
+        };
+        apply_env(&mut cmd, &app_env);
+        if let Some(manifest) = std::env::var_os(pengudroid_runtime::ENV) {
+            cmd.env(pengudroid_runtime::ENV, manifest);
+        } else { cmd.env_remove(pengudroid_runtime::ENV); }
         cmd.env("PENGUDROID_PENGU_PRELOADED", "1");
         if !preloads.is_empty() {
             cmd.env("LD_PRELOAD", preloads.join(":"));
@@ -958,7 +1005,7 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
             if let Ok(entries) = std::fs::read_dir(&bridge_dir) {
                 for ent in entries.flatten() {
                     let p = ent.path();
-                    if p.is_file() {
+                    if p.is_file() && !ent.file_name().to_string_lossy().starts_with("libpengudroid_") {
                         let dst = staged_bridge.join(ent.file_name());
                         if !dst.is_file() {
                             if let Ok(raw) = std::fs::read(&p) {
@@ -978,6 +1025,9 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
                 cmd.env("PENGUDROID_ARM64_GUEST_ROOT", gr);
             }
         }
+        if let Some(support) = std::env::var_os("PENGUDROID_BRIDGE_SUPPORT") {
+            lib_paths.push(support.to_string_lossy().into_owned());
+        }
         if let Some(prev) = std::env::var_os("LD_LIBRARY_PATH") {
             lib_paths.push(prev.to_string_lossy().into_owned());
         }
@@ -985,8 +1035,14 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
         cmd.env("PENGUDROID_BRIDGE_TLS", "1");
         cmd.env("BERBERIS_FLAGS", "glibc-host-thread-id-handoff");
         cmd.env("BERBERIS_MODE", "lite-translate-or-interpret");
-        return run_child(cmd);
+        return Some(run_child(cmd));
     }
+
+    None
+}
+
+fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: &Path) -> i32 {
+    if let Some(code) = prepare_pengu_process(info, prefix) { return code; }
 
     let entries = match apk::apk_entries(apk_path) {
         Ok(e) => e,
@@ -997,6 +1053,7 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
     };
     let mut vm = pengudroid_dexvm::Vm::new();
     vm.set_package_name(&info.package);
+    vm.set_split_apks(split_paths);
     let lib_dir = prefix.join("lib");
     let arm64_dir = lib_dir.join("arm64");
     let _ = std::fs::create_dir_all(&arm64_dir);
@@ -1036,9 +1093,12 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
             match pengudroid_nativebridge::Translator::open(open_path) {
                 Err(e) => {
                     eprintln!("pengudroid vm: Translator::open({}) failed: {e}", open_path.display());
+                    return 1;
                 }
                 Ok(mut translator) => {
-                let cbs = pengudroid_nativebridge::RuntimeCallbacks {
+                // The bridge retains this pointer after initialize returns. A
+                // stack table becomes dangling once this block exits in release.
+                static CBS: pengudroid_nativebridge::RuntimeCallbacks = pengudroid_nativebridge::RuntimeCallbacks {
                     get_method_shorty: pengudroid_dexvm::jni_host::bridge_get_method_shorty,
                     get_native_method_count:
                         pengudroid_dexvm::jni_host::bridge_get_native_method_count,
@@ -1060,7 +1120,7 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
                 );
                 std::env::remove_var("LD_PRELOAD");
                 let init_res = translator.initialize(
-                    &cbs,
+                    &CBS,
                     &cache_dir,
                     pengudroid_nativebridge::ARM64_ISA,
                 );
@@ -1073,6 +1133,7 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
                 }
                 if let Err(e) = init_res {
                     eprintln!("pengudroid vm: ARM64 bridge initialize failed: {e}");
+                    return 1;
                 } else {
                     println!(
                         "pengudroid vm: initialized ARM64 bridge from {} (zero ART/framework)",
@@ -1150,6 +1211,9 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
                 }
                 }
             }
+        } else {
+            eprintln!("pengudroid vm: ARM64 payload needs an explicit or bundled native bridge; no ART fallback is allowed");
+            return 1;
         }
     }
 
@@ -1191,9 +1255,39 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
         eprintln!("pengudroid vm: warning: daemon not started: {error}");
     }
     println!("pengudroid vm: launching {desc}");
-    match vm.launch_activity(&desc) {
+    let violations = match loaded_android_runtime_components() {
+        Ok(paths) => paths,
+        Err(error) => { eprintln!("pengudroid vm: cannot verify runtime mappings: {error}"); return 1; }
+    };
+    if !violations.is_empty() {
+        eprintln!("pengudroid vm: independent backend found forbidden Android runtime mappings: {violations:?}");
+        return 1;
+    }
+    let result = vm.launch_activity(&desc);
+    let violations = match loaded_android_runtime_components() {
+        Ok(paths) => paths,
+        Err(error) => { eprintln!("pengudroid vm: cannot verify runtime mappings: {error}"); return 1; }
+    };
+    let missing_jni = pengudroid_dexvm::jni_host::missing_jni_calls();
+    if let Some(path) = std::env::var_os("PENGUDROID_COMPAT_REPORT") {
+        let report = serde_json::json!({
+            "schema": 1, "version": env!("CARGO_PKG_VERSION"), "backend": "pengu",
+            "package": info.package, "launch_returned": result.is_ok(),
+            "launch_error": result.as_ref().err(), "gameplay_verified": false,
+            "forbidden_android_runtime_mappings": violations,
+            "missing_methods": vm.missing_methods,
+            "unimplemented_jni_calls": missing_jni,
+            "jni_table": {"function_slots": 229, "wired_slots": pengudroid_dexvm::jni_host::wired_jni_slots(),
+                "note": "Wired handlers include partial implementations; this is not an Android compatibility percentage."}
+        });
+        if let Err(error) = std::fs::write(&path, serde_json::to_vec_pretty(&report).unwrap()) {
+            eprintln!("pengudroid vm: cannot write compatibility report: {error}");
+        }
+    }
+    if !violations.is_empty() { eprintln!("pengudroid vm: unexpected ART/framework mapping: {violations:?}"); return 1; }
+    match result {
         Ok(_) => {
-            println!("pengudroid vm: launch_activity returned");
+            println!("pengudroid vm: launch_activity returned ({} unimplemented method(s), {} unimplemented JNI slot(s); rendering not verified)", vm.missing_methods.len(), missing_jni.len());
             let wait_secs = std::env::var("PENGUDROID_PENGU_WAIT_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -1208,6 +1302,37 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
             1
         }
     }
+}
+
+fn loaded_android_runtime_components() -> Result<Vec<String>, String> {
+    let names = ["libart.so", "libartd.so", "libandroid_runtime.so", "libandroidfw.so", "libhwui.so",
+        "libgui.so", "libjavacore.so", "libopenjdk.so", "framework.jar", "core-oj.jar", "core-libart.jar"];
+    let mut found = std::collections::BTreeSet::new();
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|error| error.to_string())?;
+    {
+        for line in maps.lines() {
+            if let Some(path) = line.split_whitespace().nth(5) {
+                if Path::new(path).file_name().and_then(|name| name.to_str()).is_some_and(|name| names.contains(&name)) {
+                    found.insert(path.to_string());
+                }
+            }
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+pub fn compatibility_index() -> i32 {
+    let mappings = match loaded_android_runtime_components() {
+        Ok(paths) => paths,
+        Err(error) => { eprintln!("pengudroid: cannot audit runtime mappings: {error}"); return 1; }
+    };
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "schema": 1, "version": env!("CARGO_PKG_VERSION"), "backend": "pengu",
+        "jni_function_slots": 229, "wired_jni_slots": pengudroid_dexvm::jni_host::wired_jni_slots(),
+        "note": "Wiring is not semantic conformance or whole-Android compatibility.",
+        "forbidden_android_runtime_mappings": mappings,
+    })).unwrap());
+    0
 }
 
 #[cfg(test)]

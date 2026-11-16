@@ -2998,6 +2998,7 @@ dependencies = [
  "pengudroid-runtime",
  "pengudroid-socket",
  "roxmltree",
+ "serde_json",
 ]
 
 [[package]]

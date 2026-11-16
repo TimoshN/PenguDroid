@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="430" viewBox="0 0 1000 430" role="img" aria-labelledby="title desc">
+<title id="title">PenguDroid independent runtime compatibility audit</title>
+<desc id="desc">JNI handler wiring and a scoped foundation scenario checklist. No overall Android compatibility percentage is asserted.</desc>
+<rect width="1000" height="430" rx="16" fill="#111827"/>
+<g font-family="sans-serif" fill="#e5e7eb">
+<text x="32" y="42" font-size="24" font-weight="bold">Independent DexVM · compatibility audit</text>
+<text x="32" y="72" font-size="15" fill="#a5b4fc">ART / framework payload excluded from the Pengu profile; legacy ART remains optional.</text>
+<text x="32" y="115" font-size="17">JNI 1.6 function table: 144 wired / 85 placeholders / 229 function slots</text>
+<rect x="32" y="132" width="936" height="26" rx="6" fill="#374151"/>
+<rect x="32" y="132" width="588.58" height="26" rx="6" fill="#38bdf8"/>
+<text x="32" y="183" font-size="14" fill="#9ca3af">Wired handlers can be partial or no-ops. This bar measures wiring, not Android conformance.</text>
+<text x="32" y="225" font-size="17">Audited foundation scenarios · fixed scope: 14 checks</text>
+<rect x="32.00" y="243" width="468.00" height="30" fill="#34d399"/>
+<rect x="500.00" y="243" width="267.43" height="30" fill="#fbbf24"/>
+<rect x="767.43" y="243" width="200.57" height="30" fill="#fb7185"/>
+<text x="32" y="300" font-size="16">Passed subset: 7 · Partial: 4 · Missing: 3</text>
+<text x="32" y="329" font-size="14" fill="#9ca3af">A passed scenario covers only its named regression test, not its entire API family.</text>
+<text x="32" y="363" font-size="16">Observed missing calls: 71 Java signatures · 0 JNI slots</text>
+<text x="32" y="394" font-size="14" fill="#fda4af">ZZZ independent gameplay: unverified / blocked. No whole-Android completion percentage.</text>
+</g></svg>

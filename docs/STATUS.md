@@ -1,6 +1,30 @@
 # Project status and handoff
 
-## Current — 0.3.0 component runtime (2026-11-16)
+## Current source — independent DexVM audit (2026-11-16)
+
+Upstream `0be8e05` is merged with the local Vulkan/input fixes. The new Pengu
+profile excludes ART/framework setup and runs DEX through `pengudroid-dexvm`;
+the published 0.3.0 component profile remains ART dependent. See
+[the independent audit](INDEPENDENT_RUNTIME.md) and
+[the generated compatibility index](compatibility/index.json).
+
+Implemented follow-up: indexed/shared method code, typed native call interfaces,
+real C JNI varargs/V/A adapters, JNI UTF-16/modified UTF-8, pending JNI exceptions,
+app storage/capacity, atomics, message construction and APK split metadata.
+The native bridge is explicit/authoritative; initialization failures no longer
+fall through to the wrong host loader. Pengu re-exec happens before unpacking.
+The bridge now requires static callback tables, fixing an optimized-only
+stack-use-after-return crash in ZZZ. The native-only ARM64 closure contains 21
+payload files without ART/framework or a physical Android system tree.
+
+Independent ZZZ reaches engine library initialization but remains blocked during
+worker/handler setup. No independent gameplay is verified. The ART login overlay
+and the reported BBR2 artifacts also remain open. Existing screenshots retain
+hosted-ART provenance. The legacy runtime provenance/component descriptor naming
+collision found in the merge is fixed and covered by regression tests.
+
+
+## Published 0.3.0 component runtime (2026-11-16)
 
 Android paths now resolve through `pengudroid-runtime` providers. Default
 component installs contain neither a physical `system/`/`apex/` tree nor
@@ -15,7 +39,7 @@ See [component architecture and setup](MODULAR_RUNTIME.md),
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current — 0.2.1 Vulkan ZZZ boot, upright presentation, and AppImage X11 fix (2026-11-15)
+## Historical 0.2.1 Vulkan ZZZ boot, upright presentation, and AppImage X11 fix (2026-11-15)
 
 Pick up here. See [ZZZ_HANDOFF.md](ZZZ_HANDOFF.md) for the full Vulkan / Zenless Zone Zero handoff.
 

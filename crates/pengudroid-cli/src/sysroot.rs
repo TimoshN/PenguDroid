@@ -218,8 +218,8 @@ impl Layout {
         // so a relative `--sysroot` would make them cwd-dependent or plain wrong.
         let root = std::fs::canonicalize(root)
             .map_err(|e| format!("cannot resolve sysroot {}: {e}", root.display()))?;
-        if root.join(pengudroid_runtime::DESCRIPTOR).is_file() {
-            return Self::component_runtime(pengudroid_runtime::Runtime::load(&root.join(pengudroid_runtime::DESCRIPTOR))?);
+        if let Some(runtime) = pengudroid_runtime::Runtime::from_root_if_component(&root)? {
+            return Self::component_runtime(runtime);
         }
         if !root.join("system").is_dir() {
             return Err(format!(
@@ -647,8 +647,7 @@ const GUEST_VDSO_HOOKS: &[&str] = &[
 /// The shim uses this same root for only `/system/{bin,lib64}/arm64` and the
 /// guest linker configuration. No missing-file fallback to a stock GSI exists.
 fn bridge_guest_root(host: &Path, configured: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
-    if host.join(pengudroid_runtime::DESCRIPTOR).is_file() {
-        let runtime = pengudroid_runtime::Runtime::load(&host.join(pengudroid_runtime::DESCRIPTOR))?;
+    if let Some(runtime) = pengudroid_runtime::Runtime::from_root_if_component(host)? {
         if runtime.components.contains_key("arm64-guest") { return Ok(host.to_path_buf()); }
     }
     let Some(configured) = configured else { return Ok(host.to_path_buf()); };
@@ -677,9 +676,7 @@ fn validate_bridge_guest(root: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("cannot inspect ARM64 guest manifest {}: {error}", manifest.display())),
     }
-    let runtime = if root.join(pengudroid_runtime::DESCRIPTOR).is_file() {
-        Some(pengudroid_runtime::Runtime::load(&root.join(pengudroid_runtime::DESCRIPTOR))?)
-    } else { None };
+    let runtime = pengudroid_runtime::Runtime::from_root_if_component(root)?;
     let guest_path = |path: &str| runtime.as_ref().and_then(|r| r.resolve(Path::new(path)))
         .unwrap_or_else(|| root.join(path.trim_start_matches('/')));
     // These are necessary source-defined contracts, not proof that a bundle can

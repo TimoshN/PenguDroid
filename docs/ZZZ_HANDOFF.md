@@ -1,6 +1,29 @@
-# Zenless Zone Zero (Vulkan) Handoff — 0.2.1
+# Zenless Zone Zero investigation
 
-This document records the exact state of Zenless Zone Zero (`com.HoYoverse.Nap` 3.3.0) on PenguDroid 0.2.1 so the next agent can continue directly from verified findings without re-investigating fixed issues.
+This document separates independent DexVM findings from the historical ART path.
+Neither path has verified responsive ZZZ login or gameplay.
+
+## Independent DexVM audit — 2026-11-16
+
+Upstream `0be8e05` is merged with the verified local Vulkan/input fixes. The
+independent path loads five ZZZ 3.3.0 DEX files and the ARM64 `libmain.so` /
+`libil2cpp.so` engines with a flat, native-only guest bundle. Successful `openat`
+records show native support files, with no ART/framework library or JAR opens.
+The supplied native bundle has no physical `system/` or `apex/` tree.
+
+The release build previously crashed immediately after `GetMethodID` for
+`Class.getClassLoader`: its native-bridge callback table was stack allocated,
+while the translator retains that pointer. Static storage and an API lifetime
+requirement fix this; both optimized and debug binaries now reach worker setup.
+
+The current blocker is worker/handler initialization: `HandlerThread` constructor,
+`start`, `getLooper` and actual Java thread/event-loop execution are incomplete.
+The earlier ART login screenshot does not validate the independent backend.
+See [the runtime audit](INDEPENDENT_RUNTIME.md) and [observed missing calls](compatibility/index.json).
+
+The following sections describe the separate ART-based investigation. Its blank,
+transparent SDK window is still unresolved; consent text or buttons have not been
+observed. Do not dismiss that window or assume consent was accepted.
 
 ## Local merge follow-up — 2026-11-16
 

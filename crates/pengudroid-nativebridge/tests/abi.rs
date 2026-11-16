@@ -167,19 +167,19 @@ fn stub_translator_drives_every_contract_in_order() {
 
     // initialize gets (callbacks, private_dir, isa) in the header's order; the
     // stub accepts only that.
-    let runtime = RuntimeCallbacks {
+    static RUNTIME: RuntimeCallbacks = RuntimeCallbacks {
         get_method_shorty: no_shorty,
         get_native_method_count: no_count,
         get_native_methods: no_methods,
     };
     assert!(
         translator
-            .initialize(&runtime, Path::new("wrong-dir"), ARM64_ISA)
+            .initialize(&RUNTIME, Path::new("wrong-dir"), ARM64_ISA)
             .is_err(),
         "the instruction-set argument must be the third one"
     );
     translator
-        .initialize(&runtime, Path::new("init-dir"), ARM64_ISA)
+        .initialize(&RUNTIME, Path::new("init-dir"), ARM64_ISA)
         .expect("initialize");
 
     // A path outside the ARM64 layout is refused before the bridge is asked.

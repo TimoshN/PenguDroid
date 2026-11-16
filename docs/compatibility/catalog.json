@@ -1,0 +1,19 @@
+{
+  "scope": "Audited foundation scenarios, not the complete Android API surface. Passed means only the named regression scenario passed.",
+  "scenarios": [
+    {"name":"DEX arithmetic loop", "status":"passed", "evidence":"executes_dalvik_loop_without_art"},
+    {"name":"Multi-DEX class precedence and indexing", "status":"passed", "evidence":"indexed_multidex_preserves_first_class_and_rejects_invalid_method_transactionally"},
+    {"name":"Native JNI mixed arguments and returns", "status":"passed", "evidence":"native_calls_preserve_mixed_register_banks_stack_arguments_and_float_return"},
+    {"name":"JNI ellipsis / va_list / jvalue calls", "status":"passed", "evidence":"c_jni_variadic_v_and_a_calls_preserve_arguments_and_virtual_receiver"},
+    {"name":"JNI UTF-16 and modified UTF-8", "status":"passed", "evidence":"jni_utf16_and_modified_utf8_roundtrip_nul_supplementary_and_lone_surrogates"},
+    {"name":"App storage and real filesystem capacity", "status":"passed", "evidence":"app_directories_obb_arrays_and_real_storage_capacity"},
+    {"name":"Atomic CAS identity and integer overflow", "status":"passed", "evidence":"atomic_values_obey_cas_return_values_and_java_overflow"},
+    {"name":"Java exceptions and reflection", "status":"partial", "evidence":"JNI pending exceptions exist; reflection and managed exception coverage are incomplete"},
+    {"name":"Graphics and native library startup", "status":"partial", "evidence":"ZZZ loads five DEX files and ARM64 libmain/libil2cpp; independent gameplay is unverified"},
+    {"name":"Gamepad and input", "status":"partial", "evidence":"Xbox One/360 InputManager checks pass on ART; independent DexVM input routing is incomplete"},
+    {"name":"Android Resources and View layout", "status":"partial", "evidence":"Minimal builtin objects; no general replacement for Android layout/resource services"},
+    {"name":"HandlerThread / concurrent Looper execution", "status":"missing", "evidence":"Observed ZZZ HandlerThread.start/getLooper gap; no real worker-thread VM execution"},
+    {"name":"Independent WebView and network framework", "status":"missing", "evidence":"No independent Chromium/WebView, Android HTTP/TLS framework replacement"},
+    {"name":"Garbage collection and monitor semantics", "status":"missing", "evidence":"Heap objects are retained; reference/monitor/concurrency semantics are incomplete"}
+  ]
+}

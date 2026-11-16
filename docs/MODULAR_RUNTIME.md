@@ -1,5 +1,11 @@
 # Component runtime without an Android system tree
 
+This document describes the **ART-dependent component profile**. Its absence of a
+physical system tree does not mean absence of ART/framework binaries. The separate
+[Pengu profile](INDEPENDENT_RUNTIME.md) excludes those runtime payloads and has a
+much smaller, experimental Android API implementation.
+
+
 The component installation no longer creates or reads a physical `system/` or
 `apex/` tree. ART, framework resources, configuration, fonts, native libraries
 and the optional ARM64 guest are separate providers. `pengudroid-runtime` reads

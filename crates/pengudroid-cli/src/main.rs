@@ -62,9 +62,15 @@ fn real_main() -> i32 {
         print_help();
         return 2;
     };
+    if std::env::var("PENGUDROID_INDEPENDENT").as_deref() == Ok("1")
+        && matches!(cmd, "sysroot" | "runtime" | "art-test" | "__art") {
+        eprintln!("pengudroid: independent profile excludes ART/framework provisioning and execution");
+        return 2;
+    }
     match cmd {
         "run" => cmd_run(&args[2..]),
         "launch" => launcher::launch(&args[2..]),
+        "compat-index" => launcher::compatibility_index(),
         "extract" => cmd_extract(&args[2..]),
         "demo" => cmd_demo(&args[2..]),
         "start" => cmd_start(&args[2..]),

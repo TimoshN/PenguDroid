@@ -6,6 +6,10 @@
 pub mod dex;
 pub mod jni_host;
 pub mod stdlib;
+mod stdlib_fs;
+mod stdlib_sync;
+mod native_abi;
+mod jni_strings;
 pub mod value;
 pub mod vm;
 
@@ -183,6 +187,44 @@ mod tests {
     }
 
     #[test]
+    fn indexed_multidex_preserves_first_class_and_rejects_invalid_method_transactionally() {
+        let bytes = build_sum_dex();
+        let mut vm = Vm::new();
+        vm.load_dex(&bytes).unwrap();
+        let mut duplicate = DexFile::parse(&bytes).unwrap();
+        duplicate.classes[0].direct_methods.clear();
+        vm.load_parsed_dex(duplicate).unwrap();
+        assert_eq!(vm.invoke_method("LTest;", "sumTo", "(I)I", &[Value::Int(10)], false).unwrap().as_int().unwrap(), 55);
+        let mut invalid = DexFile::parse(&bytes).unwrap();
+        invalid.classes[0].name = "LInvalid;".into();
+        invalid.classes[0].direct_methods[0].method_idx = usize::MAX;
+        assert!(vm.load_parsed_dex(invalid).is_err());
+        assert!(vm.find_class("LInvalid;").is_none());
+        assert_eq!(vm.invoke_method("LTest;", "sumTo", "(I)I", &[Value::Int(3)], false).unwrap().as_int().unwrap(), 6);
+    }
+
+    #[test]
+    fn direct_private_native_uses_object_receiver_instead_of_class() {
+        unsafe extern "C" fn native(_: *mut c_void, receiver: *mut c_void, input: i32) -> i32 {
+            let state = jni_host::jni_state().lock().unwrap();
+            match state.heap.get(receiver as usize) {
+                Some(HeapObject::Instance { class_name, .. }) if class_name == "LPrivateNativeCase;" => input + 10,
+                _ => -1,
+            }
+        }
+        let mut dex = DexFile::parse(&build_sum_dex()).unwrap();
+        dex.classes[0].name = "LPrivateNativeCase;".into();
+        dex.methods[0].class_name = "LPrivateNativeCase;".into();
+        dex.classes[0].direct_methods[0].access_flags = 0x0102; // private native, not static
+        dex.classes[0].direct_methods[0].code = None;
+        let mut vm = Vm::new(); vm.load_parsed_dex(dex).unwrap();
+        jni_host::register_native("LPrivateNativeCase;", "sumTo", "(I)I", native as *const () as usize);
+        let object = vm.new_instance("LPrivateNativeCase;").unwrap();
+        let result = vm.invoke_method("LPrivateNativeCase;", "sumTo", "(I)I", &[Value::Ref(Some(object)), Value::Int(7)], false).unwrap();
+        assert_eq!(result.as_int().unwrap(), 17);
+    }
+
+    #[test]
     fn builtin_stdlib_stringbuilder_and_math_work() {
         let mut vm = Vm::new();
         let sb = vm.new_instance("Ljava/lang/StringBuilder;").unwrap();
@@ -211,6 +253,71 @@ mod tests {
         let sid = s_val.as_ref().unwrap();
         let st = jni_host::jni_state().lock().unwrap();
         assert_eq!(st.heap.as_str(sid), Some("Pengu17"));
+    }
+
+    #[test]
+    fn c_jni_variadic_v_and_a_calls_preserve_arguments_and_virtual_receiver() {
+        unsafe extern "C" { fn pengu_test_jni_calls(env: *mut c_void, object: *mut c_void,
+            method: *mut c_void, results: *mut f64) -> i32; }
+        unsafe fn record(_: usize, class: &str, name: &str, descriptor: &str, args: &[Value]) -> Value {
+            let valid = class == "LJniBridgeCase;" && name == "mixed" && descriptor == "(IFDJIL)D"
+                && args.len() == 7 && args[0].as_ref().is_some()
+                && args[1].as_int().ok() == Some(-7) && args[2].as_float().ok() == Some(1.25)
+                && args[3].as_double().ok() == Some(2.5) && args[4].as_long().ok() == Some(10_000_000_000)
+                && args[5].as_int().ok() == Some(9) && args[6].as_ref() == Some(0x1234);
+            Value::Double(if valid { 19.75 } else { -1.0 })
+        }
+        unsafe {
+            let _guard = jni_host::scoped_vm_invoker(0, record);
+            let env = jni_host::jni_env_ptr();
+            let (object, method) = {
+                let mut state = jni_host::jni_state().lock().unwrap();
+                let object = state.heap.new_instance("LJniBridgeCase;");
+                let method = state.method_ids.len();
+                state.method_ids.push(("LSuperCase;".into(), "mixed".into(), "(IFDJIL)D".into()));
+                (object, method)
+            };
+            let mut results = [0.0; 3];
+            assert_eq!(pengu_test_jni_calls(env, object as *mut c_void, method as *mut c_void, results.as_mut_ptr()), 0);
+            assert_eq!(results, [19.75; 3]);
+        }
+    }
+
+    #[test]
+    fn repeated_jni_id_lookups_are_stable_and_env_is_thread_local() {
+        unsafe {
+            let env = jni_host::jni_env_ptr();
+            let table = *(env as *const *const *const c_void);
+            type GetId = unsafe extern "C" fn(*mut c_void,*mut c_void,*const c_char,*const c_char) -> *mut c_void;
+            let method: GetId = std::mem::transmute(*table.add(33));
+            let field: GetId = std::mem::transmute(*table.add(94));
+            let class = jni_host::jni_state().lock().unwrap().heap.class_object("LStableIdCase;") as *mut c_void;
+            let name = CString::new("value").unwrap();
+            let signature = CString::new("()I").unwrap();
+            let first = method(env,class,name.as_ptr(),signature.as_ptr());
+            assert_eq!(first,method(env,class,name.as_ptr(),signature.as_ptr()));
+            let signature = CString::new("I").unwrap();
+            let first = field(env,class,name.as_ptr(),signature.as_ptr());
+            assert_eq!(first,field(env,class,name.as_ptr(),signature.as_ptr()));
+            let main_address = env as usize;
+            let child_address = std::thread::spawn(|| jni_host::jni_env_ptr() as usize).join().unwrap();
+            assert_ne!(main_address,child_address);
+            assert_eq!(jni_host::jni_env_ptr(),env);
+        }
+    }
+
+    #[test]
+    fn handler_obtain_message_keeps_target_and_payload() {
+        let mut vm = Vm::new();
+        let handler = vm.new_instance("Landroid/os/Handler;").unwrap();
+        let message = vm.invoke_method("Landroid/os/Handler;", "obtainMessage", "(III)Landroid/os/Message;",
+            &[Value::Ref(Some(handler)),Value::Int(7),Value::Int(11),Value::Int(13)],true).unwrap().as_ref().unwrap();
+        let state = jni_host::jni_state().lock().unwrap();
+        let Some(HeapObject::Instance { fields, .. }) = state.heap.get(message) else { panic!("not a Message") };
+        assert_eq!(fields["target"].as_ref(),Some(handler));
+        assert_eq!(fields["what"].as_int().unwrap(),7);
+        assert_eq!(fields["arg1"].as_int().unwrap(),11);
+        assert_eq!(fields["arg2"].as_int().unwrap(),13);
     }
 
     #[test]

@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "date": "2026-11-16",
+  "base_merged_commit": "1fc825f",
+  "scope": "Local x86_64 Linux / RTX 3080 audit; not a general Linux or Android conformance certification",
+  "rust_workspace": {
+    "passed": 513,
+    "failed": 0,
+    "ignored": 1
+  },
+  "python_tools": {
+    "passed": 287,
+    "failed": 0
+  },
+  "release_dexvm": {
+    "passed": 13,
+    "failed": 0
+  },
+  "image": {
+    "image_sha256": "32d7ed3c5632c70fec148d389a4fe5d5a2a2baa7be1d17e1ff56f73e025bf379",
+    "bytes": 76163520,
+    "forbidden_payloads": [],
+    "first_start_marker_preserved": true,
+    "native_guest_files": 21,
+    "refused_commands": {
+      "runtime --download": 2,
+      "art-test": 2,
+      "sysroot": 2,
+      "__art": 2
+    },
+    "flat_mount_and_realpath_probe": "passed"
+  },
+  "zzz": {
+    "version": "3.3.0",
+    "debug_and_standalone_release": "Five DEXes and ARM64 engines loaded; blocked at HandlerThread/Looper setup",
+    "packaged_clean_prefix": "90-second bounded launch reaches Unity/SDK initialization but does not return or provide verified responsive UI; timeout exit 124",
+    "successful_openat_records": 2377,
+    "forbidden_art_framework_jar_opens": 0,
+    "live_engine_forbidden_mappings": [],
+    "gameplay_verified": false
+  },
+  "preexisting_local_files_in_tested_working_tree": {
+    "crates/pengudroid-cli/src/apphost.rs": "92f7c365bf187a7e0ec00f216dfc3125fb92981ac57266f58110e2a7736c74f6",
+    "crates/pengudroid-gleshim/src/lib.rs": "3b2dad806f09f4ac7cb20b610772b494c6578682ee387b14f906c9cdd1b5fb04",
+    "crates/pengudroid-vkshim/src/lib.rs": "a78a977375fda7c8749b4999ff2599fb50b9141c3bf19af87c380d40aa65b1ea"
+  },
+  "note": "These three local edits are preserved outside the new implementation commit; the AppImage is an experimental local working-tree build, not a published working-game release."
+}

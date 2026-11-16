@@ -9,6 +9,7 @@ pub const ENV: &str = "PENGUDROID_RUNTIME_MANIFEST";
 #[derive(Clone, Debug)]
 pub struct Runtime {
     pub root: PathBuf,
+    pub independent: bool,
     pub components: BTreeMap<String, PathBuf>,
     pub properties: BTreeMap<String, String>,
     mounts: Vec<(PathBuf, PathBuf)>,
@@ -41,6 +42,11 @@ impl Runtime {
         if value["schema"].as_u64() != Some(1) || value["target"].as_str() != Some("android17-x86_64") {
             return Err("unsupported component runtime schema/target".into());
         }
+        let independent = match value["profile"].as_str() {
+            None | Some("art") => false,
+            Some("pengu") => true,
+            Some(other) => return Err(format!("unsupported runtime profile: {other}")),
+        };
         let root = std::fs::canonicalize(descriptor.parent().ok_or("descriptor has no parent")?)
             .map_err(|e| e.to_string())?;
         let host = |value: &str| -> Result<PathBuf, String> {
@@ -63,8 +69,14 @@ impl Runtime {
             if name.is_empty() || name.contains('/') || name.contains('\0') { return Err("invalid component name".into()); }
             components.insert(name.clone(), host(directory.as_str().ok_or("invalid component directory")?)?);
         }
-        for required in ["apex-com.android.art", "apex-com.android.i18n", "framework", "config", "native", "platform"] {
-            if !components.contains_key(required) { return Err(format!("missing required runtime component: {required}")); }
+        let required: &[&str] = if independent { &["arm64-guest"] } else {
+            &["apex-com.android.art", "apex-com.android.i18n", "framework", "config", "native", "platform"]
+        };
+        for required in required {
+            if !components.contains_key(*required) { return Err(format!("missing required runtime component: {required}")); }
+        }
+        if independent && components.keys().any(|name| name != "arm64-guest") {
+            return Err("independent runtime excludes ART/framework components".into());
         }
         let mut properties = BTreeMap::new();
         for (key, val) in value["properties"].as_object().ok_or("missing runtime properties")? {
@@ -77,12 +89,16 @@ impl Runtime {
         let mut mounts = BTreeMap::new();
         for mount in value["mounts"].as_array().ok_or("missing runtime mounts")? {
             let source = guest(mount["guest"].as_str().ok_or("invalid guest mount")?)?;
+            if independent && !["/system/bin/arm64", "/system/lib64/arm64", "/system/etc/ld.config.arm64.txt"].contains(&source.to_str().unwrap_or("")) {
+                return Err("independent runtime permits only native ARM64 ABI mounts".into());
+            }
             let destination = host(mount["host"].as_str().ok_or("invalid host mount")?)?;
             if mounts.insert(source, destination).is_some() { return Err("duplicate Android mount".into()); }
         }
         let mut mounts: Vec<_> = mounts.into_iter().collect();
         mounts.sort_by_key(|(guest, _)| std::cmp::Reverse(guest.as_os_str().len()));
-        let runtime = Self { root, components, properties, mounts };
+        let runtime = Self { root, independent, components, properties, mounts };
+        if independent { return Ok(runtime); }
         let art = runtime.resolve(Path::new("/apex/com.android.art/lib64/libart.so"))
             .ok_or("no ART component mapping")?;
         use std::io::Read;
@@ -93,6 +109,26 @@ impl Runtime {
             return Err("component ART must be ELF64 little-endian x86_64".into());
         }
         Ok(runtime)
+    }
+
+    /// The legacy preparation tool used the same filename for provenance,
+    /// before component descriptors existed. Recognize only that exact format;
+    /// malformed or unknown component descriptors still fail closed.
+    pub fn from_root_if_component(root: &Path) -> Result<Option<Self>, String> {
+        let descriptor = root.join(DESCRIPTOR);
+        let raw = match std::fs::read(&descriptor) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect runtime descriptor: {error}")),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| format!("invalid runtime descriptor: {e}"))?;
+        if value["tool"].as_str() == Some("PenguDroid API-37 runtime preparation")
+            && value["schema"].as_u64() == Some(1) && value["sdk"].as_u64() == Some(37)
+            && value["architecture"].as_str() == Some("x86_64") && value["files"].is_object()
+            && value.get("components").is_none() && value.get("mounts").is_none() && value.get("target").is_none() {
+            return Ok(None);
+        }
+        Self::load(&descriptor).map(Some)
     }
 
     pub fn descriptor(&self) -> PathBuf { self.root.join(DESCRIPTOR) }
@@ -176,6 +212,37 @@ mod tests {
         fn save(&self, value: &serde_json::Value) { std::fs::write(self.0.join(DESCRIPTOR), serde_json::to_vec(value).unwrap()).unwrap(); }
         fn value(&self) -> serde_json::Value { serde_json::from_slice(&std::fs::read(self.0.join(DESCRIPTOR)).unwrap()).unwrap() }
         fn load(&self) -> Result<Runtime, String> { Runtime::load(&self.0.join(DESCRIPTOR)) }
+    }
+
+    #[test]
+    fn independent_native_profile_requires_no_art_and_refuses_framework_mounts() {
+        let fixture = Fixture::new();
+        let mut value = json!({"schema":1,"target":"android17-x86_64","profile":"pengu",
+            "components":{"arm64-guest":"components/native"},
+            "properties":{"ro.build.version.sdk":"37","ro.build.version.release":"17"},
+            "mounts":[{"guest":"/system/lib64/arm64","host":"components/native"}]});
+        // No ART file is present at all for this profile.
+        std::fs::remove_file(fixture.0.join("components/com.android.art/lib64/libart.so")).unwrap();
+        fixture.save(&value);
+        let runtime = fixture.load().unwrap(); assert!(runtime.independent);
+        assert!(runtime.resolve(Path::new("/apex/com.android.art/lib64/libart.so")).is_none());
+        value["mounts"][0]["guest"] = "/system/framework".into();fixture.save(&value);
+        assert!(fixture.load().unwrap_err().contains("native ARM64 ABI"));
+        value["mounts"][0]["guest"] = "/system/lib64/arm64".into();
+        value["components"]["framework"] = "components/framework".into();fixture.save(&value);
+        assert!(fixture.load().unwrap_err().contains("excludes ART/framework"));
+    }
+
+    #[test]
+    fn recognizes_legacy_provenance_without_weakening_component_validation() {
+        let fixture = Fixture::new();
+        fixture.save(&json!({"schema":1,"tool":"PenguDroid API-37 runtime preparation",
+            "sdk":37,"architecture":"x86_64","files":{}}));
+        assert!(Runtime::from_root_if_component(&fixture.0).unwrap().is_none());
+        let mut mixed = fixture.value(); mixed["components"] = json!({}); fixture.save(&mixed);
+        assert!(Runtime::from_root_if_component(&fixture.0).is_err());
+        fixture.save(&json!({"schema":1,"target":"broken"}));
+        assert!(Runtime::from_root_if_component(&fixture.0).is_err());
     }
 
     #[test]

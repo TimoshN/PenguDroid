@@ -2,6 +2,15 @@
 
 This document describes PenguDroid's control protocol and CLI. See [LIMITATIONS.md](LIMITATIONS.md) for compatibility boundaries and [ARCHITECTURE.md](ARCHITECTURE.md) for the translation layers.
 
+`doctor` currently gives the hosted/native compatibility estimate; it is not a
+DexVM API-conformance audit. Use `compat-index` and a Pengu runtime trace for that path.
+
+The independent Pengu profile refuses ART runtime setup/execution and never falls
+back to it. `PENGUDROID_COMPAT_REPORT=/path/report.json` records unresolved Java
+calls, placeholder JNI calls and mappings when a Pengu launch returns; hangs may
+prevent the final report. `PENGUDROID_VM_STRICT=1` rejects missing Java methods.
+See [independent runtime contracts](INDEPENDENT_RUNTIME.md).
+
 ## Command line
 
 | Command | Description | Status |
@@ -11,7 +20,8 @@ This document describes PenguDroid's control protocol and CLI. See [LIMITATIONS.
 | `pengudroid stop` | Stop the daemon and wait for its socket to disappear. | Working |
 | `pengudroid demo` | Open the built-in demo window; no APK required. | Working; requires a Wayland session |
 | `pengudroid native <apk>` / `--lib lib.so` | Run a NativeActivity app without ART; `--isolate` adds seccomp. | Working |
-| `pengudroid launch <app.apk>` | Launch with an app-specific prefix under `~/.local/share/pengudroid/prefixes/<pkg>`. Reads overrides from `pengudroid.env` and selects the `native` or `art` backend from the APK. Supports `--backend`, `--prefix`, and `--runtime` (`--sysroot` remains a legacy alias). | Working |
+| `pengudroid launch <app.apk>` | Launch with an app-specific prefix under `~/.local/share/pengudroid/prefixes/<pkg>`. Reads overrides from `pengudroid.env` and selects `native` or `art` automatically, or `pengu` explicitly (`--backend pengu` / `PENGUDROID_BACKEND=pengu`). Supports `--backend`, `--prefix`, and `--runtime` (`--sysroot` remains a legacy alias). | Working |
+| `pengudroid compat-index` | Emit JSON for the effective JNI table and current ART/framework mappings. Wiring is not semantic conformance. | Working |
 | `pengudroid extract <file> [--dest DIR] [--abi A]` | Extract `.apk`, `.apkm`, `.xapk`, or `.apks` packages, including base APK, ABI-filtered splits, and OBB data under `Android/obb/<pkg>/`. | Working |
 | `pengudroid doctor <apk>` | Report whether an APK can run and what it is missing. | Working |
 | `pengudroid runtime --modules <store>` | Install/update descriptor-backed runtime components without materializing a sysroot; atomic activation retains previous generations. See [modular runtime](MODULAR_RUNTIME.md). | Working |

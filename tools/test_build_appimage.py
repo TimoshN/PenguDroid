@@ -42,6 +42,12 @@ class ScriptTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_independent_profile_refuses_android_payload_options(self):
+        for arguments in [("--pengu", "--with-runtime"), ("--pengu", "--with-modules", "/unused/store")]:
+            result = run(*arguments)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("excludes ART/framework", result.stderr)
+
     def test_rejects_an_unknown_option(self):
         result = run("--definitely-not-an-option")
         self.assertEqual(result.returncode, 2)
@@ -59,6 +65,28 @@ class AppDirTests(unittest.TestCase):
         # the tree layout it expects; copying the repo is too expensive, so only
         # the paths the script touches are mirrored.
         self.appdir = REPO / "target" / "appimage" / "PenguDroid.AppDir"
+
+    def test_independent_appdir_does_not_provision_or_load_android_runtime(self):
+        if not all((RELEASE / name).is_file() for name in ARTIFACTS):
+            self.skipTest("release artifacts are not built")
+        result = run("--skip-build", "--pengu", "--no-image")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.appdir / "usr/share/pengudroid/pengu-backend").is_file())
+        forbidden = {"libart.so", "libartd.so", "libandroid_runtime.so", "libhwui.so", "libandroidfw.so", "framework.jar", "core-oj.jar", "core-libart.jar"}
+        self.assertFalse([str(path) for path in self.appdir.rglob("*") if path.name in forbidden or path.suffix == ".jar"])
+        environment = dict(os.environ, PENGUDROID_RUNTIME_MANIFEST="/missing/should-not-be-loaded.json",
+            PENGUDROID_SYSROOT="/missing/legacy-system", PENGUDROID_RUNTIME_MODULES="/missing/modules")
+        result = subprocess.run(["sh", str(self.appdir / "AppRun"), "--cli", "compat-index"],
+            env=environment, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import json
+        data = json.loads(result.stdout)
+        self.assertEqual(data["forbidden_android_runtime_mappings"], [])
+        self.assertGreater(len(data["wired_jni_slots"]), 0)
+        result = subprocess.run(["sh", str(self.appdir / "AppRun"), "--cli", "runtime", "--download"],
+            env=environment, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("independent profile excludes", result.stderr)
 
     def test_assembled_layout(self):
         if not all((RELEASE / name).is_file() for name in ARTIFACTS):

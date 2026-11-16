@@ -26,7 +26,9 @@ impl RunningApp {
             .map_err(|e| e.to_string())?;
         let mut cmd = Command::new(pengudroid_binary());
         cmd.arg("launch").arg(&entry.apk);
-        if let Some(sysroot) = sysroot() { cmd.arg("--runtime").arg(sysroot); }
+        if !using_pengu_backend() {
+            if let Some(sysroot) = sysroot() { cmd.arg("--runtime").arg(sysroot); }
+        }
         launch_preferences(&mut cmd, fps, keymapper);
         cmd.env("PENGUDROID_APP_LABEL", &entry.label)
             .stdin(Stdio::null()).stdout(log.try_clone().map_err(|e| e.to_string())?)
@@ -84,7 +86,13 @@ fn launch_preferences(cmd: &mut Command, fps: bool, keymapper: bool) {
 }
 
 /// Whether first-run setup has an offline store or explicit download opt-in.
+fn using_pengu_backend() -> bool {
+    std::env::var("PENGUDROID_BACKEND").as_deref() == Ok("pengu")
+        || std::env::var("PENGUDROID_INDEPENDENT").as_deref() == Ok("1")
+}
+
 pub fn should_prepare_runtime() -> bool {
+    if using_pengu_backend() { return false; }
     if std::env::var("PENGUDROID_AUTO_RUNTIME").as_deref() == Ok("0") {
         return false;
     }

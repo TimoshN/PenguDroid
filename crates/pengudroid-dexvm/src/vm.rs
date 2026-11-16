@@ -1,6 +1,6 @@
 //! Dalvik bytecode VM, class loader, and method dispatcher.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
 
@@ -13,8 +13,18 @@ pub type NativeLoaderFn = Box<dyn FnMut(&str) -> Result<(), String>>;
 pub type SymbolResolverFn = Box<dyn FnMut(&str, &str) -> Option<usize>>;
 pub type PointerWrapperFn = Box<dyn FnMut(usize, &str) -> Option<usize>>;
 
+struct IndexedClass {
+    dex: usize,
+    class: usize,
+    direct: HashMap<String, HashMap<String, usize>>,
+    virtual_methods: HashMap<String, HashMap<String, usize>>,
+}
+
 pub struct Vm {
-    pub dexes: Vec<DexFile>,
+    dexes: Vec<DexFile>,
+    classes: HashMap<String, IndexedClass>,
+    native_calls: HashMap<String, std::rc::Rc<crate::native_abi::NativeCall>>,
+    pub missing_methods: BTreeMap<String, u64>,
     pub static_fields: HashMap<String, Value>,
     pub clinit_done: HashSet<String>,
     pub native_dirs: Vec<PathBuf>,
@@ -41,6 +51,9 @@ impl Vm {
         }
         Self {
             dexes: Vec::new(),
+            classes: HashMap::new(),
+            native_calls: HashMap::new(),
+            missing_methods: BTreeMap::new(),
             static_fields,
             clinit_done: HashSet::new(),
             native_dirs: Vec::new(),
@@ -71,6 +84,35 @@ impl Vm {
 
     pub fn load_dex(&mut self, bytes: &[u8]) -> Result<(), String> {
         let dex = DexFile::parse(bytes)?;
+        self.load_parsed_dex(dex)
+    }
+
+    /// Add an already parsed DEX. Class identity follows first-definition wins,
+    /// as before; adding a later split cannot replace an existing class.
+    pub fn load_parsed_dex(&mut self, dex: DexFile) -> Result<(), String> {
+        let di = self.dexes.len();
+        let mut indexed = Vec::with_capacity(dex.classes.len());
+        for (ci, class) in dex.classes.iter().enumerate() {
+            let index_methods = |methods: &[EncodedMethod]| -> Result<HashMap<String, HashMap<String, usize>>, String> {
+                let mut index: HashMap<String, HashMap<String, usize>> = HashMap::new();
+                for (i, method) in methods.iter().enumerate() {
+                    let id = dex.methods.get(method.method_idx).ok_or("invalid encoded method index")?;
+                    index.entry(id.name.clone()).or_default().entry(id.descriptor.clone()).or_insert(i);
+                }
+                Ok(index)
+            };
+            indexed.push((class.name.clone(), IndexedClass {
+                dex: di, class: ci,
+                direct: index_methods(&class.direct_methods)?,
+                virtual_methods: index_methods(&class.virtual_methods)?,
+            }));
+        }
+        for (name, index) in indexed {
+            if !self.classes.contains_key(&name) {
+                self.clinit_done.remove(&name);
+                self.classes.insert(name, index);
+            }
+        }
         self.dexes.push(dex);
         Ok(())
     }
@@ -92,13 +134,18 @@ impl Vm {
         self.static_fields.insert("PENGUDROID_DATA_DIR".into(), Value::Ref(Some(d)));
     }
 
+    pub fn set_split_apks(&mut self, paths: &[String]) {
+        let mut state = jni_state().lock().unwrap();
+        let values = paths.iter().map(|path| Some(state.heap.new_string(path.clone()))).collect();
+        let array = state.heap.alloc(HeapObject::Array {
+            type_desc: "[Ljava/lang/String;".into(), data: ArrayData::Object(values),
+        });
+        self.static_fields.insert("PENGUDROID_SPLIT_APKS".into(), Value::Ref(Some(array)));
+    }
+
     pub fn find_class(&self, class_name: &str) -> Option<(usize, &ClassDef)> {
-        for (di, dex) in self.dexes.iter().enumerate() {
-            if let Some(&ci) = dex.class_by_name.get(class_name) {
-                return Some((di, &dex.classes[ci]));
-            }
-        }
-        None
+        let index = self.classes.get(class_name)?;
+        Some((index.dex, &self.dexes[index.dex].classes[index.class]))
     }
 
     fn find_method_in_hierarchy(
@@ -116,28 +163,15 @@ impl Vm {
             }
             depth += 1;
             if let Some((di, cls)) = self.find_class(&cname) {
-                let dex = &self.dexes[di];
-                let list = if is_virtual {
-                    &cls.virtual_methods
+                let index = self.classes.get(&cname)?;
+                let (first, second, first_methods, second_methods) = if is_virtual {
+                    (&index.virtual_methods, &index.direct, &cls.virtual_methods, &cls.direct_methods)
                 } else {
-                    &cls.direct_methods
+                    (&index.direct, &index.virtual_methods, &cls.direct_methods, &cls.virtual_methods)
                 };
-                for m in list {
-                    let mid = &dex.methods[m.method_idx];
-                    if mid.name == name && mid.descriptor == descriptor {
-                        return Some((di, cname, m.clone()));
-                    }
-                }
-                // Fallback: search the other list if not found (e.g., private/direct).
-                let other = if is_virtual {
-                    &cls.direct_methods
-                } else {
-                    &cls.virtual_methods
-                };
-                for m in other {
-                    let mid = &dex.methods[m.method_idx];
-                    if mid.name == name && mid.descriptor == descriptor {
-                        return Some((di, cname, m.clone()));
+                for (map, methods) in [(first, first_methods), (second, second_methods)] {
+                    if let Some(&i) = map.get(name).and_then(|overloads| overloads.get(descriptor)) {
+                        return Some((di, cname, methods[i].clone()));
                     }
                 }
                 cur = cls.superclass.clone();
@@ -263,7 +297,10 @@ impl Vm {
                 }
                 self.wrapped_natives.insert(key);
             }
-            return self.call_jni_native(fn_ptr, class_name, descriptor, args, !is_virtual);
+            let is_static = self.find_method_in_hierarchy(class_name, method_name, descriptor, is_virtual)
+                .map(|(_, _, method)| method.access_flags & 0x0008 != 0)
+                .unwrap_or(!is_virtual);
+            return self.call_jni_native(fn_ptr, class_name, descriptor, args, is_static);
         }
 
         // Built-in Java / Android framework classes (walk builtin_superclass chain too).
@@ -363,8 +400,14 @@ impl Vm {
             }
         }
 
-        if self.trace {
-            eprintln!("[pengu-vm] stubbed missing {class_name}.{method_name}{descriptor}");
+        let signature = format!("{class_name}.{method_name}{descriptor}");
+        let count = self.missing_methods.entry(signature.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            eprintln!("[pengu-vm] UNIMPLEMENTED method {signature}");
+        }
+        if std::env::var_os("PENGUDROID_VM_STRICT").is_some() {
+            return Err(format!("unimplemented method {signature}"));
         }
         Ok(default_return_for_descriptor(descriptor))
     }
@@ -400,67 +443,30 @@ impl Vm {
     }
 
     fn call_jni_native(
-        &self,
-        fn_ptr: usize,
-        class_desc: &str,
-        descriptor: &str,
-        args: &[Value],
-        is_static: bool,
+        &mut self, fn_ptr: usize, class_desc: &str, descriptor: &str,
+        args: &[Value], is_static: bool,
     ) -> Result<Value, String> {
         let env = jni_env_ptr();
-        let (cls_or_this, param_start) = if !is_static {
-            if let Some(first) = args.first() {
-                (first.as_ref().unwrap_or(0) as *mut c_void, 1usize)
-            } else {
-                let mut st = jni_state().lock().unwrap();
-                (st.heap.class_object(class_desc) as *mut c_void, 0usize)
-            }
+        let (receiver, params) = if is_static {
+            let mut state = jni_state().lock().unwrap();
+            (state.heap.class_object(class_desc) as *mut c_void, args)
         } else {
-            let mut st = jni_state().lock().unwrap();
-            (st.heap.class_object(class_desc) as *mut c_void, 0usize)
+            let receiver = args.first().and_then(Value::as_ref).ok_or("null JNI native receiver")?;
+            (receiver as *mut c_void, &args[1..])
         };
-        let ret_char = descriptor
-            .rsplit(')')
-            .next()
-            .and_then(|r| r.chars().next())
-            .unwrap_or('V');
-
-        let a1 = args.get(param_start).map(value_to_ffi).unwrap_or(0);
-        let a2 = args.get(param_start + 1).map(value_to_ffi).unwrap_or(0);
-        let a3 = args.get(param_start + 2).map(value_to_ffi).unwrap_or(0);
-        if self.trace {
-            eprintln!("[pengu-vm] call_jni_native {class_desc}{descriptor} is_static={is_static} fn=0x{fn_ptr:x} a1=0x{a1:x}");
-        } else if std::env::var_os("PENGUDROID_TRACE_FRAMES").is_some()
-            && descriptor == "()Z"
-            && class_desc.contains("UnityPlayer")
-        {
-            static FRAME_NUM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = FRAME_NUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            eprintln!("[pengu-vm] frame-call #{n} {class_desc}{descriptor} ENTER");
-            if n >= 2 && std::env::var_os("PENGUDROID_TRACE_FRAME2").is_some() {
-                std::env::set_var("PENGUDROID_TRACE_VM", "1");
-            }
+        let shorty = descriptor_to_shorty(descriptor);
+        if !self.native_calls.contains_key(&shorty) {
+            self.native_calls.insert(shorty.clone(), std::rc::Rc::new(crate::native_abi::NativeCall::new(&shorty)?));
         }
-
-        unsafe {
-            type F3 = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize, usize) -> usize;
-            let f: F3 = std::mem::transmute(fn_ptr);
-            let r = f(env, cls_or_this, a1, a2, a3);
-            if self.trace {
-                eprintln!("[pengu-vm] call_jni_native <- {class_desc}{descriptor} r=0x{r:x}");
-            } else if std::env::var_os("PENGUDROID_TRACE_FRAMES").is_some()
-                && descriptor == "()Z"
-                && class_desc.contains("UnityPlayer")
-            {
-                eprintln!("[pengu-vm] frame-call {class_desc}{descriptor} EXIT r=0x{r:x}");
-            }
-            Ok(match ret_char {
-                'V' => Value::Void,
-                'J' => Value::Long(r as i64),
-                'L' | '[' => Value::Ref(if r == 0 { None } else { Some(r) }),
-                _ => Value::Int(r as i32),
-            })
+        // JNI can reenter the VM; keep the prepared interface alive without
+        // retaining a map borrow across the foreign call.
+        let interface = std::rc::Rc::clone(&self.native_calls[&shorty]);
+        if self.trace { eprintln!("[pengu-vm] call_jni_native {class_desc}{descriptor} static={is_static} receiver={receiver:p}"); }
+        let result = unsafe { interface.call(fn_ptr, env, receiver, params) };
+        if let Some(exception) = crate::jni_host::take_pending_exception() {
+            self.pending_exception = Some(exception);
         }
+        result
     }
 
     pub fn new_instance(&mut self, class_name: &str) -> Result<ObjId, String> {
@@ -483,6 +489,7 @@ impl Vm {
                 .invoke_method(class_desc, name, sig, args, true)
                 .unwrap_or(Value::Void);
             if let Some(exc_id) = vm.pending_exception.take() {
+                crate::jni_host::set_pending_exception_object(exc_id);
                 if vm.trace {
                     eprintln!("[pengu-jni] uncaught Dalvik exception in {class_desc}.{name}{sig} obj={exc_id}");
                 }
@@ -490,7 +497,7 @@ impl Vm {
             vm.pending_exception = saved_exc;
             res
         }
-        crate::jni_host::set_vm_invoker(self as *mut Vm as usize, vm_jni_invoke_trampoline);
+        let _invoker = crate::jni_host::scoped_vm_invoker(self as *mut Vm as usize, vm_jni_invoke_trampoline);
         let obj = self.new_instance(activity_class)?;
         self.invoke_method(activity_class, "<init>", "()V", &[Value::Ref(Some(obj))], false)?;
         if let Some(exc_id) = self.pending_exception.take() {
@@ -1419,7 +1426,7 @@ fn jni_mangle_name(class_desc: &str, method_name: &str) -> String {
     format!("Java_{cls}_{meth}")
 }
 
-fn descriptor_to_shorty(sig: &str) -> String {
+pub(crate) fn descriptor_to_shorty(sig: &str) -> String {
     let mut params = String::new();
     let mut ret = String::new();
     let mut chars = sig.chars().peekable();

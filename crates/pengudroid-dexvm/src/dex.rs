@@ -5,6 +5,7 @@
 //! and `code_item` (registers, insns, try/catch handlers).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct DexFile {
@@ -61,7 +62,7 @@ pub struct EncodedField {
 pub struct EncodedMethod {
     pub method_idx: usize,
     pub access_flags: u32,
-    pub code: Option<CodeItem>,
+    pub code: Option<Arc<CodeItem>>,
 }
 
 #[derive(Debug, Clone)]
@@ -399,7 +400,7 @@ impl DexFile {
                     let flags = c.uleb128()?;
                     let code_off = c.uleb128()?;
                     let code = if code_off != 0 {
-                        Some(parse_code_item(data, code_off, &types)?)
+                        Some(Arc::new(parse_code_item(data, code_off, &types)?))
                     } else {
                         None
                     };
@@ -411,7 +412,7 @@ impl DexFile {
                     let flags = c.uleb128()?;
                     let code_off = c.uleb128()?;
                     let code = if code_off != 0 {
-                        Some(parse_code_item(data, code_off, &types)?)
+                        Some(Arc::new(parse_code_item(data, code_off, &types)?))
                     } else {
                         None
                     };

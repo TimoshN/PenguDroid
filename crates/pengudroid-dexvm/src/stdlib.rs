@@ -72,6 +72,10 @@ pub fn try_invoke_builtin(
     descriptor: &str,
     args: &[Value],
 ) -> Result<BuiltinResult, String> {
+    let atomic = crate::stdlib_sync::try_invoke(heap, class_name, method_name, args)?;
+    if !matches!(atomic, BuiltinResult::NotBuiltin) { return Ok(atomic); }
+    let filesystem = crate::stdlib_fs::try_invoke(heap, static_fields, class_name, method_name, descriptor, args)?;
+    if !matches!(filesystem, BuiltinResult::NotBuiltin) { return Ok(filesystem); }
     if class_name.starts_with('[') && method_name == "clone" {
         if let Some(id) = args.first().and_then(|v| v.as_ref()) {
             if let Some(HeapObject::Array { type_desc, data }) = heap.get(id).cloned() {
@@ -208,8 +212,8 @@ pub fn try_invoke_builtin(
             let len = args
                 .first()
                 .and_then(|v| v.as_ref())
-                .and_then(|id| heap.as_str(id))
-                .map(|s| s.encode_utf16().count() as i32)
+                .and_then(|id| heap.utf16(id))
+                .map(|s| s.len() as i32)
                 .unwrap_or(0);
             Ok(BuiltinResult::Handled(Value::Int(len)))
         }
@@ -1287,6 +1291,9 @@ pub fn try_invoke_builtin(
                 fields.insert("nativeLibraryDir".into(), lib_dir);
                 fields.insert("sourceDir".into(), apk_path.clone());
                 fields.insert("publicSourceDir".into(), apk_path);
+                let splits = static_fields.get("PENGUDROID_SPLIT_APKS").cloned().unwrap_or(Value::Ref(None));
+                fields.insert("splitSourceDirs".into(), splits.clone());
+                fields.insert("splitPublicSourceDirs".into(), splits);
                 fields.insert("dataDir".into(), data_dir);
                 fields.insert("packageName".into(), pkg);
             }
@@ -1663,6 +1670,10 @@ pub fn try_invoke_builtin(
         ("Ljava/util/concurrent/Semaphore;", "tryAcquire") => {
             Ok(BuiltinResult::Handled(Value::Int(1)))
         }
+        ("Landroid/os/Handler;", "obtainMessage") => {
+            let descriptor = format!("(Landroid/os/Handler;{}", descriptor.strip_prefix('(').ok_or("invalid Handler.obtainMessage descriptor")?);
+            return try_invoke_builtin(heap, static_fields, "Landroid/os/Message;", "obtain", &descriptor, args);
+        }
         ("Landroid/os/Message;", "obtain") => {
             let msg = heap.new_instance("Landroid/os/Message;");
             let target = args.first().cloned().unwrap_or(Value::Ref(None));
@@ -1678,6 +1689,11 @@ pub fn try_invoke_builtin(
                     "(Landroid/os/Handler;ILjava/lang/Object;)Landroid/os/Message;" => {
                         fields.insert("what".into(), args.get(1).cloned().unwrap_or(Value::Int(0)));
                         fields.insert("obj".into(), args.get(2).cloned().unwrap_or(Value::Ref(None)));
+                    }
+                    "(Landroid/os/Handler;III)Landroid/os/Message;" => {
+                        fields.insert("what".into(), args.get(1).cloned().unwrap_or(Value::Int(0)));
+                        fields.insert("arg1".into(), args.get(2).cloned().unwrap_or(Value::Int(0)));
+                        fields.insert("arg2".into(), args.get(3).cloned().unwrap_or(Value::Int(0)));
                     }
                     "(Landroid/os/Handler;IIILjava/lang/Object;)Landroid/os/Message;" => {
                         fields.insert("what".into(), args.get(1).cloned().unwrap_or(Value::Int(0)));

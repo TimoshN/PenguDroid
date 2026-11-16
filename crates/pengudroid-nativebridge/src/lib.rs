@@ -352,7 +352,17 @@ impl Translator {
     /// The argument order is the header's, not a guess: the bridge compares
     /// `instruction_set` against `kGuestIsa`. `private_dir` is where the bridge
     /// may keep translation caches.
-    pub fn initialize(&mut self, runtime: &RuntimeCallbacks, private_dir: &Path, isa: &str) -> Result<(), Error> {
+    /// The bridge retains the callback table for later JNI calls, potentially
+    /// until process exit. Requiring static storage prevents a stack-use-after-
+    /// return that otherwise appears only in optimized builds.
+    ///
+    /// ```compile_fail
+    /// use pengudroid_nativebridge::{Translator, RuntimeCallbacks};
+    /// fn initialize(bridge: &mut Translator, callbacks: RuntimeCallbacks) {
+    ///     bridge.initialize(&callbacks, std::path::Path::new("cache"), "arm64");
+    /// }
+    /// ```
+    pub fn initialize(&mut self, runtime: &'static RuntimeCallbacks, private_dir: &Path, isa: &str) -> Result<(), Error> {
         let callbacks = unsafe { &*self.callbacks };
         let init = callbacks.initialize.ok_or(Error::MissingSlot("initialize"))?;
         let dir = CString::new(private_dir.as_os_str().as_encoded_bytes())
