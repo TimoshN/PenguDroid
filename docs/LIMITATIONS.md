@@ -19,14 +19,15 @@ whether an arbitrary APK works.
 
 ## Independent VM gaps
 
-- Real concurrent Java execution, HandlerThread/Looper ownership, JNI attachment
-  and asynchronous callbacks are incomplete. Synchronous builtin helpers are not
-  a replacement for Android's scheduling model.
+- OS-backed Java workers and owned HandlerThread/Looper queues are implemented.
+  Scheduler priorities, fair Semaphore scheduling, executors and full lifecycle
+  teardown remain incomplete. Choreographer uses a software frame clock.
+  See [tested threading contracts](DEXVM_THREADING.md).
 - Reflection, class/field metadata, resources, View layout and framework services
   have large gaps. Some prototype builtins/defaults remain placeholders.
 - Independent WebView/Chromium, Android network/TLS services and many application
   platform APIs are not implemented.
-- Heap collection, reference lifetime, monitor semantics, verification and complete
+- Heap collection, reference lifetime, verification and complete
   exception behavior remain open. JNI UTF-16 roundtrips do not prove every
   `java.lang.String` operation preserves every edge case.
 - Native calls now preserve typed arguments/returns and the JNI call families have
@@ -35,8 +36,9 @@ whether an arbitrary APK works.
   Independent DexVM still needs the corresponding device/UI dispatch integration.
 
 Unimplemented methods and JNI slots are logged. `PENGUDROID_VM_STRICT=1` rejects
-missing Java calls. A final compatibility report is written only when activity
-launch returns; a native hang needs its trace log and thread diagnosis.
+missing Java calls. The compatibility report starts when activity
+launch returns and includes worker counts/errors. Bounded main-loop audits refresh
+it periodically; a native hang still needs its trace log and thread diagnosis.
 
 ## Current application evidence
 

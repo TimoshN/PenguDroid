@@ -1167,7 +1167,10 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
                             .load_library(Path::new(so_path))
                             .map_err(|e| format!("bridge load_library({so_path}): {e}"))?;
                         st.2.insert(so_path.to_string());
-                        if let Ok(on_load_ptr) = st.0.jni_on_load(&lib) {
+                        let on_load_ptr = st.0.jni_on_load(&lib).ok();
+                        st.1.push(lib);
+                        drop(st);
+                        if let Some(on_load_ptr) = on_load_ptr {
                             type FnOnLoad = unsafe extern "C" fn(
                                 *mut std::ffi::c_void,
                                 *mut std::ffi::c_void,
@@ -1183,7 +1186,6 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
                                 return Err(format!("JNI_OnLoad({so_path}) returned {ver}"));
                             }
                         }
-                        st.1.push(lib);
                         Ok(())
                     }));
                     let sym_state = std::rc::Rc::clone(&bridge_state);
@@ -1263,20 +1265,37 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
         eprintln!("pengudroid vm: independent backend found forbidden Android runtime mappings: {violations:?}");
         return 1;
     }
-    let result = vm.launch_activity(&desc);
+    {
+        let mut state = pengudroid_dexvm::jni_host::jni_state().lock().unwrap();
+        let bundle = state.heap.new_instance("Landroid/os/Bundle;");
+        let values: Vec<_> = info.application_meta.iter().map(|(name,value)| {
+            let value = match value {
+                apk::MetaValue::Str(s) => pengudroid_dexvm::Value::Ref(Some(state.heap.new_string(s.clone()))),
+                apk::MetaValue::Int(v) => pengudroid_dexvm::Value::Int(*v),
+                apk::MetaValue::Bool(v) => pengudroid_dexvm::Value::Int(*v as i32),
+                apk::MetaValue::Ref(v) | apk::MetaValue::ValueRef(v) => pengudroid_dexvm::Value::Int(*v as i32),
+            }; (name.clone(),value)
+        }).collect();
+        if let Some(pengudroid_dexvm::HeapObject::Instance{fields,..})=state.heap.get_mut(bundle){fields.extend(values);}
+        vm.static_fields.insert("PENGUDROID_MANIFEST_META".into(),pengudroid_dexvm::Value::Ref(Some(bundle)));
+    }
+    let application = info.application_class.as_ref().map(|name|format!("L{};",name.replace('.',"/"))).unwrap_or_else(||"Landroid/app/Application;".into());
+    let result = vm.launch_application(&application).and_then(|_| vm.launch_activity(&desc));
     let violations = match loaded_android_runtime_components() {
         Ok(paths) => paths,
         Err(error) => { eprintln!("pengudroid vm: cannot verify runtime mappings: {error}"); return 1; }
     };
     let missing_jni = pengudroid_dexvm::jni_host::missing_jni_calls();
+    let write_report = |vm: &pengudroid_dexvm::Vm, phase: &str| {
     if let Some(path) = std::env::var_os("PENGUDROID_COMPAT_REPORT") {
         let report = serde_json::json!({
-            "schema": 1, "version": env!("CARGO_PKG_VERSION"), "backend": "pengu",
+            "schema": 1, "observation_phase": phase, "version": env!("CARGO_PKG_VERSION"), "backend": "pengu",
             "package": info.package, "launch_returned": result.is_ok(),
             "launch_error": result.as_ref().err(), "gameplay_verified": false,
             "forbidden_android_runtime_mappings": violations,
-            "missing_methods": vm.missing_methods,
-            "unimplemented_jni_calls": missing_jni,
+            "missing_methods": vm.all_missing_methods(),
+            "worker_failures": vm.worker_failures(),
+            "unimplemented_jni_calls": pengudroid_dexvm::jni_host::missing_jni_calls(),
             "jni_table": {"function_slots": 229, "wired_slots": pengudroid_dexvm::jni_host::wired_jni_slots(),
                 "note": "Wired handlers include partial implementations; this is not an Android compatibility percentage."}
         });
@@ -1284,16 +1303,27 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
             eprintln!("pengudroid vm: cannot write compatibility report: {error}");
         }
     }
+    };
+    write_report(&vm, "activity_lifecycle_returned");
     if !violations.is_empty() { eprintln!("pengudroid vm: unexpected ART/framework mapping: {violations:?}"); return 1; }
-    match result {
+    match &result {
         Ok(_) => {
-            println!("pengudroid vm: launch_activity returned ({} unimplemented method(s), {} unimplemented JNI slot(s); rendering not verified)", vm.missing_methods.len(), missing_jni.len());
-            let wait_secs = std::env::var("PENGUDROID_PENGU_WAIT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            if wait_secs > 0 {
-                std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+            println!("pengudroid vm: launch_activity returned ({} unimplemented method(s), {} unimplemented JNI slot(s); rendering not verified)", vm.all_missing_methods().len(), missing_jni.len());
+            if let Ok(seconds) = std::env::var("PENGUDROID_PENGU_WAIT_SECS") {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds.parse().unwrap_or(0));
+                let mut next_report = std::time::Instant::now();
+                while std::time::Instant::now() < deadline {
+                    if std::time::Instant::now() >= next_report {
+                        write_report(&vm, "main_queue_running");
+                        next_report = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    }
+                    if let Err(error) = vm.pump_main_messages() { eprintln!("pengudroid vm: main queue failed: {error}"); return 1; }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                vm.shutdown_workers();
+                write_report(&vm, "bounded_run_finished");
+            } else if let Err(error) = vm.run_main_loop() {
+                eprintln!("pengudroid vm: main Looper failed: {error}"); return 1;
             }
             0
         }

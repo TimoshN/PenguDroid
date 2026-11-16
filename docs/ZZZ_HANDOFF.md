@@ -16,8 +16,13 @@ The release build previously crashed immediately after `GetMethodID` for
 while the translator retains that pointer. Static storage and an API lifetime
 requirement fix this; both optimized and debug binaries now reach worker setup.
 
-The current blocker is worker/handler initialization: `HandlerThread` constructor,
-`start`, `getLooper` and actual Java thread/event-loop execution are incomplete.
+The worker/handler blocker is fixed in the current source: real OS workers,
+thread-owned Loopers, queued callbacks, shared DEX statics/class initialization,
+monitors and JNI attachment are present. SDK primitive types, collection class
+identity and dynamic proxies were also required to reach repeated `nativeRender`
+calls. Subsequent traces expose resource/UI, Android service, builtin reflection,
+asset-pack task and MethodHandle gaps. Native rendering calls are not evidence
+of a visible, responsive login or gameplay. [Implementation and limits](DEXVM_THREADING.md).
 The earlier ART login screenshot does not validate the independent backend.
 See [the runtime audit](INDEPENDENT_RUNTIME.md) and [observed missing calls](compatibility/index.json).
 

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::dex::{ClassDef, CodeItem, DexFile, EncodedMethod};
 use crate::jni_host::{jni_env_ptr, jni_state, load_native_library, lookup_native};
@@ -13,7 +14,8 @@ pub type NativeLoaderFn = Box<dyn FnMut(&str) -> Result<(), String>>;
 pub type SymbolResolverFn = Box<dyn FnMut(&str, &str) -> Option<usize>>;
 pub type PointerWrapperFn = Box<dyn FnMut(usize, &str) -> Option<usize>>;
 
-struct IndexedClass {
+#[derive(Clone)]
+pub(crate) struct IndexedClass {
     dex: usize,
     class: usize,
     direct: HashMap<String, HashMap<String, usize>>,
@@ -21,8 +23,8 @@ struct IndexedClass {
 }
 
 pub struct Vm {
-    dexes: Vec<DexFile>,
-    classes: HashMap<String, IndexedClass>,
+    pub(crate) dexes: Vec<Arc<DexFile>>,
+    pub(crate) classes: Arc<HashMap<String, IndexedClass>>,
     native_calls: HashMap<String, std::rc::Rc<crate::native_abi::NativeCall>>,
     pub missing_methods: BTreeMap<String, u64>,
     pub static_fields: HashMap<String, Value>,
@@ -31,9 +33,12 @@ pub struct Vm {
     pub native_loader: Option<NativeLoaderFn>,
     pub symbol_resolver: Option<SymbolResolverFn>,
     pub pointer_wrapper: Option<PointerWrapperFn>,
-    pub wrapped_natives: HashSet<(String, String, String)>,
+    pub wrapped_natives: Arc<Mutex<HashMap<(String, String, String), usize>>>,
     pub pending_exception: Option<ObjId>,
     pub trace: bool,
+    pub(crate) threads: Arc<crate::threads::ThreadRuntime>,
+    pub(crate) needs_bridge: bool,
+    pub(crate) owns_runtime: bool,
 }
 
 impl Default for Vm {
@@ -51,7 +56,7 @@ impl Vm {
         }
         Self {
             dexes: Vec::new(),
-            classes: HashMap::new(),
+            classes: Arc::new(HashMap::new()),
             native_calls: HashMap::new(),
             missing_methods: BTreeMap::new(),
             static_fields,
@@ -60,8 +65,11 @@ impl Vm {
             native_loader: None,
             symbol_resolver: None,
             pointer_wrapper: None,
-            wrapped_natives: HashSet::new(),
+            wrapped_natives: Arc::new(Mutex::new(HashMap::new())),
             pending_exception: None,
+            threads: Arc::new(crate::threads::ThreadRuntime::default()),
+            needs_bridge: false,
+            owns_runtime: true,
             trace: std::env::var_os("PENGUDROID_TRACE_VM").is_some(),
         }
     }
@@ -75,6 +83,7 @@ impl Vm {
     }
 
     pub fn set_pointer_wrapper(&mut self, wrapper: PointerWrapperFn) {
+        self.needs_bridge = true;
         self.pointer_wrapper = Some(wrapper);
     }
 
@@ -110,10 +119,10 @@ impl Vm {
         for (name, index) in indexed {
             if !self.classes.contains_key(&name) {
                 self.clinit_done.remove(&name);
-                self.classes.insert(name, index);
+                Arc::make_mut(&mut self.classes).insert(name, index);
             }
         }
-        self.dexes.push(dex);
+        self.dexes.push(Arc::new(dex));
         Ok(())
     }
 
@@ -146,6 +155,31 @@ impl Vm {
     pub fn find_class(&self, class_name: &str) -> Option<(usize, &ClassDef)> {
         let index = self.classes.get(class_name)?;
         Some((index.dex, &self.dexes[index.dex].classes[index.class]))
+    }
+
+    pub fn is_assignable_from(&self,target:&str,source:&str)->bool {
+        if target==source {return true;}
+        if source.starts_with('[') {
+            if matches!(target,"Ljava/lang/Object;" | "Ljava/lang/Cloneable;" | "Ljava/io/Serializable;"){return true;}
+            if let Some(target)=target.strip_prefix('['){let source=&source[1..];return source.len()>1 && target.len()>1 && self.is_assignable_from(target,source);}
+            return false;
+        }
+        if target=="Ljava/lang/Object;" && source.starts_with('L'){return true;}
+        let mut pending=vec![source.to_string()];let mut visited=HashSet::new();
+        while let Some(class)=pending.pop(){if class==target{return true}if !visited.insert(class.clone()){continue}
+            if let Some((_,definition))=self.find_class(&class){pending.extend(definition.interfaces.iter().cloned());if let Some(parent)=&definition.superclass{pending.push(parent.clone());}}
+            else {pending.extend(crate::stdlib::builtin_interfaces(&class).iter().map(|s|s.to_string()));if let Some(parent)=builtin_superclass(&class){pending.push(parent.into());}}
+        }
+        false
+    }
+    pub fn is_instance_of(&self,object:ObjId,target:&str)->bool {
+        let (source,interfaces)={let state=jni_state().lock().unwrap();let Some(source)=state.heap.class_name(object).map(str::to_owned)else{return false};let object=state.heap.get(object).unwrap();
+            let interfaces=match object {HeapObject::Instance{fields,..} if source=="Ljava/lang/reflect/Proxy;"=>fields.get("interfaces").and_then(Value::as_ref).and_then(|id|match state.heap.get(id){Some(HeapObject::Array{data:ArrayData::Object(items),..})=>Some(items.iter().flatten().filter_map(|id|match state.heap.get(*id){Some(HeapObject::ClassObj(class))=>Some(class.clone()),_=>None}).collect::<Vec<_>>()),_=>None}).unwrap_or_default(),_=>Vec::new()};(source,interfaces)};
+        self.is_assignable_from(target,&source) || interfaces.iter().any(|source|self.is_assignable_from(target,source))
+    }
+
+    pub(crate) fn has_dex_method(&self, class: &str, method: &str, descriptor: &str) -> bool {
+        self.find_method_in_hierarchy(class, method, descriptor, true).is_some()
     }
 
     fn find_method_in_hierarchy(
@@ -183,20 +217,28 @@ impl Vm {
     }
 
     pub fn ensure_clinit(&mut self, class_name: &str) -> Result<(), String> {
-        if self.clinit_done.contains(class_name) {
-            return Ok(());
-        }
-        self.clinit_done.insert(class_name.to_string());
-        if let Some((di, _cname, m)) =
-            self.find_method_in_hierarchy(class_name, "<clinit>", "()V", false)
-        {
-            if _cname == class_name {
-                if let Some(code) = m.code {
-                    let _ = self.exec_code(di, &code, &[])?;
-                }
+        if self.clinit_done.contains(class_name) { return Ok(()); }
+        if !self.threads.begin_init(class_name)? { return Ok(()); }
+        let result = (|| {
+            if let Some((di, declaring, method)) = self.find_method_in_hierarchy(class_name,"<clinit>","()V",false) {
+                if declaring==class_name { if let Some(code)=method.code {self.exec_code(di,&code,&[])?;} }
             }
-        }
-        Ok(())
+            if self.pending_exception.is_some() { return Err(format!("ExceptionInInitializerError: {class_name}: {}",self.describe_exception(self.pending_exception.unwrap()))); }
+            Ok(())
+        })();
+        self.threads.finish_init(class_name,&result);
+        if result.is_ok() { self.clinit_done.insert(class_name.to_string()); }
+        result
+    }
+
+    pub fn all_missing_methods(&self) -> BTreeMap<String,u64> { self.threads.missing_methods.lock().unwrap().clone() }
+
+    fn builtin_exception(&mut self,error:String,descriptor:&str)->Result<Value,String> {
+        let name=error.split(':').next().unwrap_or("");
+        if !matches!(name,"NoSuchMethodException" | "NoSuchFieldException" | "NullPointerException" | "InterruptedException" | "IllegalMonitorStateException" | "IllegalThreadStateException" | "IllegalArgumentException" | "IllegalStateException" | "ClassCastException" | "RuntimeException") { return Err(error); }
+        let mut state=jni_state().lock().unwrap();let id=state.heap.new_instance(&format!("Ljava/lang/{name};"));let message=state.heap.new_string(error);
+        if let Some(HeapObject::Instance{fields,..})=state.heap.get_mut(id){fields.insert("detailMessage".into(),Value::Ref(Some(message)));}
+        self.pending_exception=Some(id);Ok(default_return_for_descriptor(descriptor))
     }
 
     pub fn invoke_method(
@@ -210,6 +252,14 @@ impl Vm {
         if self.trace {
             eprintln!("[pengu-vm] invoke {class_name}.{method_name}{descriptor}");
         }
+        let resolved_method = self.find_method_in_hierarchy(class_name, method_name, descriptor, is_virtual);
+        let synchronization = resolved_method.clone().filter(|(_,_,m)| m.access_flags & 0x20 != 0);
+        let _monitor = if let Some((_, declaring, method)) = synchronization {
+            let object = if method.access_flags & 0x08 != 0 { jni_state().lock().unwrap().heap.class_object(&declaring) }
+                else { args.first().and_then(Value::as_ref).ok_or("null synchronized receiver")? };
+            Some(crate::monitors::Guard::new(object))
+        } else { None };
+
         if class_name == "Ljava/lang/ClassLoader;" && method_name == "loadClass" {
             let name = args
                 .get(1)
@@ -247,47 +297,24 @@ impl Vm {
             }
             return Ok(Value::Ref(None));
         }
-        if class_name == "Ljava/lang/reflect/Constructor;" && method_name == "newInstance" {
-            let target_cls = args.first().and_then(|v| v.as_ref()).and_then(|ctor_id| {
-                let st = jni_state().lock().unwrap();
-                let cls_id = match st.heap.get(ctor_id) {
-                    Some(HeapObject::Instance { fields, .. }) => {
-                        fields.get("declaringClass").and_then(|v| v.as_ref())
-                    }
-                    _ => None,
-                }?;
-                match st.heap.get(cls_id) {
-                    Some(HeapObject::ClassObj(c)) => Some(c.clone()),
-                    _ => None,
-                }
-            });
-            if let Some(tc) = target_cls {
-                if self.find_class(&tc).is_some() {
-                    let obj = self.new_instance(&tc)?;
-                    let _ = self.invoke_method(&tc, "<init>", "()V", &[Value::Ref(Some(obj))], false);
-                    return Ok(Value::Ref(Some(obj)));
-                }
-            }
-            return Ok(Value::Ref(None));
+        if matches!(method_name,"getApplication" | "getApplicationContext") && (self.is_assignable_from("Landroid/content/Context;",class_name) || self.is_assignable_from("Landroid/view/View;",class_name)) {
+            if let Some(value)=self.threads.statics.lock().unwrap().get("PENGUDROID_APPLICATION").cloned(){return Ok(value);}
         }
-        if method_name == "start" && descriptor == "()V" && is_virtual {
-            if let Some(tid) = args.first().and_then(|v| v.as_ref()) {
-                let run_cls = {
-                    let st = jni_state().lock().unwrap();
-                    st.heap.get(tid).map(|o| o.class_name().to_string())
-                };
-                if let Some(rc) = run_cls {
-                    if self.find_method_in_hierarchy(&rc, "run", "()V", true).is_some() {
-                        let _ = self.invoke_method(&rc, "run", "()V", &[Value::Ref(Some(tid))], true);
-                        return Ok(Value::Void);
-                    }
-                }
-            }
+        match self.invoke_reflection(class_name,method_name,descriptor,args,is_virtual) {
+            Ok(Some(value)) => return Ok(value), Ok(None) => {},
+            Err(error) => return self.builtin_exception(error,descriptor),
+        }
+        match self.invoke_thread_builtin(class_name,method_name,descriptor,args,is_virtual) {
+            Ok(Some(value)) => return Ok(value), Ok(None) => {},
+            Err(error) => return self.builtin_exception(error,descriptor),
         }
         // Check registered JNI native methods first.
         if let Some(mut fn_ptr) = lookup_native(class_name, method_name, descriptor) {
             let key = (class_name.to_string(), method_name.to_string(), descriptor.to_string());
-            if !self.wrapped_natives.contains(&key) {
+            if self.wrapped_natives.lock().unwrap().get(&key) != Some(&fn_ptr) {
+                if self.needs_bridge && self.pointer_wrapper.is_none() {
+                    return Err(format!("ARM64 JNI method was not prepared before worker execution: {key:?}"));
+                }
                 if let Some(wrapper) = self.pointer_wrapper.as_mut() {
                     let shorty = descriptor_to_shorty(descriptor);
                     if let Some(wrapped) = wrapper(fn_ptr, &shorty) {
@@ -295,9 +322,9 @@ impl Vm {
                         fn_ptr = wrapped;
                     }
                 }
-                self.wrapped_natives.insert(key);
+                self.wrapped_natives.lock().unwrap().insert(key, fn_ptr);
             }
-            let is_static = self.find_method_in_hierarchy(class_name, method_name, descriptor, is_virtual)
+            let is_static = resolved_method.as_ref()
                 .map(|(_, _, method)| method.access_flags & 0x0008 != 0)
                 .unwrap_or(!is_virtual);
             return self.call_jni_native(fn_ptr, class_name, descriptor, args, is_static);
@@ -341,8 +368,7 @@ impl Vm {
         }
 
         // Resolve in loaded DEX hierarchy.
-        if let Some((di, resolved_cls, method)) =
-            self.find_method_in_hierarchy(class_name, method_name, descriptor, is_virtual)
+        if let Some((di, resolved_cls, method)) = resolved_method
         {
             self.ensure_clinit(&resolved_cls)?;
             if let Some(code) = method.code {
@@ -363,9 +389,11 @@ impl Vm {
                 };
                 if let Some(fn_ptr) = resolved_ptr {
                     crate::jni_host::register_native(&resolved_cls, method_name, descriptor, fn_ptr);
+                    self.wrapped_natives.lock().unwrap().insert((resolved_cls.clone(),method_name.into(),descriptor.into()),fn_ptr);
                     return self.call_jni_native(fn_ptr, &resolved_cls, descriptor, args, is_static);
                 }
             }
+            if method.access_flags & 0x0100 != 0 { return Err(format!("UnsatisfiedLinkError: {resolved_cls}.{method_name}{descriptor}")); }
             return Ok(Value::Void);
         }
 
@@ -400,7 +428,12 @@ impl Vm {
             }
         }
 
+        if matches!((method_name,descriptor),("getClass","()Ljava/lang/Class;") | ("hashCode","()I") | ("equals","(Ljava/lang/Object;)Z") | ("toString","()Ljava/lang/String;")) {
+            let mut state=jni_state().lock().unwrap();
+            if let BuiltinResult::Handled(value)=try_invoke_builtin(&mut state.heap,&mut self.static_fields,"Ljava/lang/Object;",method_name,descriptor,args)? { return Ok(value); }
+        }
         let signature = format!("{class_name}.{method_name}{descriptor}");
+        *self.threads.missing_methods.lock().unwrap().entry(signature.clone()).or_insert(0) += 1;
         let count = self.missing_methods.entry(signature.clone()).or_insert(0);
         *count += 1;
         if *count == 1 {
@@ -412,7 +445,8 @@ impl Vm {
         Ok(default_return_for_descriptor(descriptor))
     }
 
-    fn load_library_by_name(&mut self, short_or_path: &str) -> Result<(), String> {
+    pub(crate) fn load_library_by_name(&mut self, short_or_path: &str) -> Result<(), String> {
+        if !self.owns_runtime && self.native_loader.is_none() { return self.request_native_load(short_or_path); }
         let so_name = if let Some(base) = short_or_path.rsplit('/').next().filter(|s| s.ends_with(".so")) {
             base.to_string()
         } else if short_or_path.ends_with(".so") {
@@ -475,8 +509,7 @@ impl Vm {
         Ok(st.heap.new_instance(class_name))
     }
 
-    pub fn launch_activity(&mut self, activity_class: &str) -> Result<ObjId, String> {
-        unsafe fn vm_jni_invoke_trampoline(
+    pub(crate) unsafe fn vm_jni_invoke_trampoline(
             ctx: usize,
             class_desc: &str,
             name: &str,
@@ -485,9 +518,18 @@ impl Vm {
         ) -> Value {
             let vm = &mut *(ctx as *mut Vm);
             let saved_exc = vm.pending_exception.take();
-            let res = vm
-                .invoke_method(class_desc, name, sig, args, true)
-                .unwrap_or(Value::Void);
+            let res = match vm.invoke_method(class_desc, name, sig, args, true) {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("[pengu-jni] callback failed in {class_desc}.{name}{sig}: {error}");
+                    let mut state = jni_state().lock().unwrap();
+                    let id = state.heap.new_instance("Ljava/lang/RuntimeException;");
+                    let message = state.heap.new_string(error);
+                    if let Some(HeapObject::Instance{fields,..})=state.heap.get_mut(id){fields.insert("detailMessage".into(),Value::Ref(Some(message)));}
+                    vm.pending_exception = Some(id);
+                    Value::Void
+                }
+            };
             if let Some(exc_id) = vm.pending_exception.take() {
                 crate::jni_host::set_pending_exception_object(exc_id);
                 if vm.trace {
@@ -497,11 +539,39 @@ impl Vm {
             vm.pending_exception = saved_exc;
             res
         }
-        let _invoker = crate::jni_host::scoped_vm_invoker(self as *mut Vm as usize, vm_jni_invoke_trampoline);
+
+    fn describe_exception(&self,id:ObjId)->String {
+        let state=jni_state().lock().unwrap();let Some(object)=state.heap.get(id) else {return format!("invalid exception {id}")};
+        let message=match object{HeapObject::Instance{fields,..}=>fields.get("detailMessage").and_then(Value::as_ref).and_then(|id|state.heap.as_str(id)).unwrap_or(""),_=>""};
+        format!("{}: {message} (obj={id})",object.class_name())
+    }
+    pub fn launch_application(&mut self, application_class: &str) -> Result<ObjId, String> {
+        let _invoker = crate::jni_host::scoped_vm_invoker(self as *mut Vm as usize, Self::vm_jni_invoke_trampoline);
+        self.prepare_main_thread()?;
+        crate::threads::publish_template(self.thread_template()?);
+        let object = self.new_instance(application_class)?;
+        let key = "PENGUDROID_APPLICATION".to_string();
+        self.static_fields.insert(key.clone(), Value::Ref(Some(object)));
+        self.threads.statics.lock().unwrap().insert(key, Value::Ref(Some(object)));
+        let context = self.new_instance("Landroid/content/Context;")?;
+        for (name, signature, arguments) in [
+            ("<init>", "()V", vec![Value::Ref(Some(object))]),
+            ("attachBaseContext", "(Landroid/content/Context;)V", vec![Value::Ref(Some(object)), Value::Ref(Some(context))]),
+            ("onCreate", "()V", vec![Value::Ref(Some(object))]),
+        ] {
+            self.invoke_method(application_class,name,signature,&arguments,name!="<init>")?;
+            if let Some(exception)=self.pending_exception.take(){return Err(format!("Application.{name}: {}",self.describe_exception(exception)));}
+        }
+        Ok(object)
+    }
+    pub fn launch_activity(&mut self, activity_class: &str) -> Result<ObjId, String> {
+        let _invoker = crate::jni_host::scoped_vm_invoker(self as *mut Vm as usize, Self::vm_jni_invoke_trampoline);
+        self.prepare_main_thread()?;
+        crate::threads::publish_template(self.thread_template()?);
         let obj = self.new_instance(activity_class)?;
         self.invoke_method(activity_class, "<init>", "()V", &[Value::Ref(Some(obj))], false)?;
         if let Some(exc_id) = self.pending_exception.take() {
-            return Err(format!("uncaught Dalvik exception in <init> obj={exc_id}"));
+            return Err(format!("uncaught Dalvik exception in <init>: {}",self.describe_exception(exc_id)));
         }
         let bundle = Value::Ref(None);
         self.invoke_method(
@@ -512,15 +582,15 @@ impl Vm {
             true,
         )?;
         if let Some(exc_id) = self.pending_exception.take() {
-            return Err(format!("uncaught Dalvik exception in onCreate obj={exc_id}"));
+            return Err(format!("uncaught Dalvik exception in onCreate: {}",self.describe_exception(exc_id)));
         }
         self.invoke_method(activity_class, "onStart", "()V", &[Value::Ref(Some(obj))], true)?;
         if let Some(exc_id) = self.pending_exception.take() {
-            return Err(format!("uncaught Dalvik exception in onStart obj={exc_id}"));
+            return Err(format!("uncaught Dalvik exception in onStart: {}",self.describe_exception(exc_id)));
         }
         self.invoke_method(activity_class, "onResume", "()V", &[Value::Ref(Some(obj))], true)?;
         if let Some(exc_id) = self.pending_exception.take() {
-            return Err(format!("uncaught Dalvik exception in onResume obj={exc_id}"));
+            return Err(format!("uncaught Dalvik exception in onResume: {}",self.describe_exception(exc_id)));
         }
 
         // Deliver SurfaceHolder callbacks (surfaceCreated / surfaceChanged) and window focus.
@@ -558,14 +628,15 @@ impl Vm {
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(720);
             for (cid, cls) in callbacks {
-                let _ = self.invoke_method(
+                self.invoke_method(
                     &cls,
                     "surfaceCreated",
                     "(Landroid/view/SurfaceHolder;)V",
                     &[Value::Ref(Some(cid)), Value::Ref(Some(hid))],
                     true,
-                );
-                let _ = self.invoke_method(
+                )?;
+                if let Some(exc) = self.pending_exception.take() { return Err(format!("surfaceCreated: {}", self.describe_exception(exc))); }
+                self.invoke_method(
                     &cls,
                     "surfaceChanged",
                     "(Landroid/view/SurfaceHolder;III)V",
@@ -577,7 +648,8 @@ impl Vm {
                         Value::Int(h),
                     ],
                     true,
-                );
+                )?;
+                if let Some(exc) = self.pending_exception.take() { return Err(format!("surfaceChanged: {}", self.describe_exception(exc))); }
             }
         }
         let _ = self.invoke_method(
@@ -588,70 +660,6 @@ impl Vm {
             true,
         );
 
-        // Pump queued Handler / Message dispatches (e.g. UnityPlayer render/event thread).
-        for _ in 0..200 {
-            let next_msg = {
-                let mut st = jni_state().lock().unwrap();
-                let qid = self
-                    .static_fields
-                    .get("PENGUDROID_MSG_QUEUE")
-                    .and_then(|v| v.as_ref());
-                qid.and_then(|id| match st.heap.get_mut(id) {
-                    Some(HeapObject::List(vec)) if !vec.is_empty() => Some(vec.remove(0)),
-                    _ => None,
-                })
-            };
-            let Some(msg_val) = next_msg else {
-                break;
-            };
-            let Some(mid) = msg_val.as_ref() else {
-                continue;
-            };
-            let (cb_opt, target_opt, target_cb_opt) = {
-                let st = jni_state().lock().unwrap();
-                let cb = match st.heap.get(mid) {
-                    Some(HeapObject::Instance { fields, .. }) => fields
-                        .get("callback")
-                        .and_then(|v| v.as_ref())
-                        .and_then(|cid| st.heap.get(cid).map(|o| (cid, o.class_name().to_string()))),
-                    _ => None,
-                };
-                let tgt = match st.heap.get(mid) {
-                    Some(HeapObject::Instance { fields, .. }) => fields
-                        .get("target")
-                        .and_then(|v| v.as_ref())
-                        .and_then(|tid| st.heap.get(tid).map(|o| (tid, o.class_name().to_string()))),
-                    _ => None,
-                };
-                let tcb = tgt.as_ref().and_then(|(tid, _)| match st.heap.get(*tid) {
-                    Some(HeapObject::Instance { fields, .. }) => fields
-                        .get("mCallback")
-                        .and_then(|v| v.as_ref())
-                        .and_then(|hcid| st.heap.get(hcid).map(|o| (hcid, o.class_name().to_string()))),
-                    _ => None,
-                });
-                (cb, tgt, tcb)
-            };
-            if let Some((cid, ccls)) = cb_opt {
-                let _ = self.invoke_method(&ccls, "run", "()V", &[Value::Ref(Some(cid))], true);
-            } else if let Some((hcid, hccls)) = target_cb_opt {
-                let _ = self.invoke_method(
-                    &hccls,
-                    "handleMessage",
-                    "(Landroid/os/Message;)Z",
-                    &[Value::Ref(Some(hcid)), Value::Ref(Some(mid))],
-                    true,
-                );
-            } else if let Some((tid, tcls)) = target_opt {
-                let _ = self.invoke_method(
-                    &tcls,
-                    "handleMessage",
-                    "(Landroid/os/Message;)V",
-                    &[Value::Ref(Some(tid)), Value::Ref(Some(mid))],
-                    true,
-                );
-            }
-        }
         Ok(obj)
     }
 
@@ -820,25 +828,20 @@ impl Vm {
                         regs[aa] = Value::Ref(Some(id));
                         pc += 2;
                     }
-                    0x1d | 0x1e => pc += 1, // monitor-enter / monitor-exit
-                    0x1f => pc += 2,        // check-cast
+                    0x1d | 0x1e => {
+                        let id = regs[aa].as_ref().ok_or_else(|| OpErr::Fatal("null monitor receiver".into()))?;
+                        if op == 0x1d { crate::monitors::enter(id); }
+                        else { crate::monitors::exit(id).map_err(OpErr::Fatal)?; }
+                        pc += 1;
+                    }
+                    0x1f => {
+                        let target=&self.dexes[dex_idx].types[insns[pc+1] as usize];
+                        if let Some(id)=regs[aa].as_ref(){if !self.is_instance_of(id,target){let exception=jni_state().lock().unwrap().heap.new_instance("Ljava/lang/ClassCastException;");return Err(OpErr::Thrown(exception));}}
+                        pc+=2;
+                    }
                     0x20 => {
-                        // instance-of vA, vB, type@CCCC
-                        let a = aa & 0x0f;
-                        let b = (aa >> 4) & 0x0f;
-                        let type_idx = insns[pc + 1] as usize;
-                        let target = self.dexes[dex_idx].types[type_idx].clone();
-                        let ok = if let Some(id) = regs[b].as_ref() {
-                            let st = jni_state().lock().unwrap();
-                            st.heap
-                                .get(id)
-                                .map(|o| o.class_name() == target || target == "Ljava/lang/Object;")
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        };
-                        regs[a] = Value::Int(i32::from(ok));
-                        pc += 2;
+                        let a=aa&0x0f;let b=(aa>>4)&0x0f;let target=&self.dexes[dex_idx].types[insns[pc+1] as usize];
+                        regs[a]=Value::Int(regs[b].as_ref().is_some_and(|id|self.is_instance_of(id,target)) as i32);pc+=2;
                     }
                     0x21 => {
                         // array-length vA, vB
@@ -1185,10 +1188,8 @@ impl Vm {
                         let f = self.dexes[dex_idx].fields[fidx].clone();
                         self.ensure_clinit(&f.class_name).map_err(OpErr::Fatal)?;
                         let key = format!("{}.{}", f.class_name, f.name);
-                        regs[aa] = self
-                            .static_fields
-                            .get(&key)
-                            .cloned()
+                        regs[aa] = self.threads.statics.lock().unwrap().get(&key).cloned()
+                            .or_else(|| self.static_fields.get(&key).cloned())
                             .unwrap_or_else(|| {
                                 if f.type_name.starts_with('L') || f.type_name.starts_with('[') {
                                     Value::Ref(None)
@@ -1206,6 +1207,7 @@ impl Vm {
                         let f = self.dexes[dex_idx].fields[fidx].clone();
                         self.ensure_clinit(&f.class_name).map_err(OpErr::Fatal)?;
                         let key = format!("{}.{}", f.class_name, f.name);
+                        self.threads.statics.lock().unwrap().insert(key.clone(), regs[aa].clone());
                         self.static_fields.insert(key, regs[aa].clone());
                         pc += 2;
                     }
@@ -1237,8 +1239,7 @@ impl Vm {
                                         .lock()
                                         .unwrap()
                                         .heap
-                                        .get(id)
-                                        .map(|o| o.class_name().to_string())
+                                        .class_name(id).map(str::to_owned)
                                 })
                                 .unwrap_or_else(|| m.class_name.clone())
                         } else {
@@ -1269,8 +1270,7 @@ impl Vm {
                                         .lock()
                                         .unwrap()
                                         .heap
-                                        .get(id)
-                                        .map(|o| o.class_name().to_string())
+                                        .class_name(id).map(str::to_owned)
                                 })
                                 .unwrap_or_else(|| m.class_name.clone())
                         } else {
@@ -1369,8 +1369,7 @@ impl Vm {
         let exc_class = {
             let st = jni_state().lock().unwrap();
             st.heap
-                .get(exc_id)
-                .map(|o| o.class_name().to_string())
+                .class_name(exc_id).map(str::to_owned)
                 .unwrap_or_default()
         };
         for t in &code.tries {
@@ -1414,7 +1413,7 @@ fn compact_wide_args(raw: &[Value], params: &[String], has_this: bool) -> Vec<Va
     out
 }
 
-fn jni_mangle_name(class_desc: &str, method_name: &str) -> String {
+pub(crate) fn jni_mangle_name(class_desc: &str, method_name: &str) -> String {
     let cls = class_desc
         .strip_prefix('L')
         .and_then(|s| s.strip_suffix(';'))
@@ -1612,5 +1611,18 @@ fn eval_int_lit(kind: u8, a: i32, lit: i32) -> Value {
         9 => Value::Int(a.wrapping_shr(lit as u32)),
         10 => Value::Int(((a as u32).wrapping_shr(lit as u32)) as i32),
         _ => Value::Int(0),
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        if self.owns_runtime {
+            self.shutdown_workers();
+            if self.needs_bridge {
+                if let Some(loader) = self.native_loader.take() { std::mem::forget(loader); }
+                if let Some(resolver) = self.symbol_resolver.take() { std::mem::forget(resolver); }
+                if let Some(wrapper) = self.pointer_wrapper.take() { std::mem::forget(wrapper); }
+            }
+        }
     }
 }

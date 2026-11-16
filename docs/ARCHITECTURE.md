@@ -48,7 +48,7 @@ The JNI host provides a function table and object/method/field handles. Native
 outbound calls use cached libffi interfaces with typed arguments/returns. JNI
 ellipsis, `va_list` and `jvalue` entry points use a C adapter. JNI string APIs handle
 UTF-16 and modified UTF-8; pending exceptions are carried back to the interpreter.
-Reference management, reflection, monitors and threading remain incomplete.
+Workers own separate interpreters with shared immutable DEX and synchronized heap/statics. HandlerThread/Looper queues and reentrant DEX/JNI monitors now execute real work. JNI attachment and proxy/reflection metadata support a tested subset; reference management and general framework coverage remain incomplete. See [threading contracts](DEXVM_THREADING.md).
 
 Native ARM64 libraries use the same translator/proxy infrastructure as the other
 backends. The translator needs host C++ support and an ARM64 native support bundle;

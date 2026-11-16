@@ -105,6 +105,7 @@ pub enum HeapObject {
         data: ArrayData,
     },
     List(Vec<Value>),
+    Queue(std::collections::VecDeque<Value>),
     Map(HashMap<String, Value>),
     StringBuilder(String),
 }
@@ -116,6 +117,7 @@ impl HeapObject {
             HeapObject::StringObj(_) => "Ljava/lang/String;",
             HeapObject::ClassObj(_) => "Ljava/lang/Class;",
             HeapObject::Array { type_desc, .. } => type_desc,
+            HeapObject::Queue(_) => "Ljava/util/concurrent/ConcurrentLinkedQueue;",
             HeapObject::List(_) => "Ljava/util/ArrayList;",
             HeapObject::Map(_) => "Ljava/util/HashMap;",
             HeapObject::StringBuilder(_) => "Ljava/lang/StringBuilder;",
@@ -129,6 +131,7 @@ pub struct Heap {
     interned_strings: HashMap<String, ObjId>,
     class_objects: HashMap<String, ObjId>,
     utf16_strings: HashMap<ObjId, Vec<u16>>,
+    instance_classes: HashMap<ObjId, String>,
 }
 
 impl Heap {
@@ -139,6 +142,7 @@ impl Heap {
             interned_strings: HashMap::new(),
             class_objects: HashMap::new(),
             utf16_strings: HashMap::new(),
+            instance_classes: HashMap::new(),
         }
     }
 
@@ -151,6 +155,10 @@ impl Heap {
     pub fn get(&self, id: ObjId) -> Option<&HeapObject> {
         self.objects.get(id).and_then(|o| o.as_ref())
     }
+
+    /// Backing storage can change in a builtin constructor; Java class identity
+    /// remains the class of the allocated instance (e.g. LinkedHashMap).
+    pub fn class_name(&self,id:ObjId)->Option<&str>{self.get(id).map(|object|self.instance_classes.get(&id).map(String::as_str).unwrap_or_else(||object.class_name()))}
 
     pub fn get_mut(&mut self, id: ObjId) -> Option<&mut HeapObject> {
         self.objects.get_mut(id).and_then(|o| o.as_mut())
@@ -190,10 +198,12 @@ impl Heap {
     }
 
     pub fn new_instance(&mut self, class_name: &str) -> ObjId {
-        self.alloc(HeapObject::Instance {
+        let id=self.alloc(HeapObject::Instance {
             class_name: class_name.to_string(),
             fields: HashMap::new(),
-        })
+        });
+        self.instance_classes.insert(id,class_name.into());
+        id
     }
 
     pub fn new_array(&mut self, type_desc: &str, len: usize) -> Result<ObjId, String> {

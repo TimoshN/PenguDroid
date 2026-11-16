@@ -168,6 +168,7 @@ struct JNIEnvObj {
 
 static JNI_ENV_TABLE: OnceLock<Vec<usize>> = OnceLock::new();
 std::thread_local! {
+    static JNI_ATTACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static JNI_ENV_OBJ: std::cell::UnsafeCell<JNIEnvObj> = const {
         std::cell::UnsafeCell::new(JNIEnvObj { functions: std::ptr::null() })
     };
@@ -182,6 +183,7 @@ macro_rules! fill_unimpl {
 }
 
 pub fn jni_env_ptr() -> *mut c_void {
+    JNI_ATTACHED.with(|attached| attached.set(true));
     let table = JNI_ENV_TABLE.get_or_init(|| {
         let mut t = vec![jni_unimplemented::<999> as *const () as usize; 233];
         fill_unimpl!(
@@ -201,6 +203,9 @@ pub fn jni_env_ptr() -> *mut c_void {
         let placeholders = t.clone();
         t[4] = jni_get_version as *const () as usize;
         t[6] = jni_find_class as *const () as usize;
+        t[7] = jni_from_reflected_method as *const () as usize;
+        t[9] = jni_to_reflected_method as *const () as usize;
+        t[11] = jni_is_assignable_from as *const () as usize;
         t[10] = jni_get_superclass as *const () as usize;
         t[13] = jni_throw as *const () as usize;
         t[14] = jni_throw_new as *const () as usize;
@@ -250,6 +255,8 @@ pub fn jni_env_ptr() -> *mut c_void {
         t[192] = jni_release_byte_array_elements as *const () as usize;
         t[215] = jni_register_natives as *const () as usize;
         t[216] = jni_unregister_natives as *const () as usize;
+        t[217] = jni_monitor_enter as *const () as usize;
+        t[218] = jni_monitor_exit as *const () as usize;
         t[219] = jni_get_java_vm as *const () as usize;
         t[228] = jni_exception_check as *const () as usize;
         unsafe extern "C" { fn pengu_install_jni_calls(table: *mut usize); }
@@ -273,6 +280,8 @@ unsafe extern "C" fn vm_destroy(_vm: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn vm_attach(_vm: *mut c_void, p_env: *mut *mut c_void, _args: *mut c_void) -> c_int {
+    if p_env.is_null() { return JNI_ERR; }
+    crate::threads::attach_native_thread();
     if !p_env.is_null() {
         *p_env = jni_env_ptr();
     }
@@ -280,10 +289,17 @@ unsafe extern "C" fn vm_attach(_vm: *mut c_void, p_env: *mut *mut c_void, _args:
 }
 
 unsafe extern "C" fn vm_detach(_vm: *mut c_void) -> c_int {
+    if !crate::threads::detach_native_thread() { return JNI_ERR; }
+    JNI_ATTACHED.with(|attached| attached.set(false));
     JNI_OK
 }
 
-unsafe extern "C" fn vm_get_env(_vm: *mut c_void, p_env: *mut *mut c_void, _version: c_int) -> c_int {
+unsafe extern "C" fn vm_get_env(_vm: *mut c_void, p_env: *mut *mut c_void, version: c_int) -> c_int {
+    if p_env.is_null() { return JNI_ERR; }
+    *p_env = std::ptr::null_mut();
+    if !matches!(version, 0x00010001 | 0x00010002 | 0x00010004 | JNI_VERSION_1_6) { return -3; }
+    if !JNI_ATTACHED.with(|attached| attached.get()) { return -2; }
+    crate::threads::attach_native_thread();
     if !p_env.is_null() {
         *p_env = jni_env_ptr();
     }
@@ -321,9 +337,8 @@ unsafe extern "C" fn jni_find_class(_env: *mut c_void, name: *const c_char) -> *
     id as *mut c_void
 }
 
-unsafe extern "C" fn jni_get_superclass(_env: *mut c_void, _cls: *mut c_void) -> *mut c_void {
-    let mut st = jni_state().lock().unwrap();
-    st.heap.class_object("Ljava/lang/Object;") as *mut c_void
+unsafe extern "C" fn jni_get_superclass(_env:*mut c_void,class:*mut c_void)->*mut c_void {
+    invoke_via_vm("Ljava/lang/Class;","getSuperclass","()Ljava/lang/Class;",&[Value::Ref((!class.is_null()).then_some(class as usize))]).as_ref().map_or(std::ptr::null_mut(),|id|id as *mut c_void)
 }
 
 std::thread_local! {
@@ -396,6 +411,9 @@ pub type VmInvokeFn = unsafe fn(usize, &str, &str, &str, &[Value]) -> Value;
 std::thread_local! {
     static VM_INVOKER: std::cell::Cell<Option<(usize, VmInvokeFn)>> = const { std::cell::Cell::new(None) };
 }
+
+pub(crate) fn has_vm_invoker() -> bool { VM_INVOKER.with(|slot| slot.get().is_some()) }
+pub(crate) fn clear_vm_invoker() { VM_INVOKER.with(|slot| slot.set(None)); }
 
 pub fn set_vm_invoker(ctx: usize, f: VmInvokeFn) {
     VM_INVOKER.with(|c| c.set(Some((ctx, f))));
@@ -519,28 +537,17 @@ unsafe extern "C" fn jni_get_object_class(_env: *mut c_void, obj: *mut c_void) -
     let mut st = jni_state().lock().unwrap();
     let cname = st
         .heap
-        .get(obj as ObjId)
-        .map(|o| o.class_name().to_string())
+        .class_name(obj as ObjId).map(str::to_owned)
         .unwrap_or_else(|| "Ljava/lang/Object;".to_string());
     st.heap.class_object(&cname) as *mut c_void
 }
 
-unsafe extern "C" fn jni_is_instance_of(
-    _env: *mut c_void,
-    obj: *mut c_void,
-    cls: *mut c_void,
-) -> u8 {
-    if obj.is_null() || cls.is_null() {
-        return 0;
-    }
-    let st = jni_state().lock().unwrap();
-    let Some(obj_cls) = st.heap.get(obj as ObjId).map(|o| o.class_name()) else {
-        return 0;
-    };
-    let Some(HeapObject::ClassObj(target_cls)) = st.heap.get(cls as ObjId) else {
-        return 0;
-    };
-    u8::from(obj_cls == target_cls || target_cls == "Ljava/lang/Object;")
+unsafe extern "C" fn jni_is_instance_of(_env:*mut c_void,object:*mut c_void,class:*mut c_void)->u8 {
+    if object.is_null(){return 1;}
+    invoke_via_vm("Ljava/lang/Class;","isInstance","(Ljava/lang/Object;)Z",&[Value::Ref((!class.is_null()).then_some(class as usize)),Value::Ref(Some(object as usize))]).as_int().unwrap_or(0) as u8
+}
+unsafe extern "C" fn jni_is_assignable_from(_env:*mut c_void,source:*mut c_void,target:*mut c_void)->u8 {
+    invoke_via_vm("Ljava/lang/Class;","isAssignableFrom","(Ljava/lang/Class;)Z",&[Value::Ref((!target.is_null()).then_some(target as usize)),Value::Ref((!source.is_null()).then_some(source as usize))]).as_int().unwrap_or(0) as u8
 }
 
 unsafe extern "C" fn jni_get_object_field(
@@ -1020,7 +1027,7 @@ unsafe extern "C" fn pengu_jni_dispatch(env: *mut c_void, object: *mut c_void, m
     if mode != 1 {
         if mode == 0 && !object.is_null() {
             let state = jni_state().lock().unwrap();
-            if let Some(value) = state.heap.get(object as usize) { class = value.class_name().into(); }
+            if let Some(value) = state.heap.class_name(object as usize) { class = value.into(); }
         }
         args.push(Value::Ref(if object.is_null() { None } else { Some(object as usize) }));
     }
@@ -1032,5 +1039,45 @@ unsafe extern "C" fn pengu_jni_dispatch(env: *mut c_void, object: *mut c_void, m
         Value::Float(value) => value.to_bits() as u64,
         Value::Double(value) => value.to_bits(),
         Value::Ref(value) => value.unwrap_or(0) as u64,
+    }
+}
+
+unsafe extern "C" fn jni_from_reflected_method(_env:*mut c_void,object:*mut c_void)->*mut c_void {
+    let Ok((class,name,sig,_))=crate::reflection::method_info(object as usize) else { return std::ptr::null_mut(); };
+    let mut state=jni_state().lock().unwrap();let key=(class,name,sig);
+    if let Some(&id)=state.method_index.get(&key){return id as *mut c_void}
+    let id=state.method_ids.len();state.method_ids.push(key.clone());state.method_index.insert(key,id);id as *mut c_void
+}
+unsafe extern "C" fn jni_to_reflected_method(_env:*mut c_void,_class:*mut c_void,id:*mut c_void,is_static:u8)->*mut c_void {
+    let entry=jni_state().lock().unwrap().method_ids.get(id as usize).cloned();
+    entry.map(|(class,name,sig)|crate::reflection::method(&class,&name,&sig,if is_static!=0{9}else{1}) as *mut c_void).unwrap_or(std::ptr::null_mut())
+}
+
+unsafe extern "C" fn jni_monitor_enter(_env:*mut c_void,object:*mut c_void)->c_int {
+    if object.is_null() { return JNI_ERR; } crate::monitors::enter(object as usize);JNI_OK
+}
+unsafe extern "C" fn jni_monitor_exit(_env:*mut c_void,object:*mut c_void)->c_int {
+    if object.is_null() { return JNI_ERR; }
+    match crate::monitors::exit(object as usize) {Ok(())=>JNI_OK,Err(_)=>{let id=jni_state().lock().unwrap().heap.new_instance("Ljava/lang/IllegalMonitorStateException;");set_pending_exception_object(id);JNI_ERR}}
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    #[test]
+    fn native_threads_must_attach_and_get_env_rejects_bad_versions_and_detached_threads() {
+        let vm=java_vm_ptr() as usize;
+        std::thread::spawn(move||unsafe {
+            let table=*(vm as *const *const usize);
+            let get:unsafe extern "C" fn(*mut c_void,*mut *mut c_void,c_int)->c_int=std::mem::transmute(*table.add(6));
+            let attach:unsafe extern "C" fn(*mut c_void,*mut *mut c_void,*mut c_void)->c_int=std::mem::transmute(*table.add(4));
+            let detach:unsafe extern "C" fn(*mut c_void)->c_int=std::mem::transmute(*table.add(5));
+            let mut env=std::ptr::null_mut();
+            assert_eq!(get(vm as *mut c_void,&mut env,JNI_VERSION_1_6),-2);assert!(env.is_null());
+            assert_eq!(attach(vm as *mut c_void,&mut env,std::ptr::null_mut()),JNI_OK);assert!(!env.is_null());
+            let previous=env;assert_eq!(get(vm as *mut c_void,&mut env,JNI_VERSION_1_6),JNI_OK);assert_eq!(previous,env);
+            assert_eq!(get(vm as *mut c_void,&mut env,0x7fff_ffff),-3);assert!(env.is_null());
+            assert_eq!(detach(vm as *mut c_void),JNI_OK);assert_eq!(get(vm as *mut c_void,&mut env,JNI_VERSION_1_6),-2);assert!(env.is_null());
+        }).join().unwrap();
     }
 }

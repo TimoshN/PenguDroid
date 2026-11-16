@@ -12,6 +12,9 @@ mod native_abi;
 mod jni_strings;
 pub mod value;
 pub mod vm;
+pub mod threads;
+mod monitors;
+mod reflection;
 
 pub use dex::DexFile;
 pub use value::{ArrayData, Heap, HeapObject, ObjId, Value};
@@ -344,5 +347,65 @@ mod tests {
             assert_eq!(CStr::from_ptr(chars).to_str().unwrap(), "independent-runtime");
             rel_chars(env, jstr, chars);
         }
+    }
+}
+
+#[cfg(test)]
+mod sdk_regressions {
+    use super::*;
+    unsafe extern "C" fn application_created(_: *mut std::ffi::c_void, receiver: *mut std::ffi::c_void) {
+        if let Some(HeapObject::Instance{fields,..})=jni_host::jni_state().lock().unwrap().heap.get_mut(receiver as usize){fields.insert("initialized".into(),Value::Int(1));}
+    }
+    #[test]
+    fn application_oncreate_runs_before_activity_and_context_lookups_share_identity() {
+        use crate::dex::{ClassDef,EncodedMethod,MethodId,ProtoId};
+        let name="Lpengu/test/Application;";
+        let mut vm=Vm::new();
+        vm.load_parsed_dex(DexFile {
+            strings:vec![], types:vec![name.into()], protos:vec![ProtoId{shorty:"V".into(),return_type:"V".into(),params:vec![]}], fields:vec![],
+            methods:vec![MethodId{class_name:name.into(),proto_idx:0,name:"onCreate".into(),descriptor:"()V".into()}],
+            classes:vec![ClassDef{name:name.into(),access_flags:1,superclass:Some("Landroid/app/Application;".into()),interfaces:vec![],static_fields:vec![],instance_fields:vec![],direct_methods:vec![],virtual_methods:vec![EncodedMethod{method_idx:0,access_flags:0x101,code:None}]}],
+            class_by_name:std::collections::HashMap::from([(name.into(),0)]),
+        }).unwrap();
+        jni_host::register_native(name,"onCreate","()V",application_created as *const () as usize);
+        let app=vm.launch_application(name).unwrap();
+        {let state=jni_host::jni_state().lock().unwrap();let Some(HeapObject::Instance{fields,..})=state.heap.get(app)else{panic!()};assert_eq!(fields["initialized"].as_int().unwrap(),1);assert!(fields["mBase"].as_ref().is_some());}
+        let activity=vm.new_instance("Landroid/app/Activity;").unwrap();
+        for method in ["getApplication","getApplicationContext"] {
+            assert_eq!(vm.invoke_method("Landroid/app/Activity;",method,"()Landroid/app/Application;",&[Value::Ref(Some(activity))],true).unwrap().as_ref(),Some(app));
+        }
+    }
+
+    #[test]
+    fn boxed_values_primitive_classes_and_collection_identity_survive_sdk_calls() {
+        let mut vm = Vm::new();
+        let boolean = vm.new_instance("Ljava/lang/Boolean;").unwrap();
+        vm.invoke_method("Ljava/lang/Boolean;","<init>","(Z)V",&[Value::Ref(Some(boolean)),Value::Int(1)],false).unwrap();
+        assert_eq!(vm.invoke_method("Ljava/lang/Boolean;","booleanValue","()Z",&[Value::Ref(Some(boolean))],true).unwrap().as_int().unwrap(),1);
+        let float_type = vm.static_fields["Ljava/lang/Float;.TYPE"].as_ref().unwrap();
+        assert!(matches!(jni_host::jni_state().lock().unwrap().heap.get(float_type),Some(HeapObject::ClassObj(ty)) if ty=="F"));
+        let map = vm.new_instance("Ljava/util/LinkedHashMap;").unwrap();
+        vm.invoke_method("Ljava/util/LinkedHashMap;","<init>","()V",&[Value::Ref(Some(map))],false).unwrap();
+        assert!(vm.is_instance_of(map,"Ljava/util/Map;"));
+        let cls = vm.invoke_method("Ljava/lang/Object;","getClass","()Ljava/lang/Class;",&[Value::Ref(Some(map))],true).unwrap().as_ref().unwrap();
+        assert!(matches!(jni_host::jni_state().lock().unwrap().heap.get(cls),Some(HeapObject::ClassObj(ty)) if ty=="Ljava/util/LinkedHashMap;"));
+        assert!(vm.is_assignable_from("[Ljava/lang/Object;","[Ljava/lang/String;"));
+        assert!(!vm.is_assignable_from("[J","[I"));
+    }
+    #[test]
+    fn reflected_configuration_field_reads_real_payload_and_rejects_unknown_fields() {
+        let mut vm = Vm::new();
+        let (class, config, name) = { let mut state=jni_host::jni_state().lock().unwrap();
+            let class=state.heap.class_object("Landroid/content/res/Configuration;");
+            let config=state.heap.new_instance("Landroid/content/res/Configuration;");
+            if let Some(HeapObject::Instance{fields,..})=state.heap.get_mut(config){fields.insert("uiMode".into(),Value::Int(17));}
+            let name=state.heap.new_string("uiMode".into());(class,config,name)
+        };
+        let field=vm.invoke_method("Ljava/lang/Class;","getField","(Ljava/lang/String;)Ljava/lang/reflect/Field;",&[Value::Ref(Some(class)),Value::Ref(Some(name))],true).unwrap().as_ref().unwrap();
+        let result=vm.invoke_method("Ljava/lang/reflect/Field;","get","(Ljava/lang/Object;)Ljava/lang/Object;",&[Value::Ref(Some(field)),Value::Ref(Some(config))],true).unwrap().as_ref().unwrap();
+        assert_eq!(vm.invoke_method("Ljava/lang/Integer;","intValue","()I",&[Value::Ref(Some(result))],true).unwrap().as_int().unwrap(),17);
+        let missing=jni_host::jni_state().lock().unwrap().heap.new_string("doesNotExist".into());
+        vm.invoke_method("Ljava/lang/Class;","getField","(Ljava/lang/String;)Ljava/lang/reflect/Field;",&[Value::Ref(Some(class)),Value::Ref(Some(missing))],true).unwrap();
+        assert!(vm.pending_exception.take().is_some());
     }
 }

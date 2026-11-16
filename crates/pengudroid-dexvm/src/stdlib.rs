@@ -36,6 +36,7 @@ fn value_to_string(heap: &Heap, v: &Value) -> String {
             Some(HeapObject::Array { type_desc, data }) => {
                 format!("{type_desc}[{}]", data.len())
             }
+            Some(HeapObject::Queue(v)) => format!("ConcurrentLinkedQueue(len={})",v.len()),
             Some(HeapObject::List(v)) => format!("ArrayList(len={})", v.len()),
             Some(HeapObject::Map(m)) => format!("HashMap(len={})", m.len()),
             None => "null".into(),
@@ -43,8 +44,32 @@ fn value_to_string(heap: &Heap, v: &Value) -> String {
     }
 }
 
+pub fn builtin_interfaces(class:&str)->&'static [&'static str] {
+    match class {
+        "Ljava/util/HashMap;" | "Ljava/util/IdentityHashMap;"=>&["Ljava/util/Map;","Ljava/lang/Cloneable;","Ljava/io/Serializable;"],
+        "Ljava/util/ArrayList;"=>&["Ljava/util/List;","Ljava/util/RandomAccess;","Ljava/lang/Cloneable;","Ljava/io/Serializable;"],
+        "Ljava/util/HashSet;"=>&["Ljava/util/Set;","Ljava/lang/Cloneable;","Ljava/io/Serializable;"],
+        "Ljava/util/concurrent/ConcurrentLinkedQueue;"=>&["Ljava/util/Queue;","Ljava/io/Serializable;"],
+        "Ljava/util/List;" | "Ljava/util/Set;" | "Ljava/util/Queue;"=>&["Ljava/util/Collection;"],
+        "Ljava/util/Collection;"=>&["Ljava/lang/Iterable;"],
+        "Ljava/util/Deque;"=>&["Ljava/util/Queue;"],
+        "Ljava/lang/Thread;"=>&["Ljava/lang/Runnable;"],
+        "Ljava/lang/String;"=>&["Ljava/lang/CharSequence;","Ljava/lang/Comparable;","Ljava/io/Serializable;"],
+        _=>&[],
+    }
+}
+
 pub fn builtin_superclass(class_name: &str) -> Option<&'static str> {
     match class_name {
+        "Ljava/util/LinkedHashMap;"=>Some("Ljava/util/HashMap;"),
+        "Ljava/util/LinkedHashSet;"=>Some("Ljava/util/HashSet;"),
+        "Ljava/util/HashMap;" | "Ljava/util/IdentityHashMap;"=>Some("Ljava/util/AbstractMap;"),
+        "Ljava/util/ArrayList;"=>Some("Ljava/util/AbstractList;"),
+        "Ljava/util/HashSet;"=>Some("Ljava/util/AbstractSet;"),
+        "Ljava/util/concurrent/ConcurrentLinkedQueue;"=>Some("Ljava/util/AbstractQueue;"),
+        "Ljava/util/AbstractList;" | "Ljava/util/AbstractSet;" | "Ljava/util/AbstractQueue;"=>Some("Ljava/util/AbstractCollection;"),
+        "Ljava/util/AbstractCollection;" | "Ljava/util/AbstractMap;" | "Ljava/lang/Class;" | "Ljava/lang/String;"=>Some("Ljava/lang/Object;"),
+
         "Landroid/app/Activity;" | "Landroid/app/NativeActivity;" => Some("Landroid/view/ContextThemeWrapper;"),
         "Landroid/view/ContextThemeWrapper;" => Some("Landroid/content/ContextWrapper;"),
         "Landroid/content/ContextWrapper;" | "Landroid/app/Application;" => Some("Landroid/content/Context;"),
@@ -53,9 +78,12 @@ pub fn builtin_superclass(class_name: &str) -> Option<&'static str> {
         "Landroid/content/Context;" | "Landroid/view/View;" | "Ljava/lang/Thread;" | "Ljava/lang/Throwable;" => {
             Some("Ljava/lang/Object;")
         }
+        "Landroid/os/HandlerThread;" => Some("Ljava/lang/Thread;"),
+        "Ljava/lang/InterruptedException;" | "Ljava/lang/NoSuchMethodException;" | "Ljava/lang/NoSuchFieldException;" => Some("Ljava/lang/Exception;"),
+        "Ljava/lang/IllegalMonitorStateException;" | "Ljava/lang/IllegalThreadStateException;" => Some("Ljava/lang/RuntimeException;"),
         "Ljava/lang/Exception;" => Some("Ljava/lang/Throwable;"),
         "Ljava/lang/RuntimeException;" => Some("Ljava/lang/Exception;"),
-        "Ljava/lang/NullPointerException;"
+        "Ljava/lang/ClassCastException;" | "Ljava/lang/NullPointerException;"
         | "Ljava/lang/IllegalStateException;"
         | "Ljava/lang/IllegalArgumentException;"
         | "Ljava/lang/IndexOutOfBoundsException;"
@@ -72,6 +100,28 @@ pub fn try_invoke_builtin(
     descriptor: &str,
     args: &[Value],
 ) -> Result<BuiltinResult, String> {
+    if matches!(class_name, "Ljava/lang/Boolean;" | "Ljava/lang/Byte;" | "Ljava/lang/Character;" | "Ljava/lang/Short;" | "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Float;" | "Ljava/lang/Double;") {
+        if method_name == "<init>" && !descriptor.contains("Ljava/lang/String;") {
+            let id = args.first().and_then(Value::as_ref).ok_or("null boxed receiver")?;
+            let value = args.get(1).cloned().ok_or("missing boxed value")?;
+            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) { fields.insert("value".into(), value); }
+            return Ok(BuiltinResult::Handled(Value::Void));
+        }
+        if method_name == "valueOf" && !descriptor.contains("Ljava/lang/String;") {
+            let value = args.first().cloned().ok_or("missing boxed value")?;
+            let id = heap.new_instance(class_name);
+            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) { fields.insert("value".into(), value); }
+            return Ok(BuiltinResult::Handled(Value::Ref(Some(id))));
+        }
+        if matches!(method_name, "booleanValue" | "byteValue" | "charValue" | "shortValue" | "intValue" | "longValue" | "floatValue" | "doubleValue") {
+            let id = args.first().and_then(Value::as_ref).ok_or("null boxed receiver")?;
+            let value = match heap.get(id) { Some(HeapObject::Instance { fields, .. }) => fields.get("value").cloned(), _ => None }.ok_or("missing boxed payload")?;
+            let number = match value { Value::Int(v) => v as f64, Value::Long(v) => v as f64, Value::Float(v) => v as f64, Value::Double(v) => v, _ => return Err("invalid boxed payload".into()) };
+            let integer = match value { Value::Int(v) => v, Value::Long(v) => v as i32, _ => number as i32 };
+            let result = match method_name { "longValue" => if let Value::Long(_) = value { value } else { Value::Long(number as i64) }, "floatValue" => Value::Float(number as f32), "doubleValue" => Value::Double(number), "byteValue" => Value::Int(integer as i8 as i32), "shortValue" => Value::Int(integer as i16 as i32), "charValue" => Value::Int(integer as u16 as i32), _ => Value::Int(integer) };
+            return Ok(BuiltinResult::Handled(result));
+        }
+    }
     let atomic = crate::stdlib_sync::try_invoke(heap, class_name, method_name, args)?;
     if !matches!(atomic, BuiltinResult::NotBuiltin) { return Ok(atomic); }
     let filesystem = crate::stdlib_fs::try_invoke(heap, static_fields, class_name, method_name, descriptor, args)?;
@@ -85,7 +135,28 @@ pub fn try_invoke_builtin(
         }
         return Ok(BuiltinResult::Handled(Value::Ref(None)));
     }
+    if class_name == "Landroid/os/Bundle;" && matches!(method_name,"get" | "getString" | "getInt" | "getLong" | "getBoolean" | "containsKey") {
+        let key = args.get(1).and_then(Value::as_ref).and_then(|id|heap.as_str(id)).unwrap_or("");
+        let value = args.first().and_then(Value::as_ref).and_then(|id|heap.get(id)).and_then(|object|match object{HeapObject::Instance{fields,..}=>fields.get(key).cloned(),_=>None});
+        if method_name=="containsKey" { return Ok(BuiltinResult::Handled(Value::Int(value.is_some() as i32))); }
+        let default = args.get(2).cloned().unwrap_or_else(||match method_name{"getInt"|"getBoolean"=>Value::Int(0),"getLong"=>Value::Long(0),_=>Value::Ref(None)});
+        return Ok(BuiltinResult::Handled(value.unwrap_or(default)));
+    }
     match (class_name, method_name) {
+        ("Landroid/content/ContextWrapper;" | "Landroid/app/Application;", "attachBaseContext") => {
+            if let Some(id)=args.first().and_then(Value::as_ref) { if let Some(HeapObject::Instance{fields,..})=heap.get_mut(id){fields.insert("mBase".into(),args.get(1).cloned().unwrap_or(Value::Ref(None)));} }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/app/Application;", "registerActivityLifecycleCallbacks" | "unregisterActivityLifecycleCallbacks") => {
+            let id=args.first().and_then(Value::as_ref).ok_or("null Application receiver")?;
+            let callback=args.get(1).and_then(Value::as_ref).ok_or("null activity lifecycle callback")?;
+            if let Some(HeapObject::Instance{fields,..})=heap.get_mut(id){
+                let list=fields.entry("activityCallbacks".into()).or_insert(Value::Ref(None)).as_ref();
+                let list=if let Some(list)=list {list} else {let list=heap.alloc(HeapObject::List(Vec::new()));if let Some(HeapObject::Instance{fields,..})=heap.get_mut(id){fields.insert("activityCallbacks".into(),Value::Ref(Some(list)));}list};
+                if let Some(HeapObject::List(items))=heap.get_mut(list){if method_name.starts_with("unregister"){items.retain(|v|v.as_ref()!=Some(callback));}else if !items.iter().any(|v|v.as_ref()==Some(callback)){items.push(Value::Ref(Some(callback)));}}
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
         ("Ljava/lang/ref/WeakReference;", "<init>") => {
             let referent = args.get(1).cloned().unwrap_or(Value::Ref(None));
             if let Some(id) = args.first().and_then(|v| v.as_ref()) {
@@ -157,8 +228,8 @@ pub fn try_invoke_builtin(
             let cls = args
                 .first()
                 .and_then(|v| v.as_ref())
-                .and_then(|id| heap.get(id))
-                .map(|o| o.class_name().to_string())
+                .and_then(|id| heap.class_name(id))
+                .map(str::to_owned)
                 .unwrap_or_else(|| "Ljava/lang/Object;".to_string());
             let cid = heap.class_object(&cls);
             Ok(BuiltinResult::Handled(Value::Ref(Some(cid))))
@@ -303,6 +374,27 @@ pub fn try_invoke_builtin(
             };
             let sid = heap.new_string(sub);
             Ok(BuiltinResult::Handled(Value::Ref(Some(sid))))
+        }
+        ("Ljava/lang/String;", "compareTo") => {
+            let a = args.first().and_then(Value::as_ref).and_then(|id|heap.as_str(id)).ok_or("null String receiver")?;
+            let b = args.get(1).and_then(Value::as_ref).and_then(|id|heap.as_str(id)).ok_or("null String argument")?;
+            let a:Vec<_>=a.encode_utf16().collect();let b:Vec<_>=b.encode_utf16().collect();
+            let difference=a.iter().zip(&b).find_map(|(a,b)|(a!=b).then_some(*a as i32-*b as i32)).unwrap_or(a.len() as i32-b.len() as i32);
+            Ok(BuiltinResult::Handled(Value::Int(difference)))
+        }
+        ("Ljava/lang/String;", "getBytes") => {
+            let text = args.first().and_then(Value::as_ref).and_then(|id|heap.as_str(id)).ok_or("null String receiver")?.to_owned();
+            let encoding = args.get(1).and_then(Value::as_ref).and_then(|id|heap.as_str(id)).unwrap_or("UTF-8").to_ascii_uppercase().replace('_',"-");
+            let bytes = match encoding.as_str() {
+                "UTF-8" | "UTF8" => text.into_bytes(),
+                "US-ASCII" | "ASCII" => text.chars().map(|c|if c.is_ascii(){c as u8}else{b'?'}).collect(),
+                "ISO-8859-1" | "LATIN1" => text.chars().map(|c|if c as u32<=255{c as u8}else{b'?'}).collect(),
+                "UTF-16LE" => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                "UTF-16BE" => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+                _ => return Err(format!("unsupported String encoding: {encoding}")),
+            };
+            let array=heap.alloc(HeapObject::Array{type_desc:"[B".into(),data:ArrayData::Byte(bytes.into_iter().map(|b|b as i8).collect())});
+            Ok(BuiltinResult::Handled(Value::Ref(Some(array))))
         }
         ("Ljava/lang/String;", "startsWith") => {
             let s = args.first().and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id)).unwrap_or("");
@@ -1152,66 +1244,6 @@ pub fn try_invoke_builtin(
         ("Ljava/lang/Thread;", "setDefaultUncaughtExceptionHandler") => {
             Ok(BuiltinResult::Handled(Value::Void))
         }
-        ("Ljava/lang/Thread;", "<init>") => {
-            let target = if descriptor.starts_with("(Ljava/lang/Runnable;") {
-                args.get(1).cloned()
-            } else if descriptor.starts_with("(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;") {
-                args.get(2).cloned()
-            } else {
-                None
-            };
-            if let (Some(id), Some(target_val)) = (args.first().and_then(|v| v.as_ref()), target) {
-                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
-                    fields.insert("target".into(), target_val);
-                }
-            }
-            Ok(BuiltinResult::Handled(Value::Void))
-        }
-        ("Ljava/lang/Thread;", "start") => {
-            let runnable = args.first().and_then(|v| v.as_ref()).and_then(|id| {
-                match heap.get(id) {
-                    Some(HeapObject::Instance { class_name, fields }) => {
-                        if let Some(t @ Value::Ref(Some(_))) = fields.get("target") {
-                            Some(t.clone())
-                        } else if class_name != "Ljava/lang/Thread;" {
-                            Some(Value::Ref(Some(id)))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-            });
-            if let Some(cb) = runnable {
-                let msg = heap.new_instance("Landroid/os/Message;");
-                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(msg) {
-                    fields.insert("callback".into(), cb);
-                }
-                let qid = match static_fields.get("PENGUDROID_MSG_QUEUE").and_then(|v| v.as_ref()) {
-                    Some(id) => id,
-                    None => {
-                        let id = heap.alloc(HeapObject::List(Vec::new()));
-                        static_fields.insert("PENGUDROID_MSG_QUEUE".into(), Value::Ref(Some(id)));
-                        id
-                    }
-                };
-                if let Some(HeapObject::List(vec)) = heap.get_mut(qid) {
-                    vec.push(Value::Ref(Some(msg)));
-                }
-            }
-            Ok(BuiltinResult::Handled(Value::Void))
-        }
-        ("Ljava/lang/Thread;", "currentThread") | ("Landroid/os/Looper;", "getThread") => {
-            let tid = match static_fields.get("PENGUDROID_MAIN_THREAD").and_then(|v| v.as_ref()) {
-                Some(id) => id,
-                None => {
-                    let id = heap.new_instance("Ljava/lang/Thread;");
-                    static_fields.insert("PENGUDROID_MAIN_THREAD".into(), Value::Ref(Some(id)));
-                    id
-                }
-            };
-            Ok(BuiltinResult::Handled(Value::Ref(Some(tid))))
-        }
         ("Ljava/lang/Thread;", "getDefaultUncaughtExceptionHandler") => {
             Ok(BuiltinResult::Handled(Value::Ref(None)))
         }
@@ -1219,7 +1251,7 @@ pub fn try_invoke_builtin(
         ("Ljava/util/concurrent/ConcurrentLinkedQueue;", "<init>") => {
             if let Some(id) = args.first().and_then(|v| v.as_ref()) {
                 if let Some(slot) = heap.get_mut(id) {
-                    *slot = HeapObject::List(Vec::new());
+                    *slot = HeapObject::Queue(std::collections::VecDeque::new());
                 }
             }
             Ok(BuiltinResult::Handled(Value::Void))
@@ -1227,8 +1259,8 @@ pub fn try_invoke_builtin(
         ("Ljava/util/concurrent/ConcurrentLinkedQueue;", "add" | "offer") => {
             let item = args.get(1).cloned().unwrap_or(Value::Ref(None));
             if let Some(id) = args.first().and_then(|v| v.as_ref()) {
-                if let Some(HeapObject::List(q)) = heap.get_mut(id) {
-                    q.push(item);
+                if let Some(HeapObject::Queue(q)) = heap.get_mut(id) {
+                    q.push_back(item);
                 }
             }
             Ok(BuiltinResult::Handled(Value::Int(1)))
@@ -1238,7 +1270,7 @@ pub fn try_invoke_builtin(
                 .first()
                 .and_then(|v| v.as_ref())
                 .and_then(|id| match heap.get_mut(id) {
-                    Some(HeapObject::List(q)) if !q.is_empty() => Some(q.remove(0)),
+                    Some(HeapObject::Queue(q)) if !q.is_empty() => q.pop_front(),
                     _ => None,
                 })
                 .unwrap_or(Value::Ref(None));
@@ -1249,14 +1281,11 @@ pub fn try_invoke_builtin(
                 .first()
                 .and_then(|v| v.as_ref())
                 .and_then(|id| match heap.get(id) {
-                    Some(HeapObject::List(q)) => Some(q.is_empty()),
+                    Some(HeapObject::Queue(q)) => Some(q.is_empty()),
                     _ => None,
                 })
                 .unwrap_or(true);
             Ok(BuiltinResult::Handled(Value::Int(i32::from(empty))))
-        }
-        ("Ljava/util/concurrent/CountDownLatch;", "<init>" | "countDown" | "await") => {
-            Ok(BuiltinResult::Handled(Value::Void))
         }
         ("Landroid/content/Context;", "getApplicationContext") => {
             let this_ref = args.first().cloned().unwrap_or(Value::Ref(None));
@@ -1269,7 +1298,7 @@ pub fn try_invoke_builtin(
                 .unwrap_or_else(|| Value::Ref(Some(heap.new_string("com.pengudroid.app".into()))));
             Ok(BuiltinResult::Handled(pkg))
         }
-        ("Landroid/content/Context;", "getApplicationInfo") => {
+        ("Landroid/content/Context;" | "Landroid/content/pm/PackageManager;", "getApplicationInfo") => {
             let app_info = heap.new_instance("Landroid/content/pm/ApplicationInfo;");
             let lib_dir = static_fields
                 .get("PENGUDROID_NATIVE_LIB_DIR")
@@ -1288,6 +1317,7 @@ pub fn try_invoke_builtin(
                 .cloned()
                 .unwrap_or_else(|| Value::Ref(Some(heap.new_string("com.pengudroid.app".into()))));
             if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(app_info) {
+                fields.insert("metaData".into(), static_fields.get("PENGUDROID_MANIFEST_META").cloned().unwrap_or(Value::Ref(None)));
                 fields.insert("nativeLibraryDir".into(), lib_dir);
                 fields.insert("sourceDir".into(), apk_path.clone());
                 fields.insert("publicSourceDir".into(), apk_path);
@@ -1305,6 +1335,19 @@ pub fn try_invoke_builtin(
         }
         ("Landroid/content/res/Resources;", "getConfiguration") => {
             let cfg = heap.new_instance("Landroid/content/res/Configuration;");
+            let width = std::env::var("PENGUDROID_SURFACE_W").ok().and_then(|s|s.parse::<i32>().ok()).unwrap_or(1280);
+            let height = std::env::var("PENGUDROID_SURFACE_H").ok().and_then(|s|s.parse::<i32>().ok()).unwrap_or(720);
+            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(cfg) {
+                fields.insert("fontScale".into(), Value::Float(1.0));
+                fields.insert("orientation".into(), Value::Int(if width > height {2} else {1}));
+                fields.insert("densityDpi".into(), Value::Int(320));
+                fields.insert("screenWidthDp".into(), Value::Int(width / 2));
+                fields.insert("screenHeightDp".into(), Value::Int(height / 2));
+                fields.insert("smallestScreenWidthDp".into(), Value::Int(width.min(height) / 2));
+                fields.insert("uiMode".into(), Value::Int(0x11));
+                fields.insert("keyboard".into(), Value::Int(1));
+                fields.insert("touchscreen".into(), Value::Int(3));
+            }
             Ok(BuiltinResult::Handled(Value::Ref(Some(cfg))))
         }
         ("Landroid/content/res/Resources;", "getDisplayMetrics") => {
@@ -1391,7 +1434,8 @@ pub fn try_invoke_builtin(
                 "display" => "Landroid/hardware/display/DisplayManager;",
                 "audio" => "Landroid/media/AudioManager;",
                 "activity" => "Landroid/app/ActivityManager;",
-                _ => "Ljava/lang/Object;",
+                "input_method" => "Landroid/view/inputmethod/InputMethodManager;",
+                _ => return Ok(BuiltinResult::Handled(Value::Ref(None))),
             };
             let id = heap.new_instance(cls);
             Ok(BuiltinResult::Handled(Value::Ref(Some(id))))
@@ -1533,13 +1577,6 @@ pub fn try_invoke_builtin(
         ("Landroid/view/Surface;", "isValid") => Ok(BuiltinResult::Handled(Value::Int(1))),
         ("Landroid/media/AudioManager;", "getStreamVolume") => Ok(BuiltinResult::Handled(Value::Int(10))),
         ("Landroid/media/AudioManager;", "getStreamMaxVolume") => Ok(BuiltinResult::Handled(Value::Int(15))),
-        ("Landroid/os/Looper;", "getMainLooper" | "myLooper") => {
-            let looper = heap.new_instance("Landroid/os/Looper;");
-            Ok(BuiltinResult::Handled(Value::Ref(Some(looper))))
-        }
-        ("Landroid/os/Looper;", "prepare" | "loop" | "quit" | "quitSafely") => {
-            Ok(BuiltinResult::Handled(Value::Void))
-        }
         ("Landroidx/arch/core/executor/ArchTaskExecutor;", "isMainThread") => {
             Ok(BuiltinResult::Handled(Value::Int(1)))
         }
@@ -1640,36 +1677,6 @@ pub fn try_invoke_builtin(
         ("Landroid/content/SharedPreferences;", "getLong") => {
             Ok(BuiltinResult::Handled(args.get(2).cloned().unwrap_or(Value::Long(0))))
         }
-        ("Ljava/util/concurrent/Semaphore;", "<init>") => {
-            let permits = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0);
-            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
-                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
-                    fields.insert("permits".into(), Value::Int(permits));
-                }
-            }
-            Ok(BuiltinResult::Handled(Value::Void))
-        }
-        ("Ljava/util/concurrent/Semaphore;", "acquire") => {
-            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
-                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
-                    let cur = fields.get("permits").and_then(|v| v.as_int().ok()).unwrap_or(0);
-                    fields.insert("permits".into(), Value::Int((cur - 1).max(0)));
-                }
-            }
-            Ok(BuiltinResult::Handled(Value::Void))
-        }
-        ("Ljava/util/concurrent/Semaphore;", "release") => {
-            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
-                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
-                    let cur = fields.get("permits").and_then(|v| v.as_int().ok()).unwrap_or(0);
-                    fields.insert("permits".into(), Value::Int(cur + 1));
-                }
-            }
-            Ok(BuiltinResult::Handled(Value::Void))
-        }
-        ("Ljava/util/concurrent/Semaphore;", "tryAcquire") => {
-            Ok(BuiltinResult::Handled(Value::Int(1)))
-        }
         ("Landroid/os/Handler;", "obtainMessage") => {
             let descriptor = format!("(Landroid/os/Handler;{}", descriptor.strip_prefix('(').ok_or("invalid Handler.obtainMessage descriptor")?);
             return try_invoke_builtin(heap, static_fields, "Landroid/os/Message;", "obtain", &descriptor, args);
@@ -1705,98 +1712,6 @@ pub fn try_invoke_builtin(
                 }
             }
             Ok(BuiltinResult::Handled(Value::Ref(Some(msg))))
-        }
-        ("Landroid/os/Message;", "sendToTarget") => {
-            if let Some(msg_val) = args.first().cloned() {
-                let qid = match static_fields.get("PENGUDROID_MSG_QUEUE").and_then(|v| v.as_ref()) {
-                    Some(id) => id,
-                    None => {
-                        let id = heap.alloc(HeapObject::List(Vec::new()));
-                        static_fields.insert("PENGUDROID_MSG_QUEUE".into(), Value::Ref(Some(id)));
-                        id
-                    }
-                };
-                if let Some(HeapObject::List(vec)) = heap.get_mut(qid) {
-                    vec.push(msg_val);
-                }
-            }
-            Ok(BuiltinResult::Handled(Value::Void))
-        }
-        ("Landroid/os/Handler;", "<init>") => {
-            let cb = match descriptor {
-                "(Landroid/os/Looper;Landroid/os/Handler$Callback;)V" => args.get(2).cloned(),
-                "(Landroid/os/Handler$Callback;)V" => args.get(1).cloned(),
-                _ => None,
-            };
-            if let (Some(hid), Some(cb_val)) = (args.first().and_then(|v| v.as_ref()), cb) {
-                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(hid) {
-                    fields.insert("mCallback".into(), cb_val);
-                }
-            }
-            Ok(BuiltinResult::Handled(Value::Void))
-        }
-        ("Landroid/os/Handler;", "sendMessage" | "sendMessageDelayed" | "sendMessageAtTime") => {
-            let target = args.first().cloned().unwrap_or(Value::Ref(None));
-            let msg_val = args.get(1).cloned().unwrap_or(Value::Ref(None));
-            if let Some(mid) = msg_val.as_ref() {
-                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(mid) {
-                    fields.insert("target".into(), target);
-                }
-                let qid = match static_fields.get("PENGUDROID_MSG_QUEUE").and_then(|v| v.as_ref()) {
-                    Some(id) => id,
-                    None => {
-                        let id = heap.alloc(HeapObject::List(Vec::new()));
-                        static_fields.insert("PENGUDROID_MSG_QUEUE".into(), Value::Ref(Some(id)));
-                        id
-                    }
-                };
-                if let Some(HeapObject::List(vec)) = heap.get_mut(qid) {
-                    vec.push(msg_val);
-                }
-            }
-            Ok(BuiltinResult::Handled(Value::Int(1)))
-        }
-        ("Landroid/os/Handler;", "post" | "postDelayed") => {
-            let target = args.first().cloned().unwrap_or(Value::Ref(None));
-            let runnable = args.get(1).cloned().unwrap_or(Value::Ref(None));
-            let msg = heap.new_instance("Landroid/os/Message;");
-            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(msg) {
-                fields.insert("target".into(), target);
-                fields.insert("callback".into(), runnable);
-            }
-            let qid = match static_fields.get("PENGUDROID_MSG_QUEUE").and_then(|v| v.as_ref()) {
-                Some(id) => id,
-                None => {
-                    let id = heap.alloc(HeapObject::List(Vec::new()));
-                    static_fields.insert("PENGUDROID_MSG_QUEUE".into(), Value::Ref(Some(id)));
-                    id
-                }
-            };
-            if let Some(HeapObject::List(vec)) = heap.get_mut(qid) {
-                vec.push(Value::Ref(Some(msg)));
-            }
-            Ok(BuiltinResult::Handled(Value::Int(1)))
-        }
-        ("Landroid/os/Handler;", "sendEmptyMessage") => {
-            let target = args.first().cloned().unwrap_or(Value::Ref(None));
-            let what = args.get(1).cloned().unwrap_or(Value::Int(0));
-            let msg = heap.new_instance("Landroid/os/Message;");
-            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(msg) {
-                fields.insert("target".into(), target);
-                fields.insert("what".into(), what);
-            }
-            let qid = match static_fields.get("PENGUDROID_MSG_QUEUE").and_then(|v| v.as_ref()) {
-                Some(id) => id,
-                None => {
-                    let id = heap.alloc(HeapObject::List(Vec::new()));
-                    static_fields.insert("PENGUDROID_MSG_QUEUE".into(), Value::Ref(Some(id)));
-                    id
-                }
-            };
-            if let Some(HeapObject::List(vec)) = heap.get_mut(qid) {
-                vec.push(Value::Ref(Some(msg)));
-            }
-            Ok(BuiltinResult::Handled(Value::Int(1)))
         }
         ("Landroid/app/Activity;", "getIntent") => {
             let intent = heap.new_instance("Landroid/content/Intent;");
@@ -1867,6 +1782,16 @@ pub fn try_invoke_builtin(
 
 /// Populate well-known static fields like `System.out`, `System.err`, `Build.VERSION.SDK_INT`.
 pub fn init_builtin_statics(heap: &mut Heap, static_fields: &mut HashMap<String, Value>) {
+    for (wrapper, primitive) in [("Boolean","Z"),("Byte","B"),("Character","C"),("Short","S"),("Integer","I"),("Long","J"),("Float","F"),("Double","D"),("Void","V")] {
+        let id = heap.class_object(primitive);
+        static_fields.insert(format!("Ljava/lang/{wrapper};.TYPE"), Value::Ref(Some(id)));
+    }
+
+    for (name,nanos) in [("NANOSECONDS",1i64),("MICROSECONDS",1000),("MILLISECONDS",1_000_000),("SECONDS",1_000_000_000),("MINUTES",60_000_000_000),("HOURS",3_600_000_000_000),("DAYS",86_400_000_000_000)] {
+        let id=heap.new_instance("Ljava/util/concurrent/TimeUnit;");
+        if let Some(HeapObject::Instance{fields,..})=heap.get_mut(id){fields.insert("nanos".into(),Value::Long(nanos));}
+        static_fields.insert(format!("Ljava/util/concurrent/TimeUnit;.{name}"),Value::Ref(Some(id)));
+    }
     let out_stream = heap.new_instance("Ljava/io/PrintStream;");
     let err_stream = heap.new_instance("Ljava/io/PrintStream;");
     static_fields.insert("Ljava/lang/System;.out".into(), Value::Ref(Some(out_stream)));

@@ -22,7 +22,7 @@ This is a scoped audit, **not a whole-Android completion percentage**. JNI wirin
 
 `pengudroid compat-index` reports the current binary's JNI table and ART/framework mappings. `PENGUDROID_COMPAT_REPORT=/path/report.json` records a Pengu launch when it returns. `PENGUDROID_VM_STRICT=1` rejects unresolved Java calls.
 
-**ZZZ 3.3.0 is not yet working independently.** Pengu loads its DEX and ARM64 engine libraries without ART/framework, but real worker-thread/Looper execution and additional framework calls remain blockers. The ART path reaches the login background; the blank SDK overlay is still unresolved. No responsive login or gameplay claim is made. [Details and remaining work](docs/INDEPENDENT_RUNTIME.md#zzz-330-result-and-remaining-work).
+**ZZZ 3.3.0 is not yet working independently.** Pengu loads its DEX and ARM64 engine libraries without ART/framework, and now runs real worker threads, Looper queues and Unity nativeRender calls. SDK resource/UI, service and reflection gaps still block a verified playable result. The ART path reaches the login background; the blank SDK overlay is still unresolved. No responsive login or gameplay claim is made. [Details and remaining work](docs/INDEPENDENT_RUNTIME.md#zzz-330-result-and-remaining-work).
 
 ## Independent Pengu profile
 
