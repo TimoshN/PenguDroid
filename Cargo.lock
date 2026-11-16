@@ -2989,6 +2989,7 @@ version = "0.3.0"
 dependencies = [
  "libc",
  "miniz_oxide 0.8.9",
+ "pengudroid-dexvm",
  "pengudroid-elf",
  "pengudroid-hostgpu",
  "pengudroid-input",
@@ -3018,6 +3019,13 @@ dependencies = [
 [[package]]
 name = "pengudroid-device"
 version = "0.3.0"
+
+[[package]]
+name = "pengudroid-dexvm"
+version = "0.3.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "pengudroid-elf"

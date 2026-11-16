@@ -3396,6 +3396,35 @@ pub unsafe extern "C" fn glBindFramebuffer(target: u32, framebuffer: u32) {
     bind(target, framebuffer);
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn glDebugMessageCallbackKHR(
+    callback: *const c_void,
+    user_param: *const c_void,
+) {
+    let sym = libc::dlsym(
+        libc::RTLD_DEFAULT,
+        b"glDebugMessageCallback\0".as_ptr() as *const c_char,
+    );
+    if !sym.is_null() {
+        let f: unsafe extern "C" fn(*const c_void, *const c_void) = std::mem::transmute(sym);
+        f(callback, user_param);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glGetPointervKHR(pname: u32, params: *mut *mut c_void) {
+    let sym = libc::dlsym(
+        libc::RTLD_DEFAULT,
+        b"glGetPointerv\0".as_ptr() as *const c_char,
+    );
+    if !sym.is_null() {
+        let f: unsafe extern "C" fn(u32, *mut *mut c_void) = std::mem::transmute(sym);
+        f(pname, params);
+    } else if !params.is_null() {
+        *params = std::ptr::null_mut();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pengudroid-proto",
     "crates/pengudroid-runtime",
+    "crates/pengudroid-dexvm",
     "crates/pengudroid-socket",
     "crates/pengudroid-input",
     "crates/pengudroid-gui",
@@ -27,6 +28,7 @@ description = "A no-KVM, no-container Android compatibility layer for Linux."
 
 [workspace.dependencies]
 pengudroid-runtime = { path = "crates/pengudroid-runtime" }
+pengudroid-dexvm = { path = "crates/pengudroid-dexvm" }
 libc = "0.2"
 miniz_oxide = "0.8"
 

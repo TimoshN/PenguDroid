@@ -4269,6 +4269,213 @@ pub unsafe extern "C" fn RemoveSpecialSignalHandlerFn(_signal: c_int, _action: *
     true
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn AActivityManager_ProcessObserver_create(_cookie: *mut c_void) -> *mut c_void {
+    Box::into_raw(Box::new(0usize)) as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AActivityManager_ProcessObserver_destroy(observer: *mut c_void) {
+    if !observer.is_null() {
+        drop(Box::from_raw(observer as *mut usize));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AActivityManager_ProcessObserver_setOnForegroundActivitiesChanged(
+    _observer: *mut c_void,
+    _cb: *const c_void,
+) {
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AActivityManager_ProcessObserver_setOnProcessDied(
+    _observer: *mut c_void,
+    _cb: *const c_void,
+) {
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AActivityManager_registerProcessObserver(_observer: *mut c_void) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AActivityManager_unregisterProcessObserver(_observer: *mut c_void) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn AChoreographer_postFrameCallback(
+    _choreographer: *mut c_void,
+    _callback: *const c_void,
+    _data: *mut c_void,
+) {
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AChoreographer_postFrameCallbackDelayed(
+    _choreographer: *mut c_void,
+    _callback: *const c_void,
+    _data: *mut c_void,
+    _delay_millis: libc::c_long,
+) {
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AInputQueue_attachLooper(
+    _queue: *mut c_void,
+    _looper: *mut c_void,
+    _ident: c_int,
+    _callback: *const c_void,
+    _data: *mut c_void,
+) {
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorManager_getInstance() -> *mut c_void {
+    1usize as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorManager_getInstanceForPackage(
+    _package_name: *const c_char,
+) -> *mut c_void {
+    1usize as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorManager_getSensorList(
+    _manager: *mut c_void,
+    list: *mut *const *mut c_void,
+) -> c_int {
+    if !list.is_null() {
+        *list = std::ptr::null();
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorManager_getDefaultSensor(
+    _manager: *mut c_void,
+    _sensor_type: c_int,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorManager_getDefaultSensorEx(
+    _manager: *mut c_void,
+    _sensor_type: c_int,
+    _wake_up: bool,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorManager_createEventQueue(
+    _manager: *mut c_void,
+    _looper: *mut c_void,
+    _ident: c_int,
+    _callback: *const c_void,
+    _data: *mut c_void,
+) -> *mut c_void {
+    Box::into_raw(Box::new(0usize)) as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorManager_destroyEventQueue(
+    _manager: *mut c_void,
+    queue: *mut c_void,
+) -> c_int {
+    if !queue.is_null() {
+        drop(Box::from_raw(queue as *mut usize));
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensor_getName(_sensor: *const c_void) -> *const c_char {
+    c"PenguSensor".as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensor_getVendor(_sensor: *const c_void) -> *const c_char {
+    c"PenguDroid".as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensor_getType(_sensor: *const c_void) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensor_getMinDelay(_sensor: *const c_void) -> c_int {
+    10000
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensor_getResolution(_sensor: *const c_void) -> f32 {
+    0.01
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorEventQueue_enableSensor(
+    _queue: *mut c_void,
+    _sensor: *const c_void,
+) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorEventQueue_disableSensor(
+    _queue: *mut c_void,
+    _sensor: *const c_void,
+) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorEventQueue_setEventRate(
+    _queue: *mut c_void,
+    _sensor: *const c_void,
+    _usec: i32,
+) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorEventQueue_hasEvents(_queue: *mut c_void) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ASensorEventQueue_getEvents(
+    _queue: *mut c_void,
+    _events: *mut c_void,
+    _count: usize,
+) -> isize {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AStorageManager_mountObb(
+    _mgr: *mut c_void,
+    _filename: *const c_char,
+    _key: *const c_char,
+    _cb: *const c_void,
+    _data: *mut c_void,
+) {
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AStorageManager_unmountObb(
+    _mgr: *mut c_void,
+    _filename: *const c_char,
+    _force: c_int,
+    _cb: *const c_void,
+    _data: *mut c_void,
+) {
+}
+
 unsafe fn dlsym_next<T: Copy>(name: &[u8]) -> Option<T> {
     debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
     let p = libc::dlsym(RTLD_NEXT, name.as_ptr() as *const c_char);

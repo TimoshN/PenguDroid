@@ -105,7 +105,9 @@ pub struct Callbacks {
     pub get_exported_namespace: *const c_void,
     pub pre_zygote_fork: *const c_void,
     pub get_trampoline_with_jni_call_type: *const c_void,
-    pub get_trampoline_for_function_pointer: *const c_void,
+    pub get_trampoline_for_function_pointer: Option<
+        unsafe extern "C" fn(*const c_void, *const c_char, u32, bool) -> *mut c_void,
+    >,
     pub is_native_bridge_function_pointer: *const c_void,
 }
 
@@ -201,9 +203,6 @@ impl Shorty {
             return Err(format!("`{ret}` is not a JNI return code"));
         }
         let args: Vec<char> = chars.collect();
-        if ret == 'V' && !args.is_empty() {
-            return Err("a void shorty cannot declare arguments".into());
-        }
         for arg in &args {
             if !code(*arg) {
                 return Err(format!("`{arg}` is not a JNI argument code"));
@@ -434,6 +433,50 @@ impl Translator {
         Ok(GuestFunction { entry, shorty: shorty.clone() })
     }
 
+    /// Resolve the special `JNI_OnLoad(JavaVM*, void*)` trampoline (`shorty = NULL, len = 0`),
+    /// which wraps `JavaVM*` / `JNIEnv*` for ARM64 guest code.
+    pub fn jni_on_load(&self, library: &GuestLibrary) -> Result<*mut c_void, Error> {
+        let callbacks = unsafe { &*self.callbacks };
+        let trampoline = callbacks.get_trampoline.ok_or(Error::MissingSlot("getTrampoline"))?;
+        let entry = unsafe {
+            trampoline(
+                library.handle,
+                c"JNI_OnLoad".as_ptr(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        if entry.is_null() {
+            return Err(Error::NoTrampoline {
+                symbol: "JNI_OnLoad".to_string(),
+                shorty: String::new(),
+            });
+        }
+        Ok(entry)
+    }
+
+    /// Wrap a raw ARM64 function pointer (e.g. from `JNIEnv::RegisterNatives`)
+    /// into a callable x86_64 trampoline using `getTrampolineForFunctionPointer`.
+    pub fn trampoline_for_function_pointer(
+        &self,
+        fn_ptr: *const c_void,
+        shorty: &Shorty,
+    ) -> Result<*mut c_void, Error> {
+        let callbacks = unsafe { &*self.callbacks };
+        let f = callbacks
+            .get_trampoline_for_function_pointer
+            .ok_or(Error::MissingSlot("getTrampolineForFunctionPointer"))?;
+        let shorty_c = shorty.to_c()?;
+        let entry = unsafe { f(fn_ptr, shorty_c.as_ptr(), shorty.as_str().len() as u32, false) };
+        if entry.is_null() {
+            return Err(Error::NoTrampoline {
+                symbol: format!("0x{:x}", fn_ptr as usize),
+                shorty: shorty.as_str().to_string(),
+            });
+        }
+        Ok(entry)
+    }
+
     /// Release a guest library through the bridge.
     pub fn unload_library(&self, library: GuestLibrary) -> Result<(), Error> {
         let callbacks = unsafe { &*self.callbacks };
@@ -549,7 +592,8 @@ mod tests {
         // A JNI descriptor is the mistake this type exists to catch.
         assert!(Shorty::parse("()I").is_err());
         assert!(Shorty::parse("(I)V").is_err());
-        assert!(Shorty::parse("VI").is_err());
+        assert!(Shorty::parse("VI").is_ok());
+        assert!(Shorty::parse("IV").is_err());
         assert!(Shorty::parse("").is_err());
         assert!(Shorty::parse("X").is_err());
     }

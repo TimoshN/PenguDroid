@@ -116,6 +116,14 @@ fn map_with_roots(host: Option<&[u8]>, arm64: Option<&[u8]>, path: &[u8]) -> Opt
             return map_with_root(arm64, path);
         }
     }
+    if path == b"/system" {
+        if let Some(host) = host {
+            return map_with_root(host, path);
+        }
+        if let Some(arm64) = arm64 {
+            return map_with_root(arm64, path);
+        }
+    }
     map_with_root(host?, path)
 }
 
@@ -417,7 +425,7 @@ pub unsafe extern "C" fn faccessat(
 
 fn virtual_arm64_path<'a>(root: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
     let path = path.strip_prefix(root)?;
-    arm64_runtime_path(path).then_some(path)
+    (arm64_runtime_path(path) || path == b"/system").then_some(path)
 }
 
 fn virtual_runtime_path(path: &[u8]) -> Option<Vec<u8>> {

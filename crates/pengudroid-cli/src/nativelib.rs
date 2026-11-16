@@ -144,6 +144,7 @@ pub fn ensure_compat_dir() -> Result<PathBuf, String> {
         // the linker and its `libdl_android` wrapper resolve here too.
         "libdl_android.so",
         "ld-android.so",
+        "libbase.so",
     ];
     for name in BIONIC_SONAMES {
         symlink(&dir.join(name), &shim).map_err(|e| format!("symlink {name}: {e}"))?;

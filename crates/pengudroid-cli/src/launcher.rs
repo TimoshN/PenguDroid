@@ -22,6 +22,7 @@ use crate::apk::{self, ApkInfo};
 pub enum Backend {
     Native,
     Art,
+    Pengu,
 }
 
 impl Backend {
@@ -29,6 +30,7 @@ impl Backend {
         match self {
             Backend::Native => "native",
             Backend::Art => "art",
+            Backend::Pengu => "pengu",
         }
     }
 }
@@ -373,7 +375,7 @@ pub fn launch(args: &[String]) -> i32 {
     }
     let Some(apk_path) = apk_path else {
         eprintln!(
-            "usage: pengudroid launch <app.apk> [--backend auto|native|art] [--prefix DIR] \
+            "usage: pengudroid launch <app.apk> [--backend auto|native|art|pengu] [--prefix DIR] \
              [--sysroot DIR] [--width PX] [--height PX] [--density DPI] [-- ARGS]"
         );
         return 2;
@@ -390,6 +392,7 @@ pub fn launch(args: &[String]) -> i32 {
         None | Some("auto") => planned.backend,
         Some("native") => Backend::Native,
         Some("art") => Backend::Art,
+        Some("pengu") => Backend::Pengu,
         Some(other) => {
             eprintln!("pengudroid launch: unknown backend {other}");
             return 2;
@@ -487,6 +490,7 @@ pub fn launch(args: &[String]) -> i32 {
     }
 
     match backend {
+        Backend::Pengu => run_pengu_vm(&app_path, &split_paths, &info, &prefix),
         Backend::Native => {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
             cmd.arg("native").arg(&app_path);
@@ -747,7 +751,7 @@ fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
                 Some(b.abis[0].clone())
             }
         }
-        Backend::Art => {
+        Backend::Art | Backend::Pengu => {
             // Prefer the host ABI when the bundle has it. An ARM-only bundle has
             // no x86_64 split, so pick the architecture the native bridge can
             // translate: arm64-v8a before armeabi-v7a. Falling back to
@@ -892,6 +896,303 @@ fn run_child(mut cmd: std::process::Command) -> i32 {
     }
 }
 
+fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: &Path) -> i32 {
+    if std::env::var_os("PENGUDROID_PENGU_PRELOADED").is_none() {
+        let mut preloads: Vec<String> = Vec::new();
+        if let Some(s) = crate::deps::find_shim() {
+            preloads.push(s.to_string_lossy().into_owned());
+        }
+        if let Some(g) = crate::nativelib::find_gleshim() {
+            preloads.push(g.to_string_lossy().into_owned());
+        }
+        if let Some(v) = crate::nativelib::find_vkshim() {
+            preloads.push(v.to_string_lossy().into_owned());
+        }
+        for cand in [
+            "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/usr/lib64/libvulkan.so.1",
+            "/usr/lib/libvulkan.so.1",
+        ] {
+            if Path::new(cand).is_file() {
+                preloads.push(cand.to_string());
+                break;
+            }
+        }
+
+        let mut lib_paths: Vec<String> = vec![
+            "/system/lib64/arm64/bootstrap".to_string(),
+            "/system/lib64/arm64".to_string(),
+        ];
+        if let Ok(cdir) = crate::nativelib::ensure_compat_dir() {
+            lib_paths.push(cdir.to_string_lossy().into_owned());
+        }
+        lib_paths.push(prefix.join("lib").to_string_lossy().into_owned());
+        lib_paths.push(prefix.join("lib/arm64").to_string_lossy().into_owned());
+
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
+        cmd.args(std::env::args_os().skip(1));
+        cmd.env("PENGUDROID_PENGU_PRELOADED", "1");
+        if !preloads.is_empty() {
+            cmd.env("LD_PRELOAD", preloads.join(":"));
+        }
+        if let Some((bridge_dir, guest_root)) = find_arm64_bridge_dir() {
+            let staged_bridge = prefix.join("code_cache/bridge");
+            let _ = std::fs::create_dir_all(&staged_bridge);
+            if let Ok(entries) = std::fs::read_dir(&bridge_dir) {
+                for ent in entries.flatten() {
+                    let p = ent.path();
+                    if p.is_file() {
+                        let dst = staged_bridge.join(ent.file_name());
+                        if !dst.is_file() {
+                            if let Ok(raw) = std::fs::read(&p) {
+                                if let Ok(stripped) = pengudroid_elf::strip_android_versions(&raw) {
+                                    let _ = std::fs::write(&dst, stripped);
+                                    continue;
+                                }
+                            }
+                            let _ = std::fs::copy(&p, &dst);
+                        }
+                    }
+                }
+            }
+            lib_paths.push(staged_bridge.to_string_lossy().into_owned());
+            cmd.env("PENGUDROID_NATIVE_BRIDGE_LIB", &staged_bridge);
+            if let Some(gr) = guest_root {
+                cmd.env("PENGUDROID_ARM64_GUEST_ROOT", gr);
+            }
+        }
+        if let Some(prev) = std::env::var_os("LD_LIBRARY_PATH") {
+            lib_paths.push(prev.to_string_lossy().into_owned());
+        }
+        cmd.env("LD_LIBRARY_PATH", lib_paths.join(":"));
+        cmd.env("PENGUDROID_BRIDGE_TLS", "1");
+        cmd.env("BERBERIS_FLAGS", "glibc-host-thread-id-handoff");
+        cmd.env("BERBERIS_MODE", "lite-translate-or-interpret");
+        return run_child(cmd);
+    }
+
+    let entries = match apk::apk_entries(apk_path) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("pengudroid vm: cannot list {apk_path}: {e}");
+            return 1;
+        }
+    };
+    let mut vm = pengudroid_dexvm::Vm::new();
+    vm.set_package_name(&info.package);
+    let lib_dir = prefix.join("lib");
+    let arm64_dir = lib_dir.join("arm64");
+    let _ = std::fs::create_dir_all(&arm64_dir);
+    let mut x86_count = apk::extract_prefix(apk_path, "lib/x86_64/", &lib_dir).unwrap_or(0);
+    for split in split_paths {
+        x86_count += apk::extract_prefix(split, "lib/x86_64/", &lib_dir).unwrap_or(0);
+    }
+    let mut arm64_count = 0u64;
+    if x86_count == 0 {
+        arm64_count += apk::extract_prefix(apk_path, "lib/arm64-v8a/", &arm64_dir).unwrap_or(0);
+        for split in split_paths {
+            arm64_count += apk::extract_prefix(split, "lib/arm64-v8a/", &arm64_dir).unwrap_or(0);
+        }
+    }
+    let active_lib_dir = if x86_count > 0 { lib_dir.clone() } else { arm64_dir.clone() };
+    vm.set_runtime_paths(
+        &active_lib_dir.to_string_lossy(),
+        apk_path,
+        &prefix.join("files").to_string_lossy(),
+    );
+    vm.add_native_dir(active_lib_dir);
+
+    let has_arm64 = arm64_count > 0
+        || std::fs::read_dir(&arm64_dir)
+            .map(|mut d| d.any(|e| e.ok().is_some_and(|f| f.path().extension().and_then(|x| x.to_str()) == Some("so"))))
+            .unwrap_or(false);
+    if x86_count == 0 && has_arm64 {
+        if let Some((bridge_dir, _guest_root)) = find_arm64_bridge_dir() {
+            let staged_bridge = prefix.join("code_cache/bridge");
+            let cache_dir = prefix.join("code_cache");
+            let bridge_so = staged_bridge.join("libberberis_arm64.so");
+            let src_bridge = bridge_dir.join("libberberis_arm64.so");
+            let open_path = if bridge_so.is_file() { &bridge_so } else { &src_bridge };
+            if let Ok(c_open) = std::ffi::CString::new(open_path.as_os_str().as_encoded_bytes()) {
+                unsafe { libc::dlopen(c_open.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+            }
+            match pengudroid_nativebridge::Translator::open(open_path) {
+                Err(e) => {
+                    eprintln!("pengudroid vm: Translator::open({}) failed: {e}", open_path.display());
+                }
+                Ok(mut translator) => {
+                let cbs = pengudroid_nativebridge::RuntimeCallbacks {
+                    get_method_shorty: pengudroid_dexvm::jni_host::bridge_get_method_shorty,
+                    get_native_method_count:
+                        pengudroid_dexvm::jni_host::bridge_get_native_method_count,
+                    get_native_methods: pengudroid_dexvm::jni_host::bridge_get_native_methods,
+                };
+                std::env::set_var("PENGUDROID_APK", apk_path);
+                if !split_paths.is_empty() {
+                    std::env::set_var("PENGUDROID_SPLIT_APKS", split_paths.join(":"));
+                }
+                let prev_ld = std::env::var_os("LD_LIBRARY_PATH");
+                let prev_preload = std::env::var_os("LD_PRELOAD");
+                std::env::set_var(
+                    "LD_LIBRARY_PATH",
+                    format!(
+                        "{}:{}:/system/lib64/arm64/bootstrap:/system/lib64/arm64",
+                        arm64_dir.display(),
+                        lib_dir.display()
+                    ),
+                );
+                std::env::remove_var("LD_PRELOAD");
+                let init_res = translator.initialize(
+                    &cbs,
+                    &cache_dir,
+                    pengudroid_nativebridge::ARM64_ISA,
+                );
+                match prev_ld {
+                    Some(v) => std::env::set_var("LD_LIBRARY_PATH", v),
+                    None => std::env::remove_var("LD_LIBRARY_PATH"),
+                }
+                if let Some(v) = prev_preload {
+                    std::env::set_var("LD_PRELOAD", v);
+                }
+                if let Err(e) = init_res {
+                    eprintln!("pengudroid vm: ARM64 bridge initialize failed: {e}");
+                } else {
+                    println!(
+                        "pengudroid vm: initialized ARM64 bridge from {} (zero ART/framework)",
+                        open_path.display()
+                    );
+                    let bridge_state = std::rc::Rc::new(std::cell::RefCell::new((
+                        translator,
+                        Vec::<pengudroid_nativebridge::GuestLibrary>::new(),
+                        std::collections::HashSet::<String>::new(),
+                    )));
+                    let loader_state = std::rc::Rc::clone(&bridge_state);
+                    vm.set_native_loader(Box::new(move |so_path: &str| {
+                        let mut st = loader_state.borrow_mut();
+                        if st.2.contains(so_path) {
+                            return Ok(());
+                        }
+                        if let Some(parent) = Path::new(so_path).parent() {
+                            for dep_name in ["libc++_shared.so", "libfmod.so", "libfmodstudio.so"] {
+                                let dep = parent.join(dep_name);
+                                let dep_str = dep.to_string_lossy().into_owned();
+                                if dep.is_file() && dep_str != so_path && !st.2.contains(&dep_str) {
+                                    if let Ok(dep_lib) = st.0.load_library(&dep) {
+                                        st.1.push(dep_lib);
+                                        st.2.insert(dep_str);
+                                    }
+                                }
+                            }
+                        }
+                        let lib = st
+                            .0
+                            .load_library(Path::new(so_path))
+                            .map_err(|e| format!("bridge load_library({so_path}): {e}"))?;
+                        st.2.insert(so_path.to_string());
+                        if let Ok(on_load_ptr) = st.0.jni_on_load(&lib) {
+                            type FnOnLoad = unsafe extern "C" fn(
+                                *mut std::ffi::c_void,
+                                *mut std::ffi::c_void,
+                            ) -> i32;
+                            let f: FnOnLoad = unsafe { std::mem::transmute(on_load_ptr) };
+                            let ver = unsafe {
+                                f(
+                                    pengudroid_dexvm::jni_host::java_vm_ptr(),
+                                    std::ptr::null_mut(),
+                                )
+                            };
+                            if ver < 0 {
+                                return Err(format!("JNI_OnLoad({so_path}) returned {ver}"));
+                            }
+                        }
+                        st.1.push(lib);
+                        Ok(())
+                    }));
+                    let sym_state = std::rc::Rc::clone(&bridge_state);
+                    vm.set_symbol_resolver(Box::new(move |sym: &str, shorty_str: &str| {
+                        let st = sym_state.borrow();
+                        let shorty = pengudroid_nativebridge::Shorty::parse(shorty_str).ok()?;
+                        for lib in &st.1 {
+                            if let Ok(gf) = st.0.guest_function(lib, sym, &shorty) {
+                                return Some(gf.address() as usize);
+                            }
+                        }
+                        None
+                    }));
+                    let wrap_state = std::rc::Rc::clone(&bridge_state);
+                    vm.set_pointer_wrapper(Box::new(move |raw_ptr: usize, shorty_str: &str| {
+                        let st = wrap_state.borrow();
+                        let shorty = pengudroid_nativebridge::Shorty::parse(shorty_str).ok()?;
+                        st.0.trampoline_for_function_pointer(
+                            raw_ptr as *const std::ffi::c_void,
+                            &shorty,
+                        )
+                        .ok()
+                        .map(|p| p as usize)
+                    }));
+                }
+                }
+            }
+        }
+    }
+
+    let mut dex_count = 0usize;
+    for entry in entries {
+        if entry.starts_with("classes") && entry.ends_with(".dex") && !entry.contains('/') {
+            match apk::extract_named(apk_path, &entry) {
+                Ok(bytes) => {
+                    if let Err(e) = vm.load_dex(&bytes) {
+                        eprintln!("pengudroid vm: failed to load {entry}: {e}");
+                        return 1;
+                    }
+                    dex_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("pengudroid vm: failed to extract {entry}: {e}");
+                    return 1;
+                }
+            }
+        }
+    }
+    println!(
+        "pengudroid vm: loaded {dex_count} DEX file(s) for {} (zero ART/framework modules)",
+        info.package
+    );
+    let Some(act) = info.main_activity_name() else {
+        eprintln!("pengudroid vm: no main activity found in manifest");
+        return 1;
+    };
+    let resolved = info.resolve(act);
+    let desc = format!("L{};", resolved.replace('.', "/"));
+    if std::env::var_os(crate::display::SURFACE_W_ENV).is_none() {
+        std::env::set_var(crate::display::SURFACE_W_ENV, "1280");
+    }
+    if std::env::var_os(crate::display::SURFACE_H_ENV).is_none() {
+        std::env::set_var(crate::display::SURFACE_H_ENV, "720");
+    }
+    if let Err(error) = crate::runner::ensure_daemon(&pengudroid_proto::default_socket_path()) {
+        eprintln!("pengudroid vm: warning: daemon not started: {error}");
+    }
+    println!("pengudroid vm: launching {desc}");
+    match vm.launch_activity(&desc) {
+        Ok(_) => {
+            println!("pengudroid vm: launch_activity returned");
+            let wait_secs = std::env::var("PENGUDROID_PENGU_WAIT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            if wait_secs > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("pengudroid vm: activity failed: {e}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod data_dir_tests {
     use super::*;
@@ -953,5 +1254,6 @@ mod tests {
     fn backend_names_are_stable() {
         assert_eq!(Backend::Native.name(), "native");
         assert_eq!(Backend::Art.name(), "art");
+        assert_eq!(Backend::Pengu.name(), "pengu");
     }
 }
