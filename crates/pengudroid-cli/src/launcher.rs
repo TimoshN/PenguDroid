@@ -282,11 +282,22 @@ fn art_sysroot(explicit: Option<&str>) -> Option<PathBuf> {
 /// non-interactive (the desktop app, scripts, CI) gets instructions instead of
 /// a prompt it could never answer.
 fn offer_runtime_install() -> Option<PathBuf> {
-    use std::io::{IsTerminal, Write};
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    if std::env::var_os("PENGUDROID_AUTO_RUNTIME").is_some_and(|v| v == "0") {
         return None;
     }
-    if std::env::var_os("PENGUDROID_AUTO_RUNTIME").is_some_and(|v| v == "0") {
+    // Local/bundled modules need neither network consent nor an interactive
+    // terminal. This also enables first launch from a desktop or daemon.
+    if crate::runtime::module_store().is_some() {
+        return match crate::runtime::provision(false) {
+            Ok(tree) => Some(tree),
+            Err(error) => {
+                eprintln!("pengudroid launch: {error}");
+                None
+            }
+        };
+    }
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return None;
     }
     eprint!(
@@ -325,7 +336,7 @@ pub fn launch(args: &[String]) -> i32 {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--prefix" => prefix_arg = it.next().cloned(),
-            "--sysroot" => sysroot_arg = it.next().cloned(),
+            "--runtime" | "--sysroot" => sysroot_arg = it.next().cloned(),
             "--backend" => backend_arg = it.next().cloned(),
             "--component" => component = it.next().cloned(),
             "--width" => match it.next().and_then(|v| v.parse().ok()) {
@@ -508,7 +519,7 @@ pub fn launch(args: &[String]) -> i32 {
             }
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
             cmd.arg("art-test")
-                .arg("--sysroot")
+                .arg("--runtime")
                 .arg(&sysroot)
                 .arg("--classpath")
                 .arg(&app_path);

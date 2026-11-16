@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "miniz_oxide 0.8.9",
@@ -2994,13 +2994,14 @@ dependencies = [
  "pengudroid-input",
  "pengudroid-nativebridge",
  "pengudroid-proto",
+ "pengudroid-runtime",
  "pengudroid-socket",
  "roxmltree",
 ]
 
 [[package]]
 name = "pengudroid-daemon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "pengudroid-device",
@@ -3016,15 +3017,15 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-device"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "pengudroid-elf"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "pengudroid-gleshim"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "pengudroid-proto",
@@ -3033,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-gui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "pengudroid-input",
@@ -3043,46 +3044,54 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-hostgpu"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "pengudroid-input"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "pengudroid-nativebridge"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "pengudroid-proto"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "pengudroid-device",
 ]
 
 [[package]]
+name = "pengudroid-runtime"
+version = "0.3.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "pengudroid-shim"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "miniz_oxide 0.8.9",
  "pengudroid-device",
  "pengudroid-proto",
+ "pengudroid-runtime",
  "pengudroid-socket",
 ]
 
 [[package]]
 name = "pengudroid-socket"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "pengudroid-proto",
@@ -3090,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-vkshim"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "pengudroid-proto",

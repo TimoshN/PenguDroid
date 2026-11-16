@@ -823,9 +823,10 @@ fn print_help() {
          \x20   deps <lib.so>                               bionic import coverage\n\
          \x20   doctor <app.apk>                            can this APK run? what is missing?\n\
          \x20   runtime [--status] [--download]           find/prepare the Android runtime (no --sysroot needed)\n\
+         \x20   runtime --modules STORE                     install/update component runtime\n\
          \x20   keymap-preset [<package> [WxH]]             print a built-in keymap (no args: list them)\n\
          \x20   sysroot <dir>                               inspect an extracted Android system tree\n\
-         \x20   art-test --sysroot <dir>                    try JNI_CreateJavaVM against it\n\
+         \x20   art-test --runtime <dir>                    try JNI_CreateJavaVM against it\n\
          \x20     [--classpath <apk|jar>] [--find-class <C>] [--main <C>]\n\
          \x20     [--jni-lib <so>] [--register-natives <so>]\n\
          \x20   geometry [--width W] [--height H] [--density DPI] [--resize WxH]\n\

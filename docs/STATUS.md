@@ -1,5 +1,18 @@
 # Project status and handoff
 
+## Current — 0.3.0 component runtime (2026-11-16)
+
+Android paths now resolve through `pengudroid-runtime` providers. Default
+component installs contain neither a physical `system/`/`apex/` tree nor
+`build.prop`; SDK metadata is held in the runtime descriptor. ARM64 has its own
+component, so the component AppImage no longer bundles a separate guest sysroot.
+Explicit legacy overrides remain available. Supplied/bundled components take
+priority over automatic discovery of old tree installs.
+
+See [component architecture and setup](MODULAR_RUNTIME.md),
+[packaged validation](COMPONENT_APPIMAGE_TESTS.md), and
+[0.3.0 release notes](RELEASE-0.3.0.md). Genshin is outside this release's validation scope.
+
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
 ## Current — 0.2.1 Vulkan ZZZ boot, upright presentation, and AppImage X11 fix (2026-11-15)

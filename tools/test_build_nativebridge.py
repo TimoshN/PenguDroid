@@ -982,7 +982,10 @@ class SourceCompatibilityPatchTests(unittest.TestCase):
 
     @unittest.skipUnless((build.DEPS / "sources" / "native_bridge_support").is_dir(),
                          "requires the prepared native_bridge_support source tree")
-    def test_the_prepared_tree_is_already_patched(self):
+    def test_the_prepared_tree_patch_pass_is_idempotent(self):
+        # A downloaded cache may still contain pristine sources. Prepare once,
+        # then assert subsequent passes do not rewrite the already-patched tree.
+        build.apply_source_compatibility_patches({})
         # Running the driver twice in a row must be a no-op: the patches are
         # applied in `prepare_root`, and a patch that keeps matching would report
         # a dirty tree (and change source) on every build.
@@ -1002,6 +1005,15 @@ class SourceCompatibilityPatchTests(unittest.TestCase):
 
 class PinnedIntegrationTests(unittest.TestCase):
     def setUp(self):
+        manifest_path = build.DEPS / "manifest.json"
+        if not manifest_path.is_file():
+            self.skipTest("requires verified native-bridge build inputs")
+        preflight = json.loads(manifest_path.read_text()).get("preflight", {})
+        if preflight.get("passed") is not True:
+            self.skipTest("requires successful API-37 build SDK preflight; runtime-only caches are insufficient")
+        self.assertIn("sysroot", preflight, "successful preflight must identify its verified build SDK")
+        if not Path(preflight["sysroot"]).is_dir():
+            self.skipTest("verified build SDK is no longer available locally")
         build.prepare_root()
         temporary = tempfile.TemporaryDirectory(prefix="integration-test-", dir=build.ROOT / "work")
         self.addCleanup(temporary.cleanup)

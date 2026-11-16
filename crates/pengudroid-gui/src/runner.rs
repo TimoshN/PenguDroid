@@ -26,7 +26,7 @@ impl RunningApp {
             .map_err(|e| e.to_string())?;
         let mut cmd = Command::new(pengudroid_binary());
         cmd.arg("launch").arg(&entry.apk);
-        if let Some(sysroot) = sysroot() { cmd.arg("--sysroot").arg(sysroot); }
+        if let Some(sysroot) = sysroot() { cmd.arg("--runtime").arg(sysroot); }
         launch_preferences(&mut cmd, fps, keymapper);
         cmd.env("PENGUDROID_APP_LABEL", &entry.label)
             .stdin(Stdio::null()).stdout(log.try_clone().map_err(|e| e.to_string())?)
@@ -83,13 +83,30 @@ fn launch_preferences(cmd: &mut Command, fps: bool, keymapper: bool) {
     }
 }
 
+/// Whether first-run setup has an offline store or explicit download opt-in.
+pub fn should_prepare_runtime() -> bool {
+    if std::env::var("PENGUDROID_AUTO_RUNTIME").as_deref() == Ok("0") {
+        return false;
+    }
+    std::env::var("PENGUDROID_AUTO_RUNTIME").as_deref() == Ok("1") || has_component_store()
+}
+
+fn has_component_store() -> bool {
+    if std::env::var_os("PENGUDROID_RUNTIME_MODULES").is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    std::env::current_exe().ok().and_then(|path| {
+        path.parent().map(|dir| dir.join("../share/pengudroid/runtime-modules/runtime-modules.json"))
+    }).is_some_and(|manifest| manifest.is_file())
+}
+
 /// The Android tree to run against.
 ///
 /// `PENGUDROID_ART_SYSROOT`/`PENGUDROID_SYSROOT` win, then the in-repo tree, then
 /// the per-user locations — including the runtime cache that `pengudroid
 /// runtime` fills, so the desktop app never asks the user for a path.
 pub fn sysroot() -> Option<PathBuf> {
-    for name in ["PENGUDROID_ART_SYSROOT", "PENGUDROID_SYSROOT"] {
+    for name in ["PENGUDROID_RUNTIME", "PENGUDROID_ART_SYSROOT", "PENGUDROID_SYSROOT"] {
         if let Some(explicit) = std::env::var_os(name) {
             let path = PathBuf::from(explicit);
             if path.exists() {
@@ -102,9 +119,16 @@ pub fn sysroot() -> Option<PathBuf> {
         candidates.push(cwd.join(".toolchain/sysroot-android17"));
     }
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        candidates.push(PathBuf::from(cache).join("pengudroid/runtime/android17-x86_64"));
+        let cache = PathBuf::from(cache);
+        candidates.insert(0, cache.join("pengudroid/runtime/android17-x86_64-modular"));
+        candidates.insert(0, cache.join("pengudroid/runtime/android17-x86_64-modular-current"));
+        candidates.push(cache.join("pengudroid/runtime/android17-x86_64"));
     }
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        if std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()).is_none() {
+            candidates.insert(0, PathBuf::from(&home).join(".cache/pengudroid/runtime/android17-x86_64-modular"));
+            candidates.insert(0, PathBuf::from(&home).join(".cache/pengudroid/runtime/android17-x86_64-modular-current"));
+        }
         candidates.push(
             PathBuf::from(&home).join(".cache/pengudroid/runtime/android17-x86_64"),
         );
@@ -113,7 +137,11 @@ pub fn sysroot() -> Option<PathBuf> {
     if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
         candidates.push(PathBuf::from(data).join("pengudroid/sysroot"));
     }
-    candidates.into_iter().find(|p| p.exists())
+    let prefer_components = has_component_store();
+    candidates.into_iter().find(|p| {
+        p.is_dir() && (!prefer_components || p.join("pengudroid-runtime.json").is_file()) && (!(p.ends_with("android17-x86_64-modular") || p.ends_with("android17-x86_64-modular-current"))
+            || p.join("pengudroid-modular-runtime.json").is_file())
+    })
 }
 
 #[cfg(test)]

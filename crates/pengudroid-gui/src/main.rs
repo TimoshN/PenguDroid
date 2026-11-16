@@ -66,7 +66,7 @@ fn main() -> Result<(), slint::PlatformError> {
         registry: Registry::load(), running: HashMap::new(), stopping: HashSet::new(), events, sender, runtime_busy: false,
     }));
     refresh(&ui, &state.borrow());
-    if std::env::var("PENGUDROID_AUTO_RUNTIME").as_deref() == Ok("1") && runner::sysroot().is_none() {
+    if runner::should_prepare_runtime() && runner::sysroot().is_none() {
         prepare_runtime(&ui, Rc::clone(&state));
     }
     let editor = Rc::new(RefCell::new(None::<KeymapWindow>));
@@ -94,7 +94,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status("Android runtime setup is still running…".into());
                 return;
             }
-            if std::env::var("PENGUDROID_AUTO_RUNTIME").as_deref() == Ok("1") && runner::sysroot().is_none() {
+            if runner::should_prepare_runtime() && runner::sysroot().is_none() {
                 prepare_runtime(&ui, Rc::clone(&state));
                 return;
             }

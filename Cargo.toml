@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pengudroid-proto",
+    "crates/pengudroid-runtime",
     "crates/pengudroid-socket",
     "crates/pengudroid-input",
     "crates/pengudroid-gui",
@@ -17,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -25,6 +26,7 @@ authors = ["PenguDroid contributors"]
 description = "A no-KVM, no-container Android compatibility layer for Linux."
 
 [workspace.dependencies]
+pengudroid-runtime = { path = "crates/pengudroid-runtime" }
 libc = "0.2"
 miniz_oxide = "0.8"
 

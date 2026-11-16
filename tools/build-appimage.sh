@@ -5,9 +5,9 @@
 # The image carries the desktop shell plus the `pengudroid` CLI it drives, the
 # two host libraries the CLI needs at runtime (`libpengudroid_shim.so` for the
 # Bionic surface, `libpengudroid_gleshim.so` for EGL/GLES), an icon and a
-# desktop entry. The Android sysroot is far too large to embed, so the AppImage
-# finds one the same way the CLI does: PENGUDROID_SYSROOT, the working
-# directory's `.toolchain/sysroot-android17`, or the per-user install path.
+# desktop entry. --with-modules embeds the reduced offline runtime for per-user
+# setup. Explicit runtime overrides and the legacy extracted-tree fallback are
+# still supported by the CLI and desktop shell.
 #
 # Usage: tools/build-appimage.sh [--skip-build] [--with-bridge] [--with-runtime]
 #                                [--bridge-dir DIR] [--output PATH]
@@ -20,6 +20,7 @@
 #   --with-runtime  also embed the Android 17 runtime (.toolchain/sysroot-android17)
 #                   and the ARM64 guest root (.toolchain/guest-arm64-bridge):
 #                   the image then needs nothing but a Wayland desktop
+#   --with-modules DIR  embed an offline modular runtime store (no GSI needed)
 #   --bridge-dir    where the translator and proxies are
 #   --output PATH   write the AppImage here (default: target/PenguDroid-x86_64.AppImage)
 #   --no-image      assemble the AppDir and stop (no appimagetool needed)
@@ -35,6 +36,7 @@ OUT="$TARGET/PenguDroid-x86_64.AppImage"
 SKIP_BUILD=0
 WITH_BRIDGE=0
 WITH_RUNTIME=0
+MODULES_DIR=""
 BRIDGE_DIR="$ROOT/.toolchain/nativebridge-stage"
 NO_IMAGE=0
 PORTABLE=0
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
         --skip-build) SKIP_BUILD=1 ;;
         --with-bridge) WITH_BRIDGE=1 ;;
         --with-runtime) WITH_RUNTIME=1 ;;
+        --with-modules) shift; MODULES_DIR=${1:?--with-modules needs a path} ;;
         --portable) PORTABLE=1 ;;
         --bridge-dir) shift; BRIDGE_DIR=${1:?--bridge-dir needs a path} ;;
         --output) shift; OUT=${1:?--output needs a path} ;;
@@ -52,6 +55,20 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+if [ -n "$MODULES_DIR" ] && [ "$WITH_RUNTIME" -eq 1 ]; then
+    echo "error: --with-modules and --with-runtime are mutually exclusive" >&2
+    exit 2
+fi
+if [ -n "$MODULES_DIR" ] && [ ! -f "$MODULES_DIR/runtime-modules.json" ]; then
+    echo "error: --with-modules needs a module store with runtime-modules.json" >&2
+    exit 1
+fi
+
+MODULES_HAS_ARM64=0
+if [ -n "$MODULES_DIR" ]; then
+    MODULES_HAS_ARM64=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("arm64_guest", False)))' "$MODULES_DIR/runtime-modules.json")
+fi
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "building release binaries"
@@ -98,10 +115,22 @@ if [ "$WITH_BRIDGE" -eq 1 ]; then
         install -m 0755 "$lib" "$APPDIR/usr/lib/pengudroid/bridge/"
     done
     echo "embedded $(ls "$APPDIR/usr/lib/pengudroid/bridge" | wc -l) bridge libraries"
-    guest_src="$ROOT/.toolchain/guest-arm64-bridge"
-    test -f "$guest_src/pengudroid-arm64-bridge-bundle.json" || { echo "missing built ARM64 guest bundle" >&2; exit 1; }
-    mkdir -p "$APPDIR/usr/share/pengudroid/guest-arm64"
-    cp -a "$guest_src"/. "$APPDIR/usr/share/pengudroid/guest-arm64/"
+    if [ "$MODULES_HAS_ARM64" -eq 0 ]; then
+        guest_src="$ROOT/.toolchain/guest-arm64-bridge"
+        test -f "$guest_src/pengudroid-arm64-bridge-bundle.json" || { echo "missing built ARM64 guest bundle" >&2; exit 1; }
+        mkdir -p "$APPDIR/usr/share/pengudroid/guest-arm64"
+        cp -a "$guest_src"/. "$APPDIR/usr/share/pengudroid/guest-arm64/"
+    else
+        echo "ARM64 guest is supplied by the component store (no guest sysroot bundled)"
+    fi
+fi
+
+if [ -n "$MODULES_DIR" ]; then
+    mkdir -p "$APPDIR/usr/share/pengudroid/runtime-modules"
+    cp -a "$MODULES_DIR"/. "$APPDIR/usr/share/pengudroid/runtime-modules/"
+    mkdir -p "$APPDIR/usr/share/pengudroid/setup/tools"
+    install -m 0644 "$ROOT/tools/runtime-modules.py" "$APPDIR/usr/share/pengudroid/setup/tools/runtime-modules.py"
+    echo "embedded offline runtime modules"
 fi
 
 if [ "$WITH_RUNTIME" -eq 1 ]; then
@@ -175,12 +204,20 @@ if [ -z "${PENGUDROID_ARM64_GUEST_ROOT:-}" ] && [ -d "$HERE/usr/share/pengudroid
     export PENGUDROID_ARM64_GUEST_ROOT="$HERE/usr/share/pengudroid/guest-arm64"
 fi
 
+# A bundled module store provisions a verified per-user generation offline.
+if [ -z "${PENGUDROID_RUNTIME_MODULES:-}" ] && [ -f "$HERE/usr/share/pengudroid/runtime-modules/runtime-modules.json" ]; then
+    export PENGUDROID_RUNTIME_MODULES="$HERE/usr/share/pengudroid/runtime-modules"
+fi
+if [ -z "${PENGUDROID_MODULES_SCRIPT:-}" ] && [ -f "$HERE/usr/share/pengudroid/setup/tools/runtime-modules.py" ]; then
+    export PENGUDROID_MODULES_SCRIPT="$HERE/usr/share/pengudroid/setup/tools/runtime-modules.py"
+fi
+
 # The Android runtime: the bundled copy (built --with-runtime) first, then the
 # per-user install location.
 if [ -z "${PENGUDROID_SYSROOT:-}" ] && [ -d "$HERE/usr/share/pengudroid/sysroot" ]; then
     export PENGUDROID_SYSROOT="$HERE/usr/share/pengudroid/sysroot"
 fi
-if [ -z "${PENGUDROID_SYSROOT:-}" ] && [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/pengudroid/sysroot" ]; then
+if [ -z "${PENGUDROID_SYSROOT:-}" ] && [ -z "${PENGUDROID_RUNTIME_MODULES:-}" ] && [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/pengudroid/sysroot" ]; then
     export PENGUDROID_SYSROOT="${XDG_DATA_HOME:-$HOME/.local/share}/pengudroid/sysroot"
 fi
 

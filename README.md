@@ -16,7 +16,9 @@ The runtime target is **Android 17 / API 37 on x86_64 Linux**. This is a working
 
 ## Working applications — real screenshots
 
-### Genshin Impact 7.2.0
+### Genshin Impact 7.2.0 — historical NVIDIA validation
+
+Genshin is excluded from the 0.3.0 validation scope; the earlier NVIDIA evidence below remains historical.
 
 ![Genshin Impact 7.2.0 gameplay on PenguDroid](docs/screenshots/genshin-impact-7.2.0-rtx3080.png)
 
@@ -25,6 +27,10 @@ The runtime target is **Android 17 / API 37 on x86_64 Linux**. This is a working
 The screenshot supplied from the working local build shows in-world gameplay, the character, party, map and HUD. It is an actual desktop window, not a mock-up. This establishes gameplay on the tested machine; it does not establish compatibility with every GPU, distribution, future game update or account flow. Game files and accounts are supplied by the user and are not included in the release.
 
 ### Beach Buggy Racing 2 — 2026.10.26
+
+The 0.3.0 component AppImage was verified with game/menu rendering and injected input, without a physical Android system tree. The component development build also captured the live race below. See the [release validation](docs/COMPONENT_APPIMAGE_TESTS.md).
+
+![BBR2 on the component runtime](docs/screenshots/components-bbr2-20261116.png)
 
 ![Beach Buggy Racing 2 racing in PenguDroid](docs/screenshots/bbr2-race.png)
 
@@ -53,18 +59,18 @@ The feed renders network-fetched thumbnails. Video and audio paths use the hoste
 
 ## Install and run
 
-1. Download `PenguDroid-x86_64.AppImage` from [Releases](https://github.com/denizomer10/PenguDroid/releases/latest).
+1. Download `PenguDroid-0.3.0-x86_64.AppImage` from [Releases](https://github.com/denizomer10/PenguDroid/releases/latest).
 2. Make it executable and open it:
 
    ```sh
-   chmod +x PenguDroid-x86_64.AppImage
-   ./PenguDroid-x86_64.AppImage
+   chmod +x PenguDroid-0.3.0-x86_64.AppImage
+   ./PenguDroid-0.3.0-x86_64.AppImage
    ```
 
-3. On the first launch, the manager downloads the pinned Android sysimage from Google's server, verifies its SHA-256, and extracts the runtime into your user cache. Progress appears in the manager. Keep an internet connection and at least **12 GiB of free space** for preparation.
+3. On the first launch, the manager verifies and installs its bundled runtime components into your user cache. Setup works offline and creates no Android `system/` or `apex/` tree. Keep at least **5 GiB of free space** for extraction and runtime setup, plus space for your games.
 4. After setup completes, click **+** to install an `.apk`, `.apkm`, `.xapk` or `.apks` package. Select it in the library and click **Launch**.
 
-The release carries its own userspace libraries, loader, Python, image-extraction tools, native bridge and built ARM64 guest bundle. You do not need to install Python, Rust, an Android SDK, `debugfs` or `erofs-utils` to use this AppImage. The Android sysimage is downloaded on your machine rather than redistributed inside the release. Later launches reuse the installed runtime.
+The 0.3.0 release carries its own userspace libraries, loader, Python, native bridge and 39 verified host/ARM64 runtime components. You do not need Python, Rust, an Android SDK, an extracted sysroot or a separate ARM64 guest tree. Later launches reuse the installed components. Android ART/framework binaries remain runtime components; the full Android OS image is unnecessary.
 
 **System requirements still apply:** an x86_64 Linux machine, a compatible Linux kernel, a Wayland desktop and working host graphics drivers. The AppImage cannot supply a kernel, compositor or a GPU's kernel driver. Other architectures and every Linux distribution have not been verified.
 
@@ -81,15 +87,22 @@ Android apps keep their data under the per-user PenguDroid data directory. The r
 ### CLI inside the same AppImage
 
 ```sh
-./PenguDroid-x86_64.AppImage --cli --version
-./PenguDroid-x86_64.AppImage --cli runtime --download
-./PenguDroid-x86_64.AppImage --cli info /path/to/app.apk
-./PenguDroid-x86_64.AppImage --cli launch /path/to/app.apkm
-./PenguDroid-x86_64.AppImage --cli ps
-./PenguDroid-x86_64.AppImage --cli stop
+./PenguDroid-0.3.0-x86_64.AppImage --cli --version
+./PenguDroid-0.3.0-x86_64.AppImage --cli runtime
+./PenguDroid-0.3.0-x86_64.AppImage --cli info /path/to/app.apk
+./PenguDroid-0.3.0-x86_64.AppImage --cli launch /path/to/app.apkm
+./PenguDroid-0.3.0-x86_64.AppImage --cli ps
+./PenguDroid-0.3.0-x86_64.AppImage --cli stop
 ```
 
 `PENGUDROID_SYSROOT` and `PENGUDROID_ARM64_GUEST_ROOT` remain available for explicit developer overrides.
+
+For offline installation from separate ART/APEX, framework and native library
+packages, see the [modular runtime workflow](docs/MODULAR_RUNTIME.md). Its component
+installation uses descriptor-backed paths without a physical `system/` or `apex/`
+tree. The host payload is 71.3% smaller than the original API-37 tree; an optional
+ARM64 provider also replaces the separate guest sysroot. `--with-modules STORE`
+bundles the providers for offline AppImage first-run setup.
 
 ## What runs underneath
 
@@ -130,10 +143,12 @@ cargo build --release --workspace
 Runtime preparation and translation inputs are documented in [ANDROID17.md](docs/ANDROID17.md) and [NATIVE_BRIDGE.md](docs/NATIVE_BRIDGE.md). To assemble the portable release after preparing the bridge and guest bundle:
 
 ```sh
-tools/build-appimage.sh --portable --with-bridge
+tools/build-appimage.sh --portable --with-bridge \
+  --with-modules .toolchain/runtime-components-store \
+  --output target/PenguDroid-0.3.0-x86_64.AppImage
 ```
 
-The build host needs the packaging inputs and `appimagetool`; these are build dependencies, not packages the end user must install. `--with-runtime` is a local testing option and is not used for the downloadable release.
+The build host needs the prepared component store and native bridge, plus `appimagetool` or `mksquashfs`; these are build dependencies. See [component preparation](docs/MODULAR_RUNTIME.md). The legacy `--with-runtime` option is retained for development comparisons.
 
 ### Validation
 

@@ -1462,6 +1462,11 @@ static PROPS: LazyLock<Mutex<BTreeMap<String, String>>> = LazyLock::new(|| Mutex
 /// safe: the framework and the shim must use the same ABI.
 fn seeded_props() -> BTreeMap<String, String> {
     let mut props = default_props();
+    if let Some(runtime) = pengudroid_runtime::configured() {
+        let text = runtime.properties.iter().map(|(k, v)| format!("{k}={v}\n")).collect::<String>();
+        overlay_version_properties(&mut props, &text).unwrap_or_else(|error| panic!("invalid component runtime identity: {error}"));
+        return props;
+    }
     let Some(root) = std::env::var_os("PENGUDROID_ROOT") else {
         return props;
     };
