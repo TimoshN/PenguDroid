@@ -1228,6 +1228,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         }
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
+            prime_webview_user_agent(env, thread);
             if std::env::var_os("PENGUDROID_PROBE_WEBVIEW").is_some() {
                 let _ = webview::attach_probe(env, thread);
             }
@@ -2271,6 +2272,12 @@ impl FollowResize {
         for (key, value) in g.export() {
             std::env::set_var(key, value);
         }
+        // Refresh the binder replies before poking relayout so `IWindowSession.relayout`
+        // and `DisplayManager.getDisplayInfo` return the new dimensions instead of
+        // the initial 1280x720 frames.
+        install_display_replies(env);
+        install_window_relayout_result(env);
+        install_resized_payload(env);
         let roots = window_roots(env);
         let mut poked = 0;
         for root in &roots {
@@ -2565,6 +2572,94 @@ fn trace_roots(env: &JniEnv) {
         if let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) {
             dump_root_state(env, root, i);
         }
+    }
+    if std::env::var_os("PENGUDROID_TRACE_VIEWS").is_some() {
+        report_surface_views(env, false);
+    }
+}
+
+/// Pre-populate `MiHoYoWebview.globalUserAgent` on the UI thread before Unity's
+/// render thread starts. Otherwise `UnityMain` inside `nativeRender` calls
+/// `MiHoYoWebview.getGlobalUserAgent()`, which spin-waits on the main thread
+/// while the main thread can block in `UnitySendMessage`, deadlocking both.
+fn prime_webview_user_agent(env: &JniEnv, thread: JObject) {
+    let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
+        return;
+    };
+    let Some(field) = env.field_id(
+        thread_class,
+        "mInitialApplication",
+        "Landroid/app/Application;",
+    ) else {
+        return;
+    };
+    let app = env.object_field(thread, field);
+    if app.is_null() {
+        return;
+    }
+    let Some(ctx_class) = env.find_class("android/content/Context") else {
+        return;
+    };
+    let Some(get_loader) = env.method_id(ctx_class, "getClassLoader", "()Ljava/lang/ClassLoader;")
+    else {
+        return;
+    };
+    let Some(loader) = env.call_object(app, get_loader, &[]) else {
+        env.exception_clear();
+        return;
+    };
+    let Some(class_cls) = env.find_class("java/lang/Class") else {
+        return;
+    };
+    let Some(for_name) = env.static_method_id(
+        class_cls,
+        "forName",
+        "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+    ) else {
+        return;
+    };
+    let name = env.new_string("com.miHoYo.sdk.webview.MiHoYoWebview");
+    let Some(webview_cls) = env.call_static_object(
+        class_cls,
+        for_name,
+        &[
+            JValue { l: name },
+            JValue { z: 0 },
+            JValue { l: loader },
+        ],
+    ) else {
+        env.exception_clear();
+        return;
+    };
+    let Some(ua_field) = env.static_field_id(
+        webview_cls as JClass,
+        "globalUserAgent",
+        "Ljava/lang/String;",
+    ) else {
+        return;
+    };
+    if !env
+        .static_object_field(webview_cls as JClass, ua_field)
+        .is_null()
+    {
+        return;
+    }
+    let Some(ws_cls) = env.find_class("android/webkit/WebSettings") else {
+        return;
+    };
+    let Some(get_ua) = env.static_method_id(
+        ws_cls,
+        "getDefaultUserAgent",
+        "(Landroid/content/Context;)Ljava/lang/String;",
+    ) else {
+        return;
+    };
+    let Some(ua) = env.call_static_object(ws_cls, get_ua, &[JValue { l: app }]) else {
+        env.exception_clear();
+        return;
+    };
+    if !ua.is_null() {
+        env.set_static_object_field(webview_cls as JClass, ua_field, ua);
     }
 }
 

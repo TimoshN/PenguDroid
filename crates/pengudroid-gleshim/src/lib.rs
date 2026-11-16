@@ -3106,6 +3106,29 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         finish();
     }
     dump_frame_once(surface, host);
+    let rec = &mut *(surface as *mut SurfaceRec);
+    // An empty translucent DecorView over a Vulkan SurfaceView swaps all-zero
+    // RGBA frames; skip creating a separate transparent desktop toplevel for it
+    // until it actually draws visible pixels, and tear down an earlier splash
+    // toplevel once another surface (such as vkshim) has taken over and this
+    // layer has gone fully transparent.
+    if std::env::var_os("PENGUDROID_SURFACE_ID").is_none() {
+        let superseded = rec.owns_surface
+            && rec.surface_id != 0
+            && std::env::var("PENGUDROID_LAST_SURFACE_ID")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .is_some_and(|last| last != rec.surface_id);
+        if (rec.surface_id == 0 || superseded) && surface_has_no_visible_content(surface, host) {
+            if superseded {
+                let mut st = lock_state();
+                if let Err(e) = destroy_daemon_surface(&mut st, rec) {
+                    eprintln!("[pengudroid-gleshim] {e}");
+                }
+            }
+            return EGL_TRUE;
+        }
+    }
     trace_presents(surface);
 
     let exported = match export_surface_dmabuf(surface) {
@@ -3211,6 +3234,65 @@ fn pace_swap(surface: usize) {
     if sleep > 0 {
         std::thread::sleep(Duration::from_micros(sleep));
     }
+}
+
+/// Returns `true` when every pixel in the currently bound FBO is either fully
+/// transparent (`alpha == 0`) or pure black (`RGB == 0,0,0`).
+unsafe fn surface_has_no_visible_content(surface: EGLSurface, host: &Host) -> bool {
+    let Some(read_pixels) = host.gl_read_pixels else {
+        return false;
+    };
+    let rec = &*(surface as *const SurfaceRec);
+    let (w, h) = (rec.w as usize, rec.h as usize);
+    if w == 0 || h == 0 {
+        return true;
+    }
+    let Some(bytes) = w.checked_mul(h).and_then(|px| px.checked_mul(4)) else {
+        return false;
+    };
+    let mut rgba = vec![0u8; bytes];
+    read_pixels(
+        0,
+        0,
+        w as i32,
+        h as i32,
+        0x1908, // GL_RGBA
+        0x1401, // GL_UNSIGNED_BYTE
+        rgba.as_mut_ptr() as *mut c_void,
+    );
+    let mut visible = 0usize;
+    let (mut min_x, mut max_x) = (w, 0usize);
+    let (mut min_y, mut max_y) = (h, 0usize);
+    for (idx, px) in rgba.chunks_exact(4).enumerate() {
+        if px[3] != 0 && (px[0] != 0 || px[1] != 0 || px[2] != 0) {
+            visible += 1;
+            let x = idx % w;
+            let y = idx / w;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+    }
+    if visible == 0 {
+        return true;
+    }
+    // An injected HUD layer (such as MangoHud in a corner) can paint < 2% of
+    // an otherwise empty DecorView FBO and spawn a competing transparent window.
+    let total = w.saturating_mul(h);
+    if visible.saturating_mul(50) < total {
+        if std::env::var_os("PENGUDROID_VK_SURFACE_ID").is_some() {
+            return true;
+        }
+        let in_corner = w >= 640
+            && h >= 480
+            && (max_x < w / 4 || min_x >= (3 * w) / 4)
+            && (max_y < h / 4 || min_y >= (3 * h) / 4);
+        if in_corner {
+            return true;
+        }
+    }
+    false
 }
 
 /// `PENGUDROID_DUMP_FRAME=/path/frame.ppm`: write the first few frames to disk.

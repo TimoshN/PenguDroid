@@ -747,6 +747,7 @@ unsafe fn query_native_window_size(window: *mut c_void) -> (u32, u32) {
 
 fn subscribe_android_input(surface_id: u32) {
     std::env::set_var("PENGUDROID_LAST_SURFACE_ID", surface_id.to_string());
+    std::env::set_var("PENGUDROID_VK_SURFACE_ID", surface_id.to_string());
     unsafe {
         let hook = libc::dlsym(libc::RTLD_DEFAULT, c"pengudroid_subscribe_input".as_ptr());
         if !hook.is_null() {
