@@ -52,7 +52,7 @@ pub fn builtin_interfaces(class:&str)->&'static [&'static str] {
         "Ljava/util/ArrayList;" | "Ljava/util/concurrent/CopyOnWriteArrayList;" | "Ljava/util/LinkedList;"=>&["Ljava/util/List;","Ljava/util/RandomAccess;","Ljava/lang/Cloneable;","Ljava/io/Serializable;"],
         "Ljava/util/HashSet;" | "Ljava/util/LinkedHashSet;" | "Ljava/util/concurrent/CopyOnWriteArraySet;"=>&["Ljava/util/Set;","Ljava/lang/Cloneable;","Ljava/io/Serializable;"],
         "Ljava/util/concurrent/ConcurrentLinkedQueue;"=>&["Ljava/util/Queue;","Ljava/io/Serializable;"],
-        "Ljava/util/concurrent/LinkedBlockingQueue;"=>&["Ljava/util/concurrent/BlockingQueue;","Ljava/util/Queue;","Ljava/io/Serializable;"],
+        "Ljava/util/concurrent/LinkedBlockingQueue;" | "Ljava/util/concurrent/SynchronousQueue;" | "Ljava/util/concurrent/ArrayBlockingQueue;" | "Ljava/util/concurrent/PriorityBlockingQueue;"=>&["Ljava/util/concurrent/BlockingQueue;","Ljava/util/Queue;","Ljava/util/Collection;","Ljava/io/Serializable;"],
         "Ljava/util/concurrent/BlockingQueue;"=>&["Ljava/util/Queue;"],
         "Ljava/util/concurrent/ThreadPoolExecutor$DiscardPolicy;"
         | "Ljava/util/concurrent/ThreadPoolExecutor$AbortPolicy;"
@@ -127,12 +127,14 @@ pub fn builtin_superclass(class_name: &str) -> Option<&'static str> {
         "Ljava/io/InputStreamReader;" | "Ljava/io/BufferedReader;" | "Ljava/io/StringReader;"=>Some("Ljava/io/Reader;"),
         "Ljava/io/StringWriter;"=>Some("Ljava/io/Writer;"),
         "Ljavax/net/ssl/HttpsURLConnection;"=>Some("Ljava/net/HttpURLConnection;"),
+        "Ljavax/net/ssl/SSLSocketFactory;"=>Some("Ljavax/net/SocketFactory;"),
+        "Ljavax/net/SocketFactory;"=>Some("Ljava/lang/Object;"),
         "Ljava/net/HttpURLConnection;"=>Some("Ljava/net/URLConnection;"),
         "Ljava/net/CookieManager;"=>Some("Ljava/net/CookieHandler;"),
         "Lpengu/internal/ConnOutputStream;"=>Some("Ljava/io/OutputStream;"),
         "Lpengu/internal/StreamChannel;"=>Some("Ljava/nio/channels/ReadableByteChannel;"),
         "Ljava/util/HashSet;" | "Ljava/util/concurrent/CopyOnWriteArraySet;"=>Some("Ljava/util/AbstractSet;"),
-        "Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;"=>Some("Ljava/util/AbstractQueue;"),
+        "Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;" | "Ljava/util/concurrent/SynchronousQueue;" | "Ljava/util/concurrent/ArrayBlockingQueue;" | "Ljava/util/concurrent/PriorityBlockingQueue;"=>Some("Ljava/util/AbstractQueue;"),
         "Ljava/util/AbstractList;" | "Ljava/util/AbstractSet;" | "Ljava/util/AbstractQueue;"=>Some("Ljava/util/AbstractCollection;"),
         "Ljava/util/AbstractCollection;" | "Ljava/util/AbstractMap;" | "Ljava/lang/Class;" | "Ljava/lang/String;" | "Ljava/io/InputStream;" | "Ljava/io/Reader;" | "Ljava/io/Writer;" | "Ljava/util/Observable;" | "Ljava/util/AbstractMap$SimpleEntry;" => Some("Ljava/lang/Object;"),
 
@@ -172,7 +174,7 @@ pub fn try_invoke_builtin(
 ) -> Result<BuiltinResult, String> {
     if matches!(class_name, "Ljava/lang/Boolean;" | "Ljava/lang/Byte;" | "Ljava/lang/Character;" | "Ljava/lang/Short;" | "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Float;" | "Ljava/lang/Double;") {
         if method_name == "<init>" && !descriptor.contains("Ljava/lang/String;") {
-            let id = args.first().and_then(Value::as_ref).ok_or("null boxed receiver")?;
+            let id = args.first().and_then(Value::as_ref).ok_or("NullPointerException: null boxed receiver")?;
             let value = args.get(1).cloned().ok_or("missing boxed value")?;
             if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) { fields.insert("value".into(), value); }
             return Ok(BuiltinResult::Handled(Value::Void));
@@ -184,7 +186,7 @@ pub fn try_invoke_builtin(
             return Ok(BuiltinResult::Handled(Value::Ref(Some(id))));
         }
         if matches!(method_name, "booleanValue" | "byteValue" | "charValue" | "shortValue" | "intValue" | "longValue" | "floatValue" | "doubleValue") {
-            let id = args.first().and_then(Value::as_ref).ok_or("null boxed receiver")?;
+            let id = args.first().and_then(Value::as_ref).ok_or("NullPointerException: null boxed receiver")?;
             let value = match heap.get(id) { Some(HeapObject::Instance { fields, .. }) => fields.get("value").cloned(), _ => None }.ok_or("missing boxed payload")?;
             let number = match value { Value::Int(v) => v as f64, Value::Long(v) => v as f64, Value::Float(v) => v as f64, Value::Double(v) => v, _ => return Err("invalid boxed payload".into()) };
             let integer = match value { Value::Int(v) => v, Value::Long(v) => v as i32, _ => number as i32 };
@@ -941,12 +943,22 @@ pub fn try_invoke_builtin(
             let val = match key {
                 "os.name" => Some("Linux"),
                 "os.arch" => Some("aarch64"),
-                "java.vm.name" => Some("PenguDroid-DexVM"),
-                "java.version" => Some("17"),
+                "java.vm.name" => Some("Dalvik"),
+                "java.version" => Some("0"),
+                "java.specification.version" => Some("0.9"),
+                "java.vm.specification.version" => Some("0.9"),
+                "java.runtime.version" => Some("0.9"),
+                "http.agent" => Some("Dalvik/2.1.0 (Linux; U; Android 16; PenguDroid)"),
+                "line.separator" => Some("\n"),
+                "file.separator" => Some("/"),
+                "path.separator" => Some(":"),
                 _ => None,
             };
-            let ret = val.map(|s| heap.new_string(s.to_string()));
-            Ok(BuiltinResult::Handled(Value::Ref(ret)))
+            if let Some(s) = val {
+                Ok(BuiltinResult::Handled(Value::Ref(Some(heap.new_string(s.to_string())))))
+            } else {
+                Ok(BuiltinResult::Handled(args.get(1).cloned().unwrap_or(Value::Ref(None))))
+            }
         }
         ("Ljava/lang/System;", "getProperties") => {
             let mut map = HashMap::new();
@@ -1289,9 +1301,39 @@ pub fn try_invoke_builtin(
         // Collections
         // -------------------------------------------------------------------
         ("Ljava/util/ArrayList;" | "Ljava/util/concurrent/CopyOnWriteArrayList;", "<init>") => {
+            let init_items = if descriptor == "(Ljava/util/Collection;)V" {
+                args.get(1)
+                    .and_then(|v| v.as_ref())
+                    .and_then(|cid| match heap.get(cid) {
+                        Some(HeapObject::List(src)) => Some(src.clone()),
+                        Some(HeapObject::Instance { fields, .. }) => fields
+                            .get("values")
+                            .or_else(|| {
+                                fields.values().find(|v| {
+                                    v.as_ref().is_some_and(|aid| {
+                                        matches!(
+                                            heap.get(aid),
+                                            Some(HeapObject::Array { data: ArrayData::Object(_), .. })
+                                        )
+                                    })
+                                })
+                            })
+                            .and_then(|v| v.as_ref())
+                            .and_then(|aid| match heap.get(aid) {
+                                Some(HeapObject::Array { data: ArrayData::Object(elems), .. }) => {
+                                    Some(elems.iter().map(|&o| Value::Ref(o)).collect())
+                                }
+                                _ => None,
+                            }),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if let Some(id) = args.first().and_then(|v| v.as_ref()) {
                 if let Some(slot) = heap.get_mut(id) {
-                    *slot = HeapObject::List(Vec::new());
+                    *slot = HeapObject::List(init_items);
                 }
             }
             Ok(BuiltinResult::Handled(Value::Void))
@@ -1334,6 +1376,27 @@ pub fn try_invoke_builtin(
                 .unwrap_or(Value::Ref(None));
             Ok(BuiltinResult::Handled(val))
         }
+        ("Ljava/util/ArrayList;" | "Ljava/util/concurrent/CopyOnWriteArrayList;" | "Ljava/util/LinkedList;", "set") => {
+            let idx = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(-1);
+            let val = args.get(2).cloned().unwrap_or(Value::Ref(None));
+            let prev = if idx >= 0 {
+                args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get_mut(id) {
+                    Some(HeapObject::List(list)) => {
+                        let u = idx as usize;
+                        if u < list.len() {
+                            Some(std::mem::replace(&mut list[u], val))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+            } else {
+                None
+            }
+            .unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(prev))
+        }
         ("Ljava/util/ArrayList;" | "Ljava/util/concurrent/CopyOnWriteArrayList;", "size") => {
             let len = args
                 .first()
@@ -1361,7 +1424,96 @@ pub fn try_invoke_builtin(
             Ok(BuiltinResult::Handled(Value::Ref(Some(heap.new_string(msg)))))
         }
         ("Ljava/util/Arrays;", "copyOfRange") => {
-            Ok(BuiltinResult::Handled(args.first().cloned().unwrap_or(Value::Ref(None))))
+            let from = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0).max(0) as usize;
+            let to = args.get(2).and_then(|v| v.as_int().ok()).unwrap_or(0).max(0) as usize;
+            let sliced = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get(id) {
+                Some(HeapObject::Array { type_desc, data }) => {
+                    let td = type_desc.clone();
+                    let new_len = to.saturating_sub(from);
+                    let new_data = match data {
+                        ArrayData::Byte(v) => {
+                            let mut out = vec![0i8; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Byte(out)
+                        }
+                        ArrayData::Short(v) => {
+                            let mut out = vec![0i16; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Short(out)
+                        }
+                        ArrayData::Char(v) => {
+                            let mut out = vec![0u16; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Char(out)
+                        }
+                        ArrayData::Int(v) => {
+                            let mut out = vec![0i32; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Int(out)
+                        }
+                        ArrayData::Long(v) => {
+                            let mut out = vec![0i64; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Long(out)
+                        }
+                        ArrayData::Float(v) => {
+                            let mut out = vec![0.0f32; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Float(out)
+                        }
+                        ArrayData::Double(v) => {
+                            let mut out = vec![0.0f64; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Double(out)
+                        }
+                        ArrayData::Boolean(v) => {
+                            let mut out = vec![false; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Boolean(out)
+                        }
+                        ArrayData::Object(v) => {
+                            let mut out = vec![None; new_len];
+                            if from < v.len() {
+                                let n = new_len.min(v.len() - from);
+                                out[..n].copy_from_slice(&v[from..from + n]);
+                            }
+                            ArrayData::Object(out)
+                        }
+                    };
+                    Some((td, new_data))
+                }
+                _ => None,
+            });
+            if let Some((type_desc, data)) = sliced {
+                let arr_id = heap.alloc(HeapObject::Array { type_desc, data });
+                Ok(BuiltinResult::Handled(Value::Ref(Some(arr_id))))
+            } else {
+                Ok(BuiltinResult::Handled(Value::Ref(None)))
+            }
         }
         ("Ljava/util/Arrays;", "hashCode") => {
             let hash = args
@@ -1463,6 +1615,50 @@ pub fn try_invoke_builtin(
                 }
             }
             Ok(BuiltinResult::Handled(Value::Void))
+        }
+        (
+            "Ljava/util/LinkedHashSet;"
+            | "Ljava/util/HashSet;"
+            | "Ljava/util/ArrayList;"
+            | "Ljava/util/concurrent/CopyOnWriteArrayList;"
+            | "Ljava/util/LinkedList;"
+            | "Ljava/util/List;",
+            "toArray",
+        ) => {
+            let items: Vec<Option<usize>> = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::List(vec)) => Some(vec.iter().map(|v| v.as_ref()).collect()),
+                    Some(HeapObject::Array { data: ArrayData::Object(vec), .. }) => Some(vec.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(dst_id) = args.get(1).and_then(|v| v.as_ref()) {
+                let (dst_len, dst_type) = match heap.get(dst_id) {
+                    Some(HeapObject::Array { data: ArrayData::Object(v), type_desc }) => (v.len(), type_desc.clone()),
+                    _ => (0, "[Ljava/lang/Object;".to_string()),
+                };
+                if dst_len >= items.len() {
+                    if let Some(HeapObject::Array { data: ArrayData::Object(dst), .. }) = heap.get_mut(dst_id) {
+                        for (i, item) in items.into_iter().enumerate() {
+                            dst[i] = item;
+                        }
+                        if dst_len > dst.len() {}
+                        return Ok(BuiltinResult::Handled(Value::Ref(Some(dst_id))));
+                    }
+                }
+                let arr_id = heap.alloc(HeapObject::Array {
+                    type_desc: dst_type,
+                    data: ArrayData::Object(items),
+                });
+                return Ok(BuiltinResult::Handled(Value::Ref(Some(arr_id))));
+            }
+            let arr_id = heap.alloc(HeapObject::Array {
+                type_desc: "[Ljava/lang/Object;".into(),
+                data: ArrayData::Object(items),
+            });
+            Ok(BuiltinResult::Handled(Value::Ref(Some(arr_id))))
         }
         ("Ljava/util/LinkedHashSet;" | "Ljava/util/HashSet;" | "Ljava/util/ArrayList;" | "Ljava/util/concurrent/CopyOnWriteArrayList;", "contains") => {
             let needle = args.get(1).map(|v| value_to_string(heap, v)).unwrap_or_default();
@@ -1860,7 +2056,7 @@ pub fn try_invoke_builtin(
             Ok(BuiltinResult::Handled(Value::Ref(None)))
         }
         ("Landroid/view/View;", "requestFocus") => Ok(BuiltinResult::Handled(Value::Int(1))),
-        ("Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;", "<init>") => {
+        ("Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;" | "Ljava/util/concurrent/SynchronousQueue;" | "Ljava/util/concurrent/ArrayBlockingQueue;" | "Ljava/util/concurrent/PriorityBlockingQueue;", "<init>") => {
             if let Some(id) = args.first().and_then(|v| v.as_ref()) {
                 if let Some(slot) = heap.get_mut(id) {
                     *slot = HeapObject::Queue(std::collections::VecDeque::new());
@@ -1868,7 +2064,7 @@ pub fn try_invoke_builtin(
             }
             Ok(BuiltinResult::Handled(Value::Void))
         }
-        ("Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;", "add" | "offer") => {
+        ("Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;" | "Ljava/util/concurrent/SynchronousQueue;" | "Ljava/util/concurrent/ArrayBlockingQueue;" | "Ljava/util/concurrent/PriorityBlockingQueue;", "add" | "offer") => {
             let item = args.get(1).cloned().unwrap_or(Value::Ref(None));
             if let Some(id) = args.first().and_then(|v| v.as_ref()) {
                 if let Some(HeapObject::Queue(q)) = heap.get_mut(id) {
@@ -1877,7 +2073,7 @@ pub fn try_invoke_builtin(
             }
             Ok(BuiltinResult::Handled(Value::Int(1)))
         }
-        ("Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;", "poll") => {
+        ("Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;" | "Ljava/util/concurrent/SynchronousQueue;" | "Ljava/util/concurrent/ArrayBlockingQueue;" | "Ljava/util/concurrent/PriorityBlockingQueue;", "poll") => {
             let item = args
                 .first()
                 .and_then(|v| v.as_ref())
@@ -1888,7 +2084,7 @@ pub fn try_invoke_builtin(
                 .unwrap_or(Value::Ref(None));
             Ok(BuiltinResult::Handled(item))
         }
-        ("Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;", "isEmpty") => {
+        ("Ljava/util/concurrent/ConcurrentLinkedQueue;" | "Ljava/util/concurrent/LinkedBlockingQueue;" | "Ljava/util/concurrent/SynchronousQueue;" | "Ljava/util/concurrent/ArrayBlockingQueue;" | "Ljava/util/concurrent/PriorityBlockingQueue;", "isEmpty") => {
             let empty = args
                 .first()
                 .and_then(|v| v.as_ref())
@@ -3953,6 +4149,78 @@ pub fn try_invoke_builtin(
             }
             Ok(BuiltinResult::Handled(Value::Int(-1)))
         }
+        ("Ljava/util/Arrays;", "copyOf") => {
+            let new_len = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0).max(0) as usize;
+            let copied = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get(id) {
+                Some(HeapObject::Array { type_desc, data }) => {
+                    let td = type_desc.clone();
+                    let new_data = match data {
+                        ArrayData::Byte(v) => {
+                            let mut out = vec![0i8; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Byte(out)
+                        }
+                        ArrayData::Short(v) => {
+                            let mut out = vec![0i16; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Short(out)
+                        }
+                        ArrayData::Char(v) => {
+                            let mut out = vec![0u16; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Char(out)
+                        }
+                        ArrayData::Int(v) => {
+                            let mut out = vec![0i32; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Int(out)
+                        }
+                        ArrayData::Long(v) => {
+                            let mut out = vec![0i64; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Long(out)
+                        }
+                        ArrayData::Float(v) => {
+                            let mut out = vec![0.0f32; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Float(out)
+                        }
+                        ArrayData::Double(v) => {
+                            let mut out = vec![0.0f64; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Double(out)
+                        }
+                        ArrayData::Boolean(v) => {
+                            let mut out = vec![false; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Boolean(out)
+                        }
+                        ArrayData::Object(v) => {
+                            let mut out = vec![None; new_len];
+                            let n = new_len.min(v.len());
+                            out[..n].copy_from_slice(&v[..n]);
+                            ArrayData::Object(out)
+                        }
+                    };
+                    Some((td, new_data))
+                }
+                _ => None,
+            });
+            if let Some((type_desc, data)) = copied {
+                let arr_id = heap.alloc(HeapObject::Array { type_desc, data });
+                Ok(BuiltinResult::Handled(Value::Ref(Some(arr_id))))
+            } else {
+                Ok(BuiltinResult::Handled(Value::Ref(None)))
+            }
+        }
         ("Ljava/util/Arrays;", "equals") => {
             let eq = match (args.first().and_then(|v| v.as_ref()), args.get(1).and_then(|v| v.as_ref())) {
                 (None, None) => true,
@@ -4042,6 +4310,29 @@ pub fn try_invoke_builtin(
             Ok(BuiltinResult::Handled(Value::Ref(Some(sf))))
         }
         ("Ljavax/net/ssl/SSLSocketFactory;", "<init>") => Ok(BuiltinResult::Handled(Value::Void)),
+        ("Ljavax/net/SocketFactory;", "getDefault") => {
+            let sf = heap.new_instance("Ljavax/net/SocketFactory;");
+            Ok(BuiltinResult::Handled(Value::Ref(Some(sf))))
+        }
+        ("Ljavax/net/ssl/SSLSocketFactory;", "getDefault") => {
+            let sf = heap.new_instance("Ljavax/net/ssl/SSLSocketFactory;");
+            Ok(BuiltinResult::Handled(Value::Ref(Some(sf))))
+        }
+        ("Ljavax/net/ssl/SSLSocketFactory;", "getDefaultCipherSuites" | "getSupportedCipherSuites") => {
+            let suites = [
+                "TLS_AES_128_GCM_SHA256",
+                "TLS_AES_256_GCM_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            ]
+            .into_iter()
+            .map(|s| Some(heap.new_string(s.into())))
+            .collect();
+            let arr = heap.alloc(HeapObject::Array {
+                type_desc: "[Ljava/lang/String;".into(),
+                data: ArrayData::Object(suites),
+            });
+            Ok(BuiltinResult::Handled(Value::Ref(Some(arr))))
+        }
         ("Ljavax/net/ssl/TrustManagerFactory;", "getDefaultAlgorithm") => {
             let s = heap.new_string("X509".into());
             Ok(BuiltinResult::Handled(Value::Ref(Some(s))))
@@ -4052,16 +4343,193 @@ pub fn try_invoke_builtin(
         }
         ("Ljavax/net/ssl/TrustManagerFactory;", "init") => Ok(BuiltinResult::Handled(Value::Void)),
         ("Ljavax/net/ssl/TrustManagerFactory;", "getTrustManagers") => {
+            let tm = heap.new_instance("Ljavax/net/ssl/X509TrustManager;");
             let arr = heap.alloc(HeapObject::Array {
                 type_desc: "[Ljavax/net/ssl/TrustManager;".into(),
+                data: ArrayData::Object(vec![Some(tm)]),
+            });
+            Ok(BuiltinResult::Handled(Value::Ref(Some(arr))))
+        }
+        ("Ljavax/net/ssl/X509TrustManager;", "getAcceptedIssuers") => {
+            let arr = heap.alloc(HeapObject::Array {
+                type_desc: "[Ljava/security/cert/X509Certificate;".into(),
                 data: ArrayData::Object(Vec::new()),
             });
             Ok(BuiltinResult::Handled(Value::Ref(Some(arr))))
+        }
+        ("Ljavax/net/ssl/X509TrustManager;", "checkClientTrusted" | "checkServerTrusted") => {
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/Arrays;", "toString") => {
+            let s = match args.first().and_then(|v| v.as_ref()).and_then(|id| heap.get(id)) {
+                Some(HeapObject::Array { data: ArrayData::Object(v), .. }) => {
+                    let parts: Vec<String> = v
+                        .iter()
+                        .map(|o| match o {
+                            Some(oid) => value_to_string(heap, &Value::Ref(Some(*oid))),
+                            None => "null".to_string(),
+                        })
+                        .collect();
+                    format!("[{}]", parts.join(", "))
+                }
+                Some(HeapObject::Array { data: ArrayData::Int(v), .. }) => format!("{v:?}"),
+                Some(HeapObject::Array { data: ArrayData::Byte(v), .. }) => format!("{v:?}"),
+                _ => "null".to_string(),
+            };
+            Ok(BuiltinResult::Handled(Value::Ref(Some(heap.new_string(s)))))
         }
         ("Landroid/bluetooth/BluetoothAdapter;", "getDefaultAdapter") => {
             Ok(BuiltinResult::Handled(Value::Ref(None)))
         }
         ("Landroid/content/BroadcastReceiver;", "<init>") => {
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/logging/Logger;", "getLogger") => {
+            let logger = heap.new_instance("Ljava/util/logging/Logger;");
+            Ok(BuiltinResult::Handled(Value::Ref(Some(logger))))
+        }
+        ("Ljava/util/logging/Logger;", "log" | "info" | "warning" | "severe" | "fine" | "finer" | "finest" | "config") => {
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/logging/Logger;", "isLoggable") => {
+            Ok(BuiltinResult::Handled(Value::Int(0)))
+        }
+        ("Landroid/util/SparseArray;", "<init>") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                let map = heap.alloc(HeapObject::Map(HashMap::new()));
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("entries".into(), Value::Ref(Some(map)));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/util/SparseArray;", "put" | "append") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                let key = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0).to_string();
+                let val = args.get(2).cloned().unwrap_or(Value::Ref(None));
+                let map_id = match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("entries").and_then(|v| v.as_ref()),
+                    _ => None,
+                };
+                if let Some(mid) = map_id {
+                    if let Some(HeapObject::Map(m)) = heap.get_mut(mid) {
+                        m.insert(key, val);
+                    }
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/util/SparseArray;", "get") => {
+            let key = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0).to_string();
+            let default = args.get(2).cloned().unwrap_or(Value::Ref(None));
+            let val = args.first().and_then(|v| v.as_ref()).and_then(|id| {
+                let mid = match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("entries").and_then(|v| v.as_ref())?,
+                    _ => return None,
+                };
+                match heap.get(mid) {
+                    Some(HeapObject::Map(m)) => m.get(&key).cloned(),
+                    _ => None,
+                }
+            });
+            Ok(BuiltinResult::Handled(val.unwrap_or(default)))
+        }
+        ("Landroid/util/SparseArray;", "size") => {
+            let len = args.first().and_then(|v| v.as_ref()).and_then(|id| {
+                let mid = match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("entries").and_then(|v| v.as_ref())?,
+                    _ => return None,
+                };
+                match heap.get(mid) {
+                    Some(HeapObject::Map(m)) => Some(m.len() as i32),
+                    _ => None,
+                }
+            }).unwrap_or(0);
+            Ok(BuiltinResult::Handled(Value::Int(len)))
+        }
+        ("Ljava/lang/Throwable;", "printStackTrace") => {
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/security/Security;", "getProviders") => {
+            let arr = heap.alloc(HeapObject::Array {
+                type_desc: "[Ljava/security/Provider;".into(),
+                data: ArrayData::Object(Vec::new()),
+            });
+            Ok(BuiltinResult::Handled(Value::Ref(Some(arr))))
+        }
+        ("Ljava/security/Provider;", "getName") => {
+            let s = heap.new_string("AndroidOpenSSL".into());
+            Ok(BuiltinResult::Handled(Value::Ref(Some(s))))
+        }
+        ("Ljava/net/ProxySelector;", "<init>") => Ok(BuiltinResult::Handled(Value::Void)),
+        ("Ljava/net/ProxySelector;", "getDefault") => {
+            let ps = heap.new_instance("Ljava/net/ProxySelector;");
+            Ok(BuiltinResult::Handled(Value::Ref(Some(ps))))
+        }
+        ("Ljava/net/ProxySelector;", "select") => {
+            let list = heap.alloc(HeapObject::List(Vec::new()));
+            Ok(BuiltinResult::Handled(Value::Ref(Some(list))))
+        }
+        ("Ljava/util/ArrayDeque;", "<init>") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(slot) = heap.get_mut(id) {
+                    *slot = HeapObject::List(Vec::new());
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/ArrayDeque;", "add" | "addLast" | "offer" | "offerLast") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                let val = args.get(1).cloned().unwrap_or(Value::Ref(None));
+                if let Some(HeapObject::List(vec)) = heap.get_mut(id) {
+                    vec.push(val);
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Int(1)))
+        }
+        ("Ljava/util/ArrayDeque;", "addFirst" | "offerFirst" | "push") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                let val = args.get(1).cloned().unwrap_or(Value::Ref(None));
+                if let Some(HeapObject::List(vec)) = heap.get_mut(id) {
+                    vec.insert(0, val);
+                }
+            }
+            Ok(BuiltinResult::Handled(if method_name.starts_with("offer") { Value::Int(1) } else { Value::Void }))
+        }
+        ("Ljava/util/ArrayDeque;", "poll" | "pollFirst" | "pop" | "remove" | "removeFirst") => {
+            let val = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get_mut(id) {
+                Some(HeapObject::List(vec)) if !vec.is_empty() => Some(vec.remove(0)),
+                _ => None,
+            }).unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(val))
+        }
+        ("Ljava/util/ArrayDeque;", "peek" | "peekFirst") => {
+            let val = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get(id) {
+                Some(HeapObject::List(vec)) => vec.first().cloned(),
+                _ => None,
+            }).unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(val))
+        }
+        ("Ljava/util/ArrayDeque;", "size") => {
+            let n = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get(id) {
+                Some(HeapObject::List(vec)) => Some(vec.len() as i32),
+                _ => None,
+            }).unwrap_or(0);
+            Ok(BuiltinResult::Handled(Value::Int(n)))
+        }
+        ("Ljava/util/ArrayDeque;", "isEmpty") => {
+            let empty = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get(id) {
+                Some(HeapObject::List(vec)) => Some(vec.is_empty()),
+                _ => None,
+            }).unwrap_or(true);
+            Ok(BuiltinResult::Handled(Value::Int(i32::from(empty))))
+        }
+        ("Ljava/util/ArrayDeque;", "clear") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::List(vec)) = heap.get_mut(id) {
+                    vec.clear();
+                }
+            }
             Ok(BuiltinResult::Handled(Value::Void))
         }
 

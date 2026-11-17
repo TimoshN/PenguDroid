@@ -258,7 +258,56 @@ impl Vm {
         args: &[Value],
         is_virtual: bool,
     ) -> Result<Value, String> {
-        if self.trace {
+        if class_name == "Ljava/util/Collections;" && method_name == "sort" {
+            if let Some(list_id) = args.first().and_then(Value::as_ref) {
+                let mut items = {
+                    let st = jni_state().lock().unwrap();
+                    match st.heap.get(list_id) {
+                        Some(HeapObject::List(v)) => v.clone(),
+                        _ => Vec::new(),
+                    }
+                };
+                if items.len() > 1 {
+                    let mut i = 1;
+                    while i < items.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let (a, b) = (&items[j - 1], &items[j]);
+                            let cls = a.as_ref().and_then(|id| {
+                                jni_state().lock().unwrap().heap.get(id).map(|o| o.class_name().to_string())
+                            });
+                            let cmp = if let Some(cls) = cls {
+                                self.invoke_method(&cls, "compareTo", "(Ljava/lang/Object;)I", &[a.clone(), b.clone()], true)
+                                    .ok()
+                                    .and_then(|v| v.as_int().ok())
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            if cmp > 0 {
+                                items.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    let mut st = jni_state().lock().unwrap();
+                    if let Some(HeapObject::List(dst)) = st.heap.get_mut(list_id) {
+                        *dst = items;
+                    }
+                }
+            }
+            return Ok(Value::Void);
+        }
+        if self.trace
+            || (std::env::var_os("PENGUDROID_TRACE_OKIO").is_some()
+                && (class_name.contains("okhttp3")
+                    || class_name.contains("okio")
+                    || class_name.contains("Arrays")
+                    || class_name.contains("Collections")))
+        {
             eprintln!("[pengu-vm] invoke {class_name}.{method_name}{descriptor}");
         }
         let resolved_method = self.find_method_in_hierarchy(class_name, method_name, descriptor, is_virtual);
@@ -483,7 +532,13 @@ impl Vm {
             eprintln!("[pengu-vm] native library {so_name} not in native_dirs, trying dlopen");
         }
         if let Some(loader) = self.native_loader.as_mut() {
-            return loader(&so_name);
+            return loader(&so_name).map_err(|e| {
+                if e.contains("requires a path containing") || e.contains("No such file") {
+                    format!("UnsatisfiedLinkError: {e}")
+                } else {
+                    e
+                }
+            });
         }
         load_native_library(&so_name)
     }
@@ -729,12 +784,34 @@ impl Vm {
                         regs[aa] = regs[b].clone();
                         pc += 2;
                     }
+                    0x03 | 0x06 | 0x09 => {
+                        // move/16, move-wide/16, move-object/16 vAAAA, vBBBB
+                        let a = insns[pc + 1] as usize;
+                        let b = insns[pc + 2] as usize;
+                        regs[a] = regs[b].clone();
+                        if op == 0x06 && a + 1 < regs.len() && b + 1 < regs.len() {
+                            regs[a + 1] = regs[b + 1].clone();
+                        }
+                        pc += 3;
+                    }
                     0x04 => {
                         // move-wide vA, vB
                         let a = aa & 0x0f;
                         let b = (aa >> 4) & 0x0f;
                         regs[a] = regs[b].clone();
+                        if a + 1 < regs.len() && b + 1 < regs.len() {
+                            regs[a + 1] = regs[b + 1].clone();
+                        }
                         pc += 1;
+                    }
+                    0x05 => {
+                        // move-wide/from16 vAA, vBBBB
+                        let b = insns[pc + 1] as usize;
+                        regs[aa] = regs[b].clone();
+                        if aa + 1 < regs.len() && b + 1 < regs.len() {
+                            regs[aa + 1] = regs[b + 1].clone();
+                        }
+                        pc += 2;
                     }
                     0x07 => {
                         // move-object vA, vB
@@ -953,6 +1030,76 @@ impl Vm {
                             }
                         }
                         last_result = Value::Ref(Some(id));
+                        pc += 3;
+                    }
+                    0x26 => {
+                        // fill-array-data vAA, +BBBBBBBB
+                        let off = ((insns[pc + 1] as u32) | ((insns[pc + 2] as u32) << 16)) as i32;
+                        let data_pc = (pc as isize + off as isize) as usize;
+                        let Some(arr_id) = regs[aa].as_ref() else {
+                            let id = jni_state().lock().unwrap().heap.new_instance("Ljava/lang/NullPointerException;");
+                            return Err(OpErr::Thrown(id));
+                        };
+                        if data_pc + 4 <= insns.len() && insns[data_pc] == 0x0300 {
+                            let width = insns[data_pc + 1] as usize;
+                            let size = ((insns[data_pc + 2] as u32) | ((insns[data_pc + 3] as u32) << 16)) as usize;
+                            let payload = &insns[data_pc + 4..];
+                            let mut st = jni_state().lock().unwrap();
+                            if let Some(HeapObject::Array { data, .. }) = st.heap.get_mut(arr_id) {
+                                match (data, width) {
+                                    (ArrayData::Byte(dst), 1) => {
+                                        for i in 0..size.min(dst.len()) {
+                                            let w = payload[i / 2];
+                                            let b = if i % 2 == 0 { w & 0xff } else { w >> 8 };
+                                            dst[i] = b as i8;
+                                        }
+                                    }
+                                    (ArrayData::Boolean(dst), 1) => {
+                                        for i in 0..size.min(dst.len()) {
+                                            let w = payload[i / 2];
+                                            let b = if i % 2 == 0 { w & 0xff } else { w >> 8 };
+                                            dst[i] = b != 0;
+                                        }
+                                    }
+                                    (ArrayData::Short(dst), 2) => {
+                                        for i in 0..size.min(dst.len()) {
+                                            dst[i] = payload[i] as i16;
+                                        }
+                                    }
+                                    (ArrayData::Char(dst), 2) => {
+                                        for i in 0..size.min(dst.len()) {
+                                            dst[i] = payload[i];
+                                        }
+                                    }
+                                    (ArrayData::Int(dst), 4) => {
+                                        for i in 0..size.min(dst.len()) {
+                                            dst[i] = ((payload[i * 2] as u32) | ((payload[i * 2 + 1] as u32) << 16)) as i32;
+                                        }
+                                    }
+                                    (ArrayData::Float(dst), 4) => {
+                                        for i in 0..size.min(dst.len()) {
+                                            let bits = (payload[i * 2] as u32) | ((payload[i * 2 + 1] as u32) << 16);
+                                            dst[i] = f32::from_bits(bits);
+                                        }
+                                    }
+                                    (ArrayData::Long(dst), 8) => {
+                                        for i in 0..size.min(dst.len()) {
+                                            let lo = (payload[i * 4] as u64) | ((payload[i * 4 + 1] as u64) << 16);
+                                            let hi = (payload[i * 4 + 2] as u64) | ((payload[i * 4 + 3] as u64) << 16);
+                                            dst[i] = (lo | (hi << 32)) as i64;
+                                        }
+                                    }
+                                    (ArrayData::Double(dst), 8) => {
+                                        for i in 0..size.min(dst.len()) {
+                                            let lo = (payload[i * 4] as u64) | ((payload[i * 4 + 1] as u64) << 16);
+                                            let hi = (payload[i * 4 + 2] as u64) | ((payload[i * 4 + 3] as u64) << 16);
+                                            dst[i] = f64::from_bits(lo | (hi << 32));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         pc += 3;
                     }
                     0x2b => {

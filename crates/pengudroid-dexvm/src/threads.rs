@@ -764,8 +764,22 @@ impl Vm {
             queue.in_use.lock().unwrap().remove(&entry.message);
             result?;
             count += 1;
-            if self.pending_exception.is_some() {
-                return Err("uncaught Java exception in Looper".into());
+            if let Some(ex) = self.pending_exception {
+                let desc = {
+                    let st = jni_state().lock().unwrap();
+                    match st.heap.get(ex) {
+                        Some(HeapObject::Instance { class_name, fields, .. }) => {
+                            let msg = fields
+                                .get("detailMessage")
+                                .and_then(Value::as_ref)
+                                .and_then(|s| st.heap.as_str(s))
+                                .unwrap_or("");
+                            format!("{class_name}: {msg}")
+                        }
+                        _ => format!("obj={ex}"),
+                    }
+                };
+                return Err(format!("uncaught Java exception in Looper: {desc}"));
             }
         }
         Ok(count)
