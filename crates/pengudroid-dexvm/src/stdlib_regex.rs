@@ -444,6 +444,52 @@ pub fn try_invoke(
                 Ok(Some(BuiltinResult::Handled(Value::Int(0))))
             }
         }
+        ("Ljava/util/regex/Matcher;", "replaceAll") => {
+            let Some(mid) = args.first().and_then(Value::as_ref) else {
+                return Ok(Some(BuiltinResult::Handled(Value::Ref(None))));
+            };
+            let repl = args
+                .get(1)
+                .and_then(Value::as_ref)
+                .and_then(|i| heap.as_str(i))
+                .unwrap_or("")
+                .to_string();
+            let (pat, flags, input) = match heap.get(mid) {
+                Some(HeapObject::Instance { fields, .. }) => (
+                    fields.get("pattern").and_then(Value::as_ref).and_then(|i| heap.as_str(i)).unwrap_or("").to_string(),
+                    fields.get("flags").and_then(|v| v.as_int().ok()).unwrap_or(0),
+                    fields.get("input").and_then(Value::as_ref).and_then(|i| heap.as_str(i)).unwrap_or("").to_string(),
+                ),
+                _ => return Ok(Some(BuiltinResult::Handled(Value::Ref(None)))),
+            };
+            let chars: Vec<char> = input.chars().collect();
+            let mut out = String::new();
+            let mut pos = 0usize;
+            while pos <= chars.len() {
+                if let Some(groups) = run_match(&pat, flags, &input, pos, false, false) {
+                    if let Some((s, e)) = groups[0] {
+                        for &c in &chars[pos..s] {
+                            out.push(c);
+                        }
+                        out.push_str(&repl);
+                        pos = if e > pos { e } else {
+                            if e < chars.len() {
+                                out.push(chars[e]);
+                            }
+                            e + 1
+                        };
+                        continue;
+                    }
+                }
+                if pos < chars.len() {
+                    for &c in &chars[pos..] {
+                        out.push(c);
+                    }
+                }
+                break;
+            }
+            Ok(Some(BuiltinResult::Handled(Value::Ref(Some(heap.new_string(out))))))
+        }
         ("Ljava/util/regex/Matcher;", "region") => {
             if let Some(mid) = args.first().and_then(Value::as_ref) {
                 let start = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0).max(0);

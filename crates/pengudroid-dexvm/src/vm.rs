@@ -301,6 +301,142 @@ impl Vm {
             }
             return Ok(Value::Void);
         }
+        if class_name == "Ljava/util/Arrays;" && method_name == "sort" {
+            if let Some(arr_id) = args.first().and_then(Value::as_ref) {
+                let comp = args.get(1).and_then(Value::as_ref);
+                let mut items: Vec<Option<usize>> = {
+                    let st = jni_state().lock().unwrap();
+                    match st.heap.get(arr_id) {
+                        Some(HeapObject::Array { data: ArrayData::Object(v), .. }) => v.clone(),
+                        _ => Vec::new(),
+                    }
+                };
+                if items.len() > 1 {
+                    let comp_cls = comp.and_then(|cid| {
+                        jni_state().lock().unwrap().heap.get(cid).map(|o| o.class_name().to_string())
+                    });
+                    let mut i = 1;
+                    while i < items.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let (a, b) = (Value::Ref(items[j - 1]), Value::Ref(items[j]));
+                            let cmp = if let (Some(cid), Some(ccls)) = (comp, comp_cls.as_deref()) {
+                                self.invoke_method(
+                                    ccls,
+                                    "compare",
+                                    "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                                    &[Value::Ref(Some(cid)), a, b],
+                                    true,
+                                )
+                                .ok()
+                                .and_then(|v| v.as_int().ok())
+                                .unwrap_or(0)
+                            } else if let Some(aid) = items[j - 1] {
+                                let acls = jni_state().lock().unwrap().heap.get(aid).map(|o| o.class_name().to_string());
+                                if let Some(acls) = acls {
+                                    self.invoke_method(&acls, "compareTo", "(Ljava/lang/Object;)I", &[a, b], true)
+                                        .ok()
+                                        .and_then(|v| v.as_int().ok())
+                                        .unwrap_or(0)
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            };
+                            if cmp > 0 {
+                                items.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    let mut st = jni_state().lock().unwrap();
+                    if let Some(HeapObject::Array { data: ArrayData::Object(dst), .. }) = st.heap.get_mut(arr_id) {
+                        *dst = items;
+                    }
+                }
+            }
+            return Ok(Value::Void);
+        }
+        if class_name == "Ljava/io/File;" && method_name == "listFiles" {
+            let dir_path = args.first().and_then(Value::as_ref).and_then(|id| {
+                let st = jni_state().lock().unwrap();
+                match st.heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields
+                        .get("path")
+                        .and_then(Value::as_ref)
+                        .and_then(|sid| st.heap.as_str(sid))
+                        .map(str::to_string),
+                    _ => None,
+                }
+            });
+            let Some(dir_path) = dir_path else {
+                return Ok(Value::Ref(None));
+            };
+            let Ok(entries) = std::fs::read_dir(&dir_path) else {
+                return Ok(Value::Ref(None));
+            };
+            let filter = args.get(1).and_then(Value::as_ref);
+            let filter_cls = filter.and_then(|fid| {
+                jni_state().lock().unwrap().heap.get(fid).map(|o| o.class_name().to_string())
+            });
+            let mut results: Vec<Option<usize>> = Vec::new();
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                let (file_id, name_id) = {
+                    let mut st = jni_state().lock().unwrap();
+                    let fid = st.heap.new_instance("Ljava/io/File;");
+                    let pstr = st.heap.new_string(entry_path.to_string_lossy().into_owned());
+                    if let Some(HeapObject::Instance { fields, .. }) = st.heap.get_mut(fid) {
+                        fields.insert("path".into(), Value::Ref(Some(pstr)));
+                    }
+                    let nid = st.heap.new_string(entry.file_name().to_string_lossy().into_owned());
+                    (fid, nid)
+                };
+                let accepted = match (descriptor, filter, filter_cls.as_deref()) {
+                    ("(Ljava/io/FileFilter;)[Ljava/io/File;", Some(fid), Some(fcls)) => self
+                        .invoke_method(
+                            fcls,
+                            "accept",
+                            "(Ljava/io/File;)Z",
+                            &[Value::Ref(Some(fid)), Value::Ref(Some(file_id))],
+                            true,
+                        )
+                        .ok()
+                        .and_then(|v| v.as_int().ok())
+                        .unwrap_or(0)
+                        != 0,
+                    ("(Ljava/io/FilenameFilter;)[Ljava/io/File;", Some(fid), Some(fcls)) => self
+                        .invoke_method(
+                            fcls,
+                            "accept",
+                            "(Ljava/io/File;Ljava/lang/String;)Z",
+                            &[
+                                Value::Ref(Some(fid)),
+                                args.first().cloned().unwrap_or(Value::Ref(None)),
+                                Value::Ref(Some(name_id)),
+                            ],
+                            true,
+                        )
+                        .ok()
+                        .and_then(|v| v.as_int().ok())
+                        .unwrap_or(0)
+                        != 0,
+                    _ => true,
+                };
+                if accepted {
+                    results.push(Some(file_id));
+                }
+            }
+            let arr_id = jni_state().lock().unwrap().heap.alloc(HeapObject::Array {
+                type_desc: "[Ljava/io/File;".into(),
+                data: ArrayData::Object(results),
+            });
+            return Ok(Value::Ref(Some(arr_id)));
+        }
         if self.trace
             || (std::env::var_os("PENGUDROID_TRACE_OKIO").is_some()
                 && (class_name.contains("okhttp3")
@@ -757,7 +893,7 @@ impl Vm {
 
         while pc < insns.len() {
             steps += 1;
-            if self.owns_runtime && steps > 5_000_000 {
+            if self.owns_runtime && steps > 200_000_000 {
                 return Err(format!(
                     "VM instruction budget exceeded at pc={pc} op=0x{:02x}",
                     insns[pc] & 0xff

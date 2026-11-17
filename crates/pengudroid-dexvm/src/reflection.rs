@@ -1034,6 +1034,11 @@ impl Vm {
                         .ok_or("invalid InvocationHandler")?
                         .class_name()
                         .to_string();
+                    if std::env::var_os("PENGUDROID_TRACE_PROXY").is_some() {
+                        eprintln!(
+                            "[pengu-proxy] {declaring}.{name}{sig} -> {handler_class}.invoke"
+                        );
+                    }
                     let result=self.invoke_method(&handler_class,"invoke","(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",&[Value::Ref(Some(handler)),Value::Ref(Some(proxy)),Value::Ref(Some(reflected)),Value::Ref(values)],true)?;
                     return unbox(
                         result,

@@ -72,6 +72,7 @@ pub fn builtin_interfaces(class:&str)->&'static [&'static str] {
         "Ljava/io/Reader;"=>&["Ljava/io/Closeable;","Ljava/lang/Readable;"],
         "Ljava/io/Writer;"=>&["Ljava/io/Closeable;","Ljava/io/Flushable;","Ljava/lang/Appendable;"],
         "Ljava/io/Closeable;"=>&["Ljava/lang/AutoCloseable;"],
+        "Ljavax/net/ssl/X509TrustManager;"=>&["Ljavax/net/ssl/TrustManager;"],
         "Lpengu/reflect/ParameterizedTypeImpl;"=>&["Ljava/lang/reflect/ParameterizedType;","Ljava/lang/reflect/Type;"],
         "Lpengu/reflect/TypeVariableImpl;"=>&["Ljava/lang/reflect/TypeVariable;","Ljava/lang/reflect/Type;"],
         "Ljava/lang/reflect/ParameterizedType;" | "Ljava/lang/reflect/WildcardType;" | "Ljava/lang/reflect/GenericArrayType;"=>&["Ljava/lang/reflect/Type;"],
@@ -417,6 +418,55 @@ pub fn try_invoke_builtin(
             let b = args.get(1).and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id));
             let ok = matches!((a, b), (Some(a), Some(b)) if a.contains(b));
             Ok(BuiltinResult::Handled(Value::Int(i32::from(ok))))
+        }
+        ("Ljava/lang/String;", "regionMatches") => {
+            let s = args.first().and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id)).unwrap_or("");
+            let (ignore_case, toffset, other, ooffset, len) = if args.len() >= 6 {
+                (
+                    args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0) != 0,
+                    args.get(2).and_then(|v| v.as_int().ok()).unwrap_or(-1),
+                    args.get(3).and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id)).unwrap_or(""),
+                    args.get(4).and_then(|v| v.as_int().ok()).unwrap_or(-1),
+                    args.get(5).and_then(|v| v.as_int().ok()).unwrap_or(0),
+                )
+            } else {
+                (
+                    false,
+                    args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(-1),
+                    args.get(2).and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id)).unwrap_or(""),
+                    args.get(3).and_then(|v| v.as_int().ok()).unwrap_or(-1),
+                    args.get(4).and_then(|v| v.as_int().ok()).unwrap_or(0),
+                )
+            };
+            let ok = if toffset < 0 || ooffset < 0 || len < 0 {
+                false
+            } else {
+                let s_u16: Vec<u16> = s.encode_utf16().collect();
+                let o_u16: Vec<u16> = other.encode_utf16().collect();
+                let ts = toffset as usize;
+                let os = ooffset as usize;
+                let n = len as usize;
+                if ts + n > s_u16.len() || os + n > o_u16.len() {
+                    false
+                } else if ignore_case {
+                    (0..n).all(|i| {
+                        let a = char::from_u32(s_u16[ts + i] as u32).unwrap_or('\0');
+                        let b = char::from_u32(o_u16[os + i] as u32).unwrap_or('\0');
+                        a.eq_ignore_ascii_case(&b)
+                    })
+                } else {
+                    s_u16[ts..ts + n] == o_u16[os..os + n]
+                }
+            };
+            Ok(BuiltinResult::Handled(Value::Int(i32::from(ok))))
+        }
+        ("Ljava/lang/String;", "subSequence") => {
+            let s = args.first().and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id)).unwrap_or("");
+            let u16s: Vec<u16> = s.encode_utf16().collect();
+            let start = (args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0).max(0) as usize).min(u16s.len());
+            let end = (args.get(2).and_then(|v| v.as_int().ok()).unwrap_or(u16s.len() as i32).max(0) as usize).min(u16s.len());
+            let sub = if start <= end { String::from_utf16_lossy(&u16s[start..end]) } else { String::new() };
+            Ok(BuiltinResult::Handled(Value::Ref(Some(heap.new_string(sub)))))
         }
         ("Ljava/lang/String;", "trim") => {
             let s = args.first().and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id)).unwrap_or("").trim().to_string();
@@ -1142,6 +1192,35 @@ pub fn try_invoke_builtin(
             let v = s.trim().parse::<i32>().unwrap_or(0);
             Ok(BuiltinResult::Handled(Value::Int(v)))
         }
+        ("Ljava/lang/Integer;", "decode") => {
+            let s = args.first().and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id)).ok_or("NullPointerException: Integer.decode")?;
+            let t = s.trim();
+            let (neg, rest) = if let Some(r) = t.strip_prefix('-') {
+                (true, r)
+            } else if let Some(r) = t.strip_prefix('+') {
+                (false, r)
+            } else {
+                (false, t)
+            };
+            let parsed = if let Some(h) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+                i64::from_str_radix(h, 16)
+            } else if let Some(h) = rest.strip_prefix('#') {
+                i64::from_str_radix(h, 16)
+            } else if rest.starts_with('0') && rest.len() > 1 {
+                i64::from_str_radix(&rest[1..], 8)
+            } else {
+                rest.parse::<i64>()
+            };
+            let Ok(num) = parsed else {
+                return Err(format!("NumberFormatException: For input string: \"{s}\""));
+            };
+            let val = if neg { -num } else { num } as i32;
+            let id = heap.new_instance("Ljava/lang/Integer;");
+            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                fields.insert("value".into(), Value::Int(val));
+            }
+            Ok(BuiltinResult::Handled(Value::Ref(Some(id))))
+        }
         ("Ljava/lang/Integer;", "toString") => {
             let v = args.first().and_then(|v| v.as_int().ok()).unwrap_or(0);
             let sid = heap.new_string(v.to_string());
@@ -1407,6 +1486,52 @@ pub fn try_invoke_builtin(
                 })
                 .unwrap_or(0);
             Ok(BuiltinResult::Handled(Value::Int(len)))
+        }
+        (
+            "Ljava/util/ArrayList;"
+            | "Ljava/util/concurrent/CopyOnWriteArrayList;"
+            | "Ljava/util/LinkedList;",
+            "clear",
+        ) => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::List(list)) = heap.get_mut(id) {
+                    list.clear();
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        (
+            "Ljava/util/ArrayList;"
+            | "Ljava/util/concurrent/CopyOnWriteArrayList;"
+            | "Ljava/util/LinkedList;",
+            "remove",
+        ) => {
+            let Some(id) = args.first().and_then(|v| v.as_ref()) else {
+                return Ok(BuiltinResult::Handled(Value::Ref(None)));
+            };
+            if descriptor == "(I)Ljava/lang/Object;" {
+                let idx = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(-1);
+                let removed = match heap.get_mut(id) {
+                    Some(HeapObject::List(list)) if idx >= 0 && (idx as usize) < list.len() => {
+                        list.remove(idx as usize)
+                    }
+                    _ => return Err(format!("IndexOutOfBoundsException: index {idx}")),
+                };
+                return Ok(BuiltinResult::Handled(removed));
+            }
+            let target = args.get(1).and_then(|v| v.as_ref());
+            let removed = match heap.get_mut(id) {
+                Some(HeapObject::List(list)) => {
+                    if let Some(pos) = list.iter().position(|x| x.as_ref() == target) {
+                        list.remove(pos);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            Ok(BuiltinResult::Handled(Value::Int(i32::from(removed))))
         }
         ("Ljava/lang/Throwable;", "getStackTrace") | ("Ljava/lang/Thread;", "getStackTrace") => {
             let arr = heap.new_array("[Ljava/lang/StackTraceElement;", 0)?;
@@ -1696,7 +1821,7 @@ pub fn try_invoke_builtin(
                 .unwrap_or(true);
             Ok(BuiltinResult::Handled(Value::Int(i32::from(empty))))
         }
-        ("Ljava/util/ArrayList;" | "Ljava/util/concurrent/CopyOnWriteArrayList;" | "Ljava/util/LinkedHashSet;" | "Ljava/util/HashSet;", "iterator") => {
+        ("Ljava/util/ArrayList;" | "Ljava/util/concurrent/CopyOnWriteArrayList;" | "Ljava/util/LinkedHashSet;" | "Ljava/util/HashSet;" | "Ljava/util/ArrayDeque;" | "Ljava/util/concurrent/ConcurrentLinkedQueue;", "iterator") => {
             let iter = heap.new_instance("Ljava/util/Iterator;");
             let list_val = args.first().cloned().unwrap_or(Value::Ref(None));
             if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(iter) {
@@ -1715,6 +1840,7 @@ pub fn try_invoke_builtin(
                         let lid = fields.get("list").and_then(|v| v.as_ref())?;
                         match heap.get(lid) {
                             Some(HeapObject::List(vec)) => Some(idx < vec.len()),
+                            Some(HeapObject::Queue(q)) => Some(idx < q.len()),
                             _ => None,
                         }
                     }
@@ -1737,6 +1863,7 @@ pub fn try_invoke_builtin(
             let item = lid_opt
                 .and_then(|lid| match heap.get(lid) {
                     Some(HeapObject::List(vec)) => vec.get(idx).cloned(),
+                    Some(HeapObject::Queue(q)) => q.get(idx).cloned(),
                     _ => None,
                 })
                 .unwrap_or(Value::Ref(None));
@@ -1744,6 +1871,36 @@ pub fn try_invoke_builtin(
                 fields.insert("idx".into(), Value::Int((idx + 1) as i32));
             }
             Ok(BuiltinResult::Handled(item))
+        }
+        ("Ljava/util/Iterator;", "remove") => {
+            let Some(id) = args.first().and_then(|v| v.as_ref()) else {
+                return Ok(BuiltinResult::Handled(Value::Void));
+            };
+            let (lid_opt, idx) = match heap.get(id) {
+                Some(HeapObject::Instance { fields, .. }) => (
+                    fields.get("list").and_then(|v| v.as_ref()),
+                    fields.get("idx").and_then(|v| v.as_int().ok()).unwrap_or(0),
+                ),
+                _ => (None, 0),
+            };
+            if idx > 0 {
+                let rem_idx = (idx - 1) as usize;
+                if let Some(lid) = lid_opt {
+                    match heap.get_mut(lid) {
+                        Some(HeapObject::List(vec)) if rem_idx < vec.len() => {
+                            vec.remove(rem_idx);
+                        }
+                        Some(HeapObject::Queue(q)) if rem_idx < q.len() => {
+                            q.remove(rem_idx);
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("idx".into(), Value::Int(idx - 1));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
         }
         (
             "Ljava/util/HashMap;"
@@ -2497,12 +2654,29 @@ pub fn try_invoke_builtin(
         ) => Ok(BuiltinResult::Handled(Value::Void)),
         (
             "Ljava/util/concurrent/ExecutorService;"
+            | "Ljava/util/concurrent/ScheduledExecutorService;"
             | "Ljava/util/concurrent/ThreadPoolExecutor;"
             | "Ljava/util/concurrent/ScheduledThreadPoolExecutor;",
             "submit",
         ) => {
             let fut = heap.new_instance("Ljava/util/concurrent/Future;");
             Ok(BuiltinResult::Handled(Value::Ref(Some(fut))))
+        }
+        (
+            "Ljava/util/concurrent/ExecutorService;"
+            | "Ljava/util/concurrent/ScheduledExecutorService;"
+            | "Ljava/util/concurrent/ThreadPoolExecutor;"
+            | "Ljava/util/concurrent/ScheduledThreadPoolExecutor;",
+            "schedule" | "scheduleAtFixedRate" | "scheduleWithFixedDelay",
+        ) => {
+            let fut = heap.new_instance("Ljava/util/concurrent/ScheduledFuture;");
+            Ok(BuiltinResult::Handled(Value::Ref(Some(fut))))
+        }
+        ("Ljava/util/concurrent/ScheduledFuture;" | "Ljava/util/concurrent/Future;", "cancel") => {
+            Ok(BuiltinResult::Handled(Value::Int(1)))
+        }
+        ("Ljava/util/concurrent/ScheduledFuture;" | "Ljava/util/concurrent/Future;", "isCancelled" | "isDone") => {
+            Ok(BuiltinResult::Handled(Value::Int(0)))
         }
         (
             "Ljava/util/concurrent/ExecutorService;"
@@ -2618,6 +2792,73 @@ pub fn try_invoke_builtin(
                 }
             }
             Ok(BuiltinResult::Handled(Value::Int(i32::from(ok))))
+        }
+        ("Ljava/util/concurrent/atomic/AtomicBoolean;", "getAndSet") => {
+            let update = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0);
+            let mut prev = 0;
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    prev = fields.get("value").and_then(|v| v.as_int().ok()).unwrap_or(0);
+                    fields.insert("value".into(), Value::Int(update));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Int(prev)))
+        }
+        ("Ljava/util/concurrent/atomic/AtomicReferenceArray;", "<init>") => {
+            let len = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0).max(0) as usize;
+            let arr = heap.new_array("[Ljava/lang/Object;", len)?;
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("array".into(), Value::Ref(Some(arr)));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/concurrent/atomic/AtomicReferenceArray;", "length") => {
+            let len = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("array").and_then(|v| v.as_ref()),
+                    _ => None,
+                })
+                .and_then(|aid| match heap.get(aid) {
+                    Some(HeapObject::Array { data: ArrayData::Object(v), .. }) => Some(v.len() as i32),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            Ok(BuiltinResult::Handled(Value::Int(len)))
+        }
+        ("Ljava/util/concurrent/atomic/AtomicReferenceArray;", "get") => {
+            let idx = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0) as usize;
+            let val = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("array").and_then(|v| v.as_ref()),
+                    _ => None,
+                })
+                .and_then(|aid| match heap.get(aid) {
+                    Some(HeapObject::Array { data: ArrayData::Object(v), .. }) => v.get(idx).cloned().flatten(),
+                    _ => None,
+                });
+            Ok(BuiltinResult::Handled(Value::Ref(val)))
+        }
+        ("Ljava/util/concurrent/atomic/AtomicReferenceArray;", "set" | "lazySet") => {
+            let idx = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0) as usize;
+            let val = args.get(2).and_then(|v| v.as_ref());
+            let aid = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get(id) {
+                Some(HeapObject::Instance { fields, .. }) => fields.get("array").and_then(|v| v.as_ref()),
+                _ => None,
+            });
+            if let Some(aid) = aid {
+                if let Some(HeapObject::Array { data: ArrayData::Object(v), .. }) = heap.get_mut(aid) {
+                    if idx < v.len() {
+                        v[idx] = val;
+                    }
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
         }
         ("Landroid/content/Context;" | "Landroid/content/ContextWrapper;" | "Landroid/app/Activity;", "getSharedPreferences" | "getPreferences") => {
             let sp = heap.new_instance("Landroid/content/SharedPreferences;");
@@ -3029,7 +3270,7 @@ pub fn try_invoke_builtin(
             let v = heap.new_instance("Landroid/view/View;");
             Ok(BuiltinResult::Handled(Value::Ref(Some(v))))
         }
-        ("Landroid/view/Window;", "setFlags") => Ok(BuiltinResult::Handled(Value::Void)),
+        ("Landroid/view/Window;", "setFlags" | "setAttributes") => Ok(BuiltinResult::Handled(Value::Void)),
         (
             "Landroid/view/View;",
             "setSystemUiVisibility" | "setContentDescription" | "setFocusable" | "setFocusableInTouchMode" | "setId",
@@ -4027,6 +4268,59 @@ pub fn try_invoke_builtin(
                 .unwrap_or(1_000_000);
             Ok(BuiltinResult::Handled(Value::Long(dur.saturating_mul(unit) / 1_000_000)))
         }
+        ("Ljava/util/concurrent/TimeUnit;", "toSeconds") => {
+            let dur = args.get(1).and_then(|v| v.as_long().ok()).unwrap_or(0);
+            let unit = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("nanos").and_then(|v| v.as_long().ok()),
+                    _ => None,
+                })
+                .unwrap_or(1_000_000_000);
+            Ok(BuiltinResult::Handled(Value::Long(dur.saturating_mul(unit) / 1_000_000_000)))
+        }
+        ("Ljava/lang/Throwable;", "addSuppressed") => Ok(BuiltinResult::Handled(Value::Void)),
+        ("Landroid/os/ConditionVariable;", "<init>") => {
+            let open = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0);
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("open".into(), Value::Int(open));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/os/ConditionVariable;", "open" | "close") => {
+            let open = i32::from(method_name == "open");
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("open".into(), Value::Int(open));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/os/ConditionVariable;", "block") => {
+            if descriptor == "(J)Z" {
+                Ok(BuiltinResult::Handled(Value::Int(1)))
+            } else {
+                Ok(BuiltinResult::Handled(Value::Void))
+            }
+        }
+        ("Ljava/util/concurrent/FutureTask;", "<init>") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                let target = args.get(1).cloned().unwrap_or(Value::Ref(None));
+                let result = args.get(2).cloned().unwrap_or(Value::Ref(None));
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("target".into(), target);
+                    fields.insert("result".into(), result);
+                    fields.insert("done".into(), Value::Int(0));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/concurrent/FutureTask;", "isDone" | "isCancelled" | "cancel") => {
+            Ok(BuiltinResult::Handled(Value::Int(0)))
+        }
         ("Ljava/util/concurrent/locks/ReentrantLock;", "<init>" | "lock" | "unlock") => {
             Ok(BuiltinResult::Handled(Value::Void))
         }
@@ -4470,6 +4764,509 @@ pub fn try_invoke_builtin(
             let list = heap.alloc(HeapObject::List(Vec::new()));
             Ok(BuiltinResult::Handled(Value::Ref(Some(list))))
         }
+        ("Ljava/net/IDN;", "toASCII" | "toUnicode") => {
+            let Some(id) = args.first().and_then(|v| v.as_ref()) else {
+                return Err("NullPointerException: IDN input is null".into());
+            };
+            let s = heap.as_str(id).unwrap_or("").to_string();
+            Ok(BuiltinResult::Handled(Value::Ref(Some(heap.new_string(s)))))
+        }
+        ("Landroid/app/ActivityManager;", "getHistoricalProcessExitReasons") => {
+            let list = heap.alloc(HeapObject::List(Vec::new()));
+            Ok(BuiltinResult::Handled(Value::Ref(Some(list))))
+        }
+        ("Landroid/database/sqlite/SQLiteOpenHelper;", "<init>" | "close") => {
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/database/sqlite/SQLiteOpenHelper;", "getWritableDatabase" | "getReadableDatabase") => {
+            let db = heap.new_instance("Landroid/database/sqlite/SQLiteDatabase;");
+            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(db) {
+                fields.insert("version".into(), Value::Int(1));
+            }
+            Ok(BuiltinResult::Handled(Value::Ref(Some(db))))
+        }
+        (
+            "Landroid/content/Context;"
+            | "Landroid/content/ContextWrapper;"
+            | "Landroid/app/Application;"
+            | "Landroid/app/Activity;",
+            "openOrCreateDatabase",
+        ) => {
+            let db = heap.new_instance("Landroid/database/sqlite/SQLiteDatabase;");
+            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(db) {
+                fields.insert("version".into(), Value::Int(1));
+            }
+            Ok(BuiltinResult::Handled(Value::Ref(Some(db))))
+        }
+        ("Landroid/database/sqlite/SQLiteDatabase;", "getVersion") => {
+            let v = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => {
+                        fields.get("version").and_then(|x| x.as_int().ok())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0);
+            Ok(BuiltinResult::Handled(Value::Int(v)))
+        }
+        ("Landroid/database/sqlite/SQLiteDatabase;", "setVersion") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                let v = args.get(1).and_then(|x| x.as_int().ok()).unwrap_or(0);
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("version".into(), Value::Int(v));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        (
+            "Landroid/database/sqlite/SQLiteDatabase;",
+            "execSQL" | "beginTransaction" | "setTransactionSuccessful" | "endTransaction" | "close",
+        ) => Ok(BuiltinResult::Handled(Value::Void)),
+        ("Landroid/database/sqlite/SQLiteDatabase;", "isOpen") => {
+            Ok(BuiltinResult::Handled(Value::Int(1)))
+        }
+        ("Landroid/database/sqlite/SQLiteDatabase;", "insert") => {
+            Ok(BuiltinResult::Handled(Value::Long(1)))
+        }
+        ("Landroid/database/sqlite/SQLiteDatabase;", "update" | "delete") => {
+            Ok(BuiltinResult::Handled(Value::Int(0)))
+        }
+        ("Landroid/database/sqlite/SQLiteDatabase;", "rawQuery" | "query") => {
+            let cur = heap.new_instance("Landroid/database/Cursor;");
+            Ok(BuiltinResult::Handled(Value::Ref(Some(cur))))
+        }
+        ("Landroid/database/Cursor;", "moveToFirst" | "moveToNext" | "moveToPrevious" | "moveToLast" | "isAfterLast") => {
+            Ok(BuiltinResult::Handled(Value::Int(if method_name == "isAfterLast" { 1 } else { 0 })))
+        }
+        ("Landroid/database/Cursor;", "getCount" | "getPosition" | "getInt") => {
+            Ok(BuiltinResult::Handled(Value::Int(0)))
+        }
+        ("Landroid/database/Cursor;", "getColumnIndex" | "getColumnIndexOrThrow") => {
+            Ok(BuiltinResult::Handled(Value::Int(-1)))
+        }
+        ("Landroid/database/Cursor;", "getLong") => {
+            Ok(BuiltinResult::Handled(Value::Long(0)))
+        }
+        ("Landroid/database/Cursor;", "getString") => {
+            Ok(BuiltinResult::Handled(Value::Ref(None)))
+        }
+        ("Landroid/database/Cursor;", "close") => {
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/WeakHashMap;", "<init>") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(slot) = heap.get_mut(id) {
+                    *slot = HeapObject::Map(HashMap::new());
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/LinkedList;", "<init>") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(slot) = heap.get_mut(id) {
+                    *slot = HeapObject::List(Vec::new());
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/LinkedList;", "add" | "offer") => {
+            let item = args.get(1).cloned().unwrap_or(Value::Ref(None));
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::List(list)) = heap.get_mut(id) {
+                    list.push(item);
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Int(1)))
+        }
+        ("Ljava/util/LinkedList;", "poll") => {
+            let out = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get_mut(id) {
+                    Some(HeapObject::List(list)) if !list.is_empty() => Some(list.remove(0)),
+                    _ => None,
+                })
+                .unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(out))
+        }
+        ("Ljava/util/LinkedList;", "peek") => {
+            let out = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::List(list)) => list.first().cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(out))
+        }
+        ("Ljava/util/LinkedList;", "size") => {
+            let len = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::List(list)) => Some(list.len() as i32),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            Ok(BuiltinResult::Handled(Value::Int(len)))
+        }
+        ("Ljava/util/LinkedList;", "isEmpty") => {
+            let empty = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::List(list)) => Some(list.is_empty()),
+                    _ => None,
+                })
+                .unwrap_or(true);
+            Ok(BuiltinResult::Handled(Value::Int(i32::from(empty))))
+        }
+        ("Ljava/util/LinkedList;", "clear") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::List(list)) = heap.get_mut(id) {
+                    list.clear();
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/lang/ref/ReferenceQueue;", "<init>") => Ok(BuiltinResult::Handled(Value::Void)),
+        ("Ljava/lang/ref/ReferenceQueue;", "poll") => Ok(BuiltinResult::Handled(Value::Ref(None))),
+        ("Ljava/net/URI;", "<init>") => {
+            let raw = args
+                .get(1)
+                .and_then(|v| v.as_ref())
+                .and_then(|id| heap.as_str(id))
+                .unwrap_or("")
+                .to_string();
+            let (scheme, rest) = raw.split_once("://").unwrap_or(("", raw.as_str()));
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let host_port = authority.rsplit('@').next().unwrap_or(authority);
+            let (host, port) = if let Some((h, p)) = host_port.rsplit_once(':') {
+                (h, p.parse::<i32>().unwrap_or(-1))
+            } else {
+                (host_port, -1)
+            };
+            let raw_s = heap.new_string(raw.clone());
+            let scheme_s = heap.new_string(scheme.to_string());
+            let host_s = heap.new_string(host.to_string());
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("raw".into(), Value::Ref(Some(raw_s)));
+                    fields.insert("scheme".into(), Value::Ref(Some(scheme_s)));
+                    fields.insert("host".into(), Value::Ref(Some(host_s)));
+                    fields.insert("port".into(), Value::Int(port));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/net/URI;", "getHost") => {
+            let v = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("host").cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(v))
+        }
+        ("Ljava/net/URI;", "getScheme") => {
+            let v = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("scheme").cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(v))
+        }
+        ("Ljava/net/URI;", "getPort") => {
+            let p = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("port").and_then(|x| x.as_int().ok()),
+                    _ => None,
+                })
+                .unwrap_or(-1);
+            Ok(BuiltinResult::Handled(Value::Int(p)))
+        }
+        ("Ljava/net/URI;", "toString") => {
+            let v = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("raw").cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(v))
+        }
+        ("Ljava/net/Proxy;", "type") => {
+            let t = static_fields
+                .get("Ljava/net/Proxy$Type;.DIRECT")
+                .cloned()
+                .unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(t))
+        }
+        ("Ljava/net/Proxy;", "address") => Ok(BuiltinResult::Handled(Value::Ref(None))),
+        ("Ljava/net/InetSocketAddress;", "createUnresolved") => {
+            let host = args.first().cloned().unwrap_or(Value::Ref(None));
+            let port = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0);
+            let id = heap.new_instance("Ljava/net/InetSocketAddress;");
+            if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                fields.insert("host".into(), host);
+                fields.insert("port".into(), Value::Int(port));
+            }
+            Ok(BuiltinResult::Handled(Value::Ref(Some(id))))
+        }
+        ("Ljava/net/InetSocketAddress;", "getHostName" | "getHostString") => {
+            let h = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("host").cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::Ref(None));
+            Ok(BuiltinResult::Handled(h))
+        }
+        ("Ljava/net/InetSocketAddress;", "getPort") => {
+            let p = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("port").and_then(|x| x.as_int().ok()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            Ok(BuiltinResult::Handled(Value::Int(p)))
+        }
+        ("Landroid/provider/Settings$Global;" | "Landroid/provider/Settings$Secure;", "getString") => {
+            let key = args.get(1).and_then(|v| v.as_ref()).and_then(|id| heap.as_str(id)).unwrap_or("");
+            if key == "android_id" {
+                Ok(BuiltinResult::Handled(Value::Ref(Some(heap.new_string("pengudroid00000001".into())))))
+            } else {
+                Ok(BuiltinResult::Handled(Value::Ref(None)))
+            }
+        }
+        ("Ljava/io/FileReader;", "<init>") => {
+            let path = args.get(1).and_then(|v| v.as_ref()).and_then(|id| {
+                heap.as_str(id).map(str::to_string).or_else(|| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("path").and_then(|p| p.as_ref()).and_then(|pid| heap.as_str(pid)).map(str::to_string),
+                    _ => None,
+                })
+            }).unwrap_or_default();
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                return Err(format!("FileNotFoundException: {path}"));
+            };
+            let s_id = heap.new_string(content);
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("str".into(), Value::Ref(Some(s_id)));
+                    fields.insert("pos".into(), Value::Int(0));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/io/FileWriter;", "<init>") => {
+            let path = args.get(1).and_then(|v| v.as_ref()).and_then(|id| {
+                heap.as_str(id).map(str::to_string).or_else(|| match heap.get(id) {
+                    Some(HeapObject::Instance { fields, .. }) => fields.get("path").and_then(|p| p.as_ref()).and_then(|pid| heap.as_str(pid)).map(str::to_string),
+                    _ => None,
+                })
+            }).unwrap_or_default();
+            let append = args.get(2).and_then(|v| v.as_int().ok()).unwrap_or(0) != 0;
+            if !append {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, b"");
+            }
+            let p_id = heap.new_string(path);
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("path".into(), Value::Ref(Some(p_id)));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/io/BufferedWriter;" | "Ljava/io/PrintWriter;", "<init>") => {
+            let writer = args.get(1).cloned().unwrap_or(Value::Ref(None));
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("writer".into(), writer);
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/io/FileWriter;" | "Ljava/io/BufferedWriter;" | "Ljava/io/PrintWriter;", "write" | "print" | "println") => {
+            let text = args
+                .get(1)
+                .and_then(|v| v.as_ref())
+                .and_then(|id| heap.as_str(id))
+                .unwrap_or("")
+                .to_string();
+            let suffix = if method_name == "println" { "\n" } else { "" };
+            let path = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get(id) {
+                Some(HeapObject::Instance { fields, .. }) => {
+                    if let Some(p) = fields.get("path").and_then(|x| x.as_ref()).and_then(|pid| heap.as_str(pid)) {
+                        Some(p.to_string())
+                    } else if let Some(wid) = fields.get("writer").and_then(|x| x.as_ref()) {
+                        match heap.get(wid) {
+                            Some(HeapObject::Instance { fields: wf, .. }) => wf.get("path").and_then(|x| x.as_ref()).and_then(|pid| heap.as_str(pid)).map(str::to_string),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            if let Some(p) = path {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                    let _ = f.write_all(text.as_bytes());
+                    if !suffix.is_empty() {
+                        let _ = f.write_all(suffix.as_bytes());
+                    }
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/io/FileWriter;" | "Ljava/io/BufferedWriter;" | "Ljava/io/PrintWriter;", "flush" | "close") => {
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/content/pm/PackageManager;", "getApplicationLabel") => {
+            Ok(BuiltinResult::Handled(Value::Ref(Some(heap.new_string("Genshin Impact".into())))))
+        }
+        ("Landroid/app/ActivityManager$MemoryInfo;", "<init>") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("availMem".into(), Value::Long(8 * 1024 * 1024 * 1024));
+                    fields.insert("totalMem".into(), Value::Long(16 * 1024 * 1024 * 1024));
+                    fields.insert("threshold".into(), Value::Long(256 * 1024 * 1024));
+                    fields.insert("lowMemory".into(), Value::Int(0));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/app/ActivityManager;", "getMemoryInfo") => {
+            if let Some(id) = args.get(1).and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("availMem".into(), Value::Long(8 * 1024 * 1024 * 1024));
+                    fields.insert("totalMem".into(), Value::Long(16 * 1024 * 1024 * 1024));
+                    fields.insert("threshold".into(), Value::Long(256 * 1024 * 1024));
+                    fields.insert("lowMemory".into(), Value::Int(0));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/os/Debug;", "getPss") => {
+            Ok(BuiltinResult::Handled(Value::Long(0)))
+        }
+        ("Ljava/lang/Character;", "isSpaceChar" | "isWhitespace") => {
+            let c = args.first().and_then(|v| v.as_int().ok()).unwrap_or(0) as u32;
+            let res = char::from_u32(c).is_some_and(|ch| ch.is_whitespace() || ch == '\u{00A0}');
+            Ok(BuiltinResult::Handled(Value::Int(i32::from(res))))
+        }
+        ("Ljava/lang/Character;", "isDigit") => {
+            let c = args.first().and_then(|v| v.as_int().ok()).unwrap_or(0) as u32;
+            let res = char::from_u32(c).is_some_and(|ch| ch.is_ascii_digit());
+            Ok(BuiltinResult::Handled(Value::Int(i32::from(res))))
+        }
+        ("Ljava/lang/Character;", "isLetter") => {
+            let c = args.first().and_then(|v| v.as_int().ok()).unwrap_or(0) as u32;
+            let res = char::from_u32(c).is_some_and(|ch| ch.is_alphabetic());
+            Ok(BuiltinResult::Handled(Value::Int(i32::from(res))))
+        }
+        ("Ljava/lang/Character;", "isLetterOrDigit") => {
+            let c = args.first().and_then(|v| v.as_int().ok()).unwrap_or(0) as u32;
+            let res = char::from_u32(c).is_some_and(|ch| ch.is_alphanumeric());
+            Ok(BuiltinResult::Handled(Value::Int(i32::from(res))))
+        }
+        ("Ljava/lang/Character;", "toLowerCase") => {
+            let c = args.first().and_then(|v| v.as_int().ok()).unwrap_or(0) as u32;
+            let out = char::from_u32(c).map(|ch| ch.to_ascii_lowercase() as i32).unwrap_or(c as i32);
+            Ok(BuiltinResult::Handled(Value::Int(out)))
+        }
+        ("Ljava/lang/Character;", "toUpperCase") => {
+            let c = args.first().and_then(|v| v.as_int().ok()).unwrap_or(0) as u32;
+            let out = char::from_u32(c).map(|ch| ch.to_ascii_uppercase() as i32).unwrap_or(c as i32);
+            Ok(BuiltinResult::Handled(Value::Int(out)))
+        }
+        ("Ljava/lang/Character;", "charCount") => {
+            let cp = args.first().and_then(|v| v.as_int().ok()).unwrap_or(0) as u32;
+            Ok(BuiltinResult::Handled(Value::Int(if cp >= 0x10000 { 2 } else { 1 })))
+        }
+        ("Ljava/lang/String;", "codePointAt") => {
+            let s = args
+                .first()
+                .and_then(|v| v.as_ref())
+                .and_then(|id| heap.as_str(id))
+                .ok_or("NullPointerException: String.codePointAt")?;
+            let idx = args.get(1).and_then(|v| v.as_int().ok()).unwrap_or(0);
+            let utf16: Vec<u16> = s.encode_utf16().collect();
+            if idx < 0 || (idx as usize) >= utf16.len() {
+                return Err(format!("StringIndexOutOfBoundsException: index {idx}, len {}", utf16.len()));
+            }
+            let i = idx as usize;
+            let u0 = utf16[i];
+            let cp = if (0xD800..=0xDBFF).contains(&u0)
+                && i + 1 < utf16.len()
+                && (0xDC00..=0xDFFF).contains(&utf16[i + 1])
+            {
+                0x10000 + (((u0 as u32 - 0xD800) << 10) | (utf16[i + 1] as u32 - 0xDC00))
+            } else {
+                u0 as u32
+            };
+            Ok(BuiltinResult::Handled(Value::Int(cp as i32)))
+        }
+        ("Ljava/util/Random;", "<init>") => {
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                let seed = args.get(1).and_then(|v| v.as_long().ok()).unwrap_or(0x5deece66d);
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("seed".into(), Value::Long(seed ^ 0x5deece66d));
+                }
+            }
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Ljava/util/Random;", "nextInt" | "nextLong" | "nextBoolean") => {
+            let mut seed = args.first().and_then(|v| v.as_ref()).and_then(|id| match heap.get(id) {
+                Some(HeapObject::Instance { fields, .. }) => fields.get("seed").and_then(|v| v.as_long().ok()),
+                _ => None,
+            }).unwrap_or(0x1234_5678_9abc_def0u64 as i64) as u64;
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            if let Some(id) = args.first().and_then(|v| v.as_ref()) {
+                if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("seed".into(), Value::Long(seed as i64));
+                }
+            }
+            if method_name == "nextLong" {
+                return Ok(BuiltinResult::Handled(Value::Long(seed as i64)));
+            }
+            if method_name == "nextBoolean" {
+                return Ok(BuiltinResult::Handled(Value::Int(((seed >> 32) & 1) as i32)));
+            }
+            let bound = args.get(1).and_then(|v| v.as_int().ok());
+            let val = if let Some(b) = bound {
+                if b > 0 { ((seed >> 32) % (b as u64)) as i32 } else { 0 }
+            } else {
+                (seed >> 32) as i32
+            };
+            Ok(BuiltinResult::Handled(Value::Int(val)))
+        }
+        ("Landroid/net/http/X509TrustManagerExtensions;", "<init>") => {
+            Ok(BuiltinResult::Handled(Value::Void))
+        }
+        ("Landroid/net/http/X509TrustManagerExtensions;", "checkServerTrusted") => {
+            let list = heap.alloc(HeapObject::List(Vec::new()));
+            Ok(BuiltinResult::Handled(Value::Ref(Some(list))))
+        }
         ("Ljava/util/ArrayDeque;", "<init>") => {
             if let Some(id) = args.first().and_then(|v| v.as_ref()) {
                 if let Some(slot) = heap.get_mut(id) {
@@ -4596,5 +5393,13 @@ pub fn init_builtin_statics(heap: &mut Heap, static_fields: &mut HashMap<String,
             fields.insert("country".into(), Value::Ref(Some(cs)));
         }
         static_fields.insert(format!("Ljava/util/Locale;.{field}"), Value::Ref(Some(loc)));
+    }
+    for name in ["DIRECT", "HTTP", "SOCKS"] {
+        let pt = heap.new_instance("Ljava/net/Proxy$Type;");
+        let ns = heap.new_string(name.into());
+        if let Some(HeapObject::Instance { fields, .. }) = heap.get_mut(pt) {
+            fields.insert("name".into(), Value::Ref(Some(ns)));
+        }
+        static_fields.insert(format!("Ljava/net/Proxy$Type;.{name}"), Value::Ref(Some(pt)));
     }
 }

@@ -429,6 +429,26 @@ pub(crate) fn try_invoke_json_builtin(
                 }
                 return Ok(BuiltinResult::Handled(Value::Void));
             }
+            ("<init>", "(Ljava/util/Map;)V") => {
+                let mut entries = Vec::new();
+                if let Some(map_id) = args.get(1).and_then(|v| v.as_ref()) {
+                    let pairs: Vec<(String, Value)> = match heap.get(map_id) {
+                        Some(HeapObject::Map(m)) => m
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    for (k, v) in pairs {
+                        let jv = java_to_json(heap, &v);
+                        set_entry(&mut entries, k, jv);
+                    }
+                }
+                if let Some(id) = this_id {
+                    store().lock().unwrap().insert(id, JsonVal::Obj(entries));
+                }
+                return Ok(BuiltinResult::Handled(Value::Void));
+            }
             ("put", _) | ("putOpt", _) => {
                 let Some(id) = this_id else { return Ok(BuiltinResult::Handled(Value::Ref(None))); };
                 let Some(key) = args.get(1).and_then(|v| v.as_ref()).and_then(|k| heap.as_str(k)).map(str::to_string) else {
@@ -634,6 +654,26 @@ pub(crate) fn try_invoke_json_builtin(
                 }
                 if let Some(id) = this_id {
                     store().lock().unwrap().insert(id, parsed);
+                }
+                return Ok(BuiltinResult::Handled(Value::Void));
+            }
+            ("<init>", "(Ljava/util/Map;)V") => {
+                let mut entries = Vec::new();
+                if let Some(map_id) = args.get(1).and_then(|v| v.as_ref()) {
+                    let pairs: Vec<(String, Value)> = match heap.get(map_id) {
+                        Some(HeapObject::Map(m)) => m
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    for (k, v) in pairs {
+                        let jv = java_to_json(heap, &v);
+                        set_entry(&mut entries, k, jv);
+                    }
+                }
+                if let Some(id) = this_id {
+                    store().lock().unwrap().insert(id, JsonVal::Obj(entries));
                 }
                 return Ok(BuiltinResult::Handled(Value::Void));
             }

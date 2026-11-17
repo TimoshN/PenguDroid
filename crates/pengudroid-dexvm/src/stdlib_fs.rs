@@ -161,6 +161,27 @@ pub fn try_invoke(
                 heap.new_string(path.to_string_lossy().into_owned()),
             )))
         }
+        "getAbsoluteFile" => {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| e.to_string())?
+                    .join(path)
+            };
+            handled(file(heap, &path))
+        }
+        "createNewFile" => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let created = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .is_ok();
+            handled(Value::Int(i32::from(created)))
+        }
         "getParentFile" => handled(
             path.parent()
                 .map(|p| file(heap, p))
