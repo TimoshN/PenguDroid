@@ -198,6 +198,7 @@ pub(crate) struct ThreadRuntime {
     pub missing_methods: Mutex<BTreeMap<String, u64>>,
     messages_in_use: Arc<Mutex<HashSet<ObjId>>>,
     native_loads: Mutex<HashMap<ObjId, (String, std::sync::mpsc::SyncSender<Result<(), String>>)>>,
+    native_wraps: Mutex<HashMap<ObjId, (String, String, String, usize, std::sync::mpsc::SyncSender<Result<usize, String>>)>>,
     initialization: Mutex<HashMap<String, InitState>>,
     init_changed: Condvar,
     gates: Mutex<HashMap<ObjId, Arc<Gate>>>,
@@ -341,25 +342,30 @@ pub(crate) fn attach_native_thread() {
     }
 }
 pub(crate) fn detach_native_thread() -> bool {
-    ATTACHED_VM.with(|slot| {
-        if slot.borrow().is_none() && crate::jni_host::has_vm_invoker() {
-            return false;
-        }
-        crate::jni_host::clear_vm_invoker();
-        if let Some(vm) = slot.borrow_mut().take() {
-            let id = vm.threads.current();
-            vm.threads
-                .state
-                .lock()
-                .unwrap()
-                .attached
-                .remove(&std::thread::current().id());
-            let record = vm.threads.record(id);
-            record.state.lock().unwrap().finished = true;
-            record.changed.notify_all();
-        }
-        true
-    })
+    ATTACHED_VM
+        .try_with(|slot| {
+            if slot.borrow().is_none() && crate::jni_host::has_vm_invoker() {
+                return false;
+            }
+            crate::jni_host::clear_vm_invoker();
+            if let Some(vm) = slot.borrow_mut().take() {
+                let id = vm.threads.current();
+                vm.threads
+                    .state
+                    .lock()
+                    .unwrap()
+                    .attached
+                    .remove(&std::thread::current().id());
+                let record = vm.threads.record(id);
+                record.state.lock().unwrap().finished = true;
+                record.changed.notify_all();
+            }
+            true
+        })
+        .unwrap_or_else(|_| {
+            crate::jni_host::clear_vm_invoker();
+            true
+        })
 }
 impl ThreadTemplate {
     fn instantiate(self) -> Vm {
@@ -435,6 +441,35 @@ impl Vm {
             trace: self.trace,
         })
     }
+    pub(crate) fn post_dialog_click(&self, listener: ObjId, dialog: ObjId, which: i32) {
+        let Some(looper) = self.threads.state.lock().unwrap().main else {
+            return;
+        };
+        let task = object("Lpengu/internal/DialogClickTask;");
+        put(task, "listener", Value::Ref(Some(listener)));
+        put(task, "dialog", Value::Ref(Some(dialog)));
+        put(task, "which", Value::Int(which));
+        let handler = object("Landroid/os/Handler;");
+        put(handler, "mLooper", Value::Ref(Some(looper)));
+        let message = object("Landroid/os/Message;");
+        put(message, "callback", Value::Ref(Some(task)));
+        let _ = self.enqueue_message(handler, message, uptime_millis().saturating_add(10), false);
+    }
+    pub(crate) fn post_idle_handler(&self, looper: ObjId, idle_handler: ObjId, delay_ms: i64) {
+        let task = object("Lpengu/internal/IdleHandlerTask;");
+        put(task, "handler", Value::Ref(Some(idle_handler)));
+        put(task, "looper", Value::Ref(Some(looper)));
+        let handler = object("Landroid/os/Handler;");
+        put(handler, "mLooper", Value::Ref(Some(looper)));
+        let message = object("Landroid/os/Message;");
+        put(message, "callback", Value::Ref(Some(task)));
+        let _ = self.enqueue_message(
+            handler,
+            message,
+            uptime_millis().saturating_add(delay_ms),
+            false,
+        );
+    }
     pub(crate) fn request_native_load(&self, library: &str) -> Result<(), String> {
         let looper = self
             .threads
@@ -467,6 +502,46 @@ impl Vm {
             Err(error) => {
                 self.threads.native_loads.lock().unwrap().remove(&task);
                 Err(format!("native loader owner did not complete: {error}"))
+            }
+        }
+    }
+    pub(crate) fn request_native_wrap(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        fn_ptr: usize,
+    ) -> Result<usize, String> {
+        let looper = self
+            .threads
+            .state
+            .lock()
+            .unwrap()
+            .main
+            .ok_or("native wrap requires an owning main Looper")?;
+        if self.threads.queue(looper)?.owner == self.threads.current() {
+            return Err("pointer wrapper owner is not installed on this interpreter".into());
+        }
+        let task = object("Lpengu/internal/NativeWrapTask;");
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        self.threads.native_wraps.lock().unwrap().insert(
+            task,
+            (class_name.into(), method_name.into(), descriptor.into(), fn_ptr, reply),
+        );
+        let handler = object("Landroid/os/Handler;");
+        put(handler, "mLooper", Value::Ref(Some(looper)));
+        let message = object("Landroid/os/Message;");
+        put(message, "callback", Value::Ref(Some(task)));
+        let queued = self.enqueue_message(handler, message, uptime_millis(), false);
+        if !matches!(queued, Ok(Value::Int(1))) {
+            self.threads.native_wraps.lock().unwrap().remove(&task);
+            return Err("native wrapper main queue is unavailable".into());
+        }
+        match receive.recv_timeout(Duration::from_secs(120)) {
+            Ok(result) => result,
+            Err(error) => {
+                self.threads.native_wraps.lock().unwrap().remove(&task);
+                Err(format!("native wrapper owner did not complete: {error}"))
             }
         }
     }
@@ -861,6 +936,33 @@ impl Vm {
         args: &[Value],
         virtual_call: bool,
     ) -> Result<Option<Value>, String> {
+        if requested == "Lpengu/internal/NativeWrapTask;" && method == "run" {
+            let request = self
+                .threads
+                .native_wraps
+                .lock()
+                .unwrap()
+                .remove(&arg(args, 0)?);
+            if let Some((cls, mname, desc, fn_ptr, reply)) = request {
+                let res = if let Some(wrapper) = self.pointer_wrapper.as_mut() {
+                    let shorty = crate::vm::descriptor_to_shorty(&desc);
+                    if let Some(wrapped) = wrapper(fn_ptr, &shorty) {
+                        crate::jni_host::register_native(&cls, &mname, &desc, wrapped);
+                        self.wrapped_natives
+                            .lock()
+                            .unwrap()
+                            .insert((cls, mname, desc), wrapped);
+                        Ok(wrapped)
+                    } else {
+                        Ok(fn_ptr)
+                    }
+                } else {
+                    Err("pointer_wrapper missing on owner".into())
+                };
+                let _ = reply.send(res);
+            }
+            return Ok(Some(Value::Void));
+        }
         if requested == "Lpengu/internal/NativeLoadTask;" && method == "run" {
             let request = self
                 .threads
@@ -875,6 +977,66 @@ impl Vm {
                     Ok(())
                 });
                 let _ = reply.send(result);
+            }
+            return Ok(Some(Value::Void));
+        }
+        if requested == "Lpengu/internal/DialogClickTask;" && method == "run" {
+            let task = arg(args, 0)?;
+            let lid = field(task, "listener").as_ref();
+            let dlg = field(task, "dialog").as_ref();
+            let which = field(task, "which").as_int().unwrap_or(-1);
+            if let (Some(lid), Some(dlg)) = (lid, dlg) {
+                let lcls = jni_state()
+                    .lock()
+                    .unwrap()
+                    .heap
+                    .get(lid)
+                    .map(|o| o.class_name().to_string())
+                    .unwrap_or_default();
+                if !lcls.is_empty() {
+                    let _ = self.invoke_method(
+                        &lcls,
+                        "onClick",
+                        "(Landroid/content/DialogInterface;I)V",
+                        &[Value::Ref(Some(lid)), Value::Ref(Some(dlg)), Value::Int(which)],
+                        true,
+                    );
+                }
+            }
+            return Ok(Some(Value::Void));
+        }
+        if requested == "Lpengu/internal/IdleHandlerTask;" && method == "run" {
+            let task = arg(args, 0)?;
+            if let Some(ih) = field(task, "handler").as_ref() {
+                let cls = jni_state()
+                    .lock()
+                    .unwrap()
+                    .heap
+                    .get(ih)
+                    .map(|o| o.class_name().to_string())
+                    .unwrap_or_default();
+                if !cls.is_empty() {
+                    let keep = matches!(
+                        self.invoke_method(&cls, "queueIdle", "()Z", &[Value::Ref(Some(ih))], true),
+                        Ok(Value::Int(v)) if v != 0
+                    );
+                    if keep {
+                        let looper = field(task, "looper")
+                            .as_ref()
+                            .or_else(|| self.threads.my_looper())
+                            .or_else(|| self.threads.state.lock().unwrap().main);
+                        if let Some(looper) = looper {
+                            let quitting = self
+                                .threads
+                                .queue(looper)
+                                .map(|q| q.state.lock().unwrap().quitting)
+                                .unwrap_or(true);
+                            if !quitting {
+                                self.post_idle_handler(looper, ih, 1);
+                            }
+                        }
+                    }
+                }
             }
             return Ok(Some(Value::Void));
         }
@@ -1320,6 +1482,35 @@ impl Vm {
                 return Ok(Some(Value::Int(
                     (self.threads.queue(arg(args, 0)?)?.owner == self.threads.current()) as i32,
                 )));
+            }
+            ("Landroid/os/Looper;", "myQueue") => {
+                let mq = crate::jni_host::jni_state()
+                    .lock()
+                    .unwrap()
+                    .heap
+                    .new_instance("Landroid/os/MessageQueue;");
+                let looper = self
+                    .threads
+                    .my_looper()
+                    .or_else(|| self.threads.state.lock().unwrap().main);
+                if let Some(looper) = looper {
+                    put(mq, "looper", Value::Ref(Some(looper)));
+                }
+                return Ok(Some(Value::Ref(Some(mq))));
+            }
+            ("Landroid/os/MessageQueue;", "addIdleHandler") => {
+                let mq = arg(args, 0)?;
+                let looper = field(mq, "looper")
+                    .as_ref()
+                    .or_else(|| self.threads.my_looper())
+                    .or_else(|| self.threads.state.lock().unwrap().main);
+                if let (Some(looper), Some(ih)) = (looper, args.get(1).and_then(|v| v.as_ref())) {
+                    self.post_idle_handler(looper, ih, 1);
+                }
+                return Ok(void);
+            }
+            ("Landroid/os/MessageQueue;", "removeIdleHandler") => {
+                return Ok(void);
             }
             ("Landroid/os/Message;", "sendToTarget") => {
                 let m = arg(args, 0)?;
@@ -2033,6 +2224,8 @@ mod state_tests {
                 access_flags: 1,
                 superclass: Some("Ljava/lang/Thread;".into()),
                 interfaces: vec![],
+                signature: None,
+                field_annotations: HashMap::new(),
                 static_fields: vec![],
                 instance_fields: vec![],
                 direct_methods: vec![],
@@ -2047,6 +2240,8 @@ mod state_tests {
                 access_flags: 1,
                 superclass: Some("Ljava/lang/Object;".into()),
                 interfaces: vec![],
+                signature: None,
+                field_annotations: HashMap::new(),
                 static_fields: vec![],
                 instance_fields: vec![],
                 direct_methods: vec![

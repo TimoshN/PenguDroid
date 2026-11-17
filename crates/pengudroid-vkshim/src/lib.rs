@@ -1888,6 +1888,258 @@ pub unsafe extern "C" fn vkAcquireNextImage2KHR(
     )
 }
 
+unsafe fn dump_vk_frame_if_requested(
+    device: VkDevice,
+    queue: VkQueue,
+    image: VkImage,
+    w: u32,
+    h: u32,
+    fourcc: u32,
+) {
+    static FRAME_IDX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Ok(out_path) = std::env::var("PENGUDROID_DUMP_VK_FRAME") else {
+        return;
+    };
+    let n = FRAME_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n != 150 {
+        return;
+    }
+    let Some((inst, phys)) = lock_state().devices.get(&(device as usize)).map(|d| (d.instance, d.physical_device)) else {
+        return;
+    };
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkBufferCreateInfo {
+        s_type: u32,
+        p_next: *const c_void,
+        flags: u32,
+        size: u64,
+        usage: u32,
+        sharing_mode: u32,
+        queue_family_index_count: u32,
+        p_queue_family_indices: *const u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkMemoryRequirements {
+        size: u64,
+        alignment: u64,
+        memory_type_bits: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkMemoryType {
+        property_flags: u32,
+        heap_index: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkMemoryHeap {
+        size: u64,
+        flags: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkPhysicalDeviceMemoryProperties {
+        memory_type_count: u32,
+        memory_types: [VkMemoryType; 32],
+        memory_heap_count: u32,
+        memory_heaps: [VkMemoryHeap; 16],
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkMemoryAllocateInfo {
+        s_type: u32,
+        p_next: *const c_void,
+        allocation_size: u64,
+        memory_type_index: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkCommandPoolCreateInfo {
+        s_type: u32,
+        p_next: *const c_void,
+        flags: u32,
+        queue_family_index: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkCommandBufferAllocateInfo {
+        s_type: u32,
+        p_next: *const c_void,
+        command_pool: u64,
+        level: u32,
+        command_buffer_count: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkCommandBufferBeginInfo {
+        s_type: u32,
+        p_next: *const c_void,
+        flags: u32,
+        p_inheritance_info: *const c_void,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkImageSubresourceLayers {
+        aspect_mask: u32,
+        mip_level: u32,
+        base_array_layer: u32,
+        layer_count: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkOffset3D {
+        x: i32,
+        y: i32,
+        z: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkExtent3D {
+        width: u32,
+        height: u32,
+        depth: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkBufferImageCopy {
+        buffer_offset: u64,
+        buffer_row_length: u32,
+        buffer_image_height: u32,
+        image_subresource: VkImageSubresourceLayers,
+        image_offset: VkOffset3D,
+        image_extent: VkExtent3D,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkImageSubresourceRange {
+        aspect_mask: u32,
+        base_mip_level: u32,
+        level_count: u32,
+        base_array_layer: u32,
+        layer_count: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VkImageMemoryBarrier {
+        s_type: u32,
+        p_next: *const c_void,
+        src_access_mask: u32,
+        dst_access_mask: u32,
+        old_layout: u32,
+        new_layout: u32,
+        src_queue_family_index: u32,
+        dst_queue_family_index: u32,
+        image: VkImage,
+        subresource_range: VkImageSubresourceRange,
+    }
+
+    let size = (w as u64) * (h as u64) * 4;
+    macro_rules! dev_fn {
+        ($s:expr, $t:ty) => {{
+            let Some(p) = host_device_fn(device, $s) else { return; };
+            std::mem::transmute::<*mut c_void, $t>(p)
+        }};
+    }
+    let create_buf: unsafe extern "C" fn(VkDevice, *const VkBufferCreateInfo, *const c_void, *mut u64) -> VkResult = dev_fn!(b"vkCreateBuffer\0", _);
+    let destroy_buf: unsafe extern "C" fn(VkDevice, u64, *const c_void) = dev_fn!(b"vkDestroyBuffer\0", _);
+    let get_buf_req: unsafe extern "C" fn(VkDevice, u64, *mut VkMemoryRequirements) = dev_fn!(b"vkGetBufferMemoryRequirements\0", _);
+    let alloc_mem: unsafe extern "C" fn(VkDevice, *const VkMemoryAllocateInfo, *const c_void, *mut u64) -> VkResult = dev_fn!(b"vkAllocateMemory\0", _);
+    let free_mem: unsafe extern "C" fn(VkDevice, u64, *const c_void) = dev_fn!(b"vkFreeMemory\0", _);
+    let bind_buf: unsafe extern "C" fn(VkDevice, u64, u64, u64) -> VkResult = dev_fn!(b"vkBindBufferMemory\0", _);
+    let map_mem: unsafe extern "C" fn(VkDevice, u64, u64, u64, u32, *mut *mut u8) -> VkResult = dev_fn!(b"vkMapMemory\0", _);
+    let unmap_mem: unsafe extern "C" fn(VkDevice, u64) = dev_fn!(b"vkUnmapMemory\0", _);
+    let create_pool: unsafe extern "C" fn(VkDevice, *const VkCommandPoolCreateInfo, *const c_void, *mut u64) -> VkResult = dev_fn!(b"vkCreateCommandPool\0", _);
+    let destroy_pool: unsafe extern "C" fn(VkDevice, u64, *const c_void) = dev_fn!(b"vkDestroyCommandPool\0", _);
+    let alloc_cb: unsafe extern "C" fn(VkDevice, *const VkCommandBufferAllocateInfo, *mut usize) -> VkResult = dev_fn!(b"vkAllocateCommandBuffers\0", _);
+    let begin_cb: unsafe extern "C" fn(usize, *const VkCommandBufferBeginInfo) -> VkResult = dev_fn!(b"vkBeginCommandBuffer\0", _);
+    let end_cb: unsafe extern "C" fn(usize) -> VkResult = dev_fn!(b"vkEndCommandBuffer\0", _);
+    let cmd_barrier: unsafe extern "C" fn(usize, u32, u32, u32, u32, *const c_void, u32, *const c_void, u32, *const VkImageMemoryBarrier) = dev_fn!(b"vkCmdPipelineBarrier\0", _);
+    let cmd_copy: unsafe extern "C" fn(usize, VkImage, u32, u64, u32, *const VkBufferImageCopy) = dev_fn!(b"vkCmdCopyImageToBuffer\0", _);
+    let q_submit: unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo, u64) -> VkResult = dev_fn!(b"vkQueueSubmit\0", _);
+    let q_wait: unsafe extern "C" fn(VkQueue) -> VkResult = dev_fn!(b"vkQueueWaitIdle\0", _);
+    let get_mem_props: unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceMemoryProperties) = {
+        let Some(p) = host_instance_fn(inst, b"vkGetPhysicalDeviceMemoryProperties\0") else { return; };
+        std::mem::transmute(p)
+    };
+
+    let buf_ci = VkBufferCreateInfo { s_type: 12, p_next: std::ptr::null(), flags: 0, size, usage: 2, sharing_mode: 0, queue_family_index_count: 0, p_queue_family_indices: std::ptr::null() };
+    let mut buf = 0u64;
+    if create_buf(device, &buf_ci, std::ptr::null(), &mut buf) != VK_SUCCESS { return; }
+    let mut req = VkMemoryRequirements { size: 0, alignment: 0, memory_type_bits: 0 };
+    get_buf_req(device, buf, &mut req);
+    let mut props: VkPhysicalDeviceMemoryProperties = std::mem::zeroed();
+    get_mem_props(phys, &mut props);
+    let Some(mem_idx) = (0..props.memory_type_count).find(|&i| {
+        (req.memory_type_bits & (1 << i)) != 0 && (props.memory_types[i as usize].property_flags & 0x6) == 0x6
+    }) else {
+        destroy_buf(device, buf, std::ptr::null());
+        return;
+    };
+    let alloc_ai = VkMemoryAllocateInfo { s_type: 5, p_next: std::ptr::null(), allocation_size: req.size, memory_type_index: mem_idx };
+    let mut mem = 0u64;
+    if alloc_mem(device, &alloc_ai, std::ptr::null(), &mut mem) != VK_SUCCESS {
+        destroy_buf(device, buf, std::ptr::null());
+        return;
+    }
+    let _ = bind_buf(device, buf, mem, 0);
+    let pool_ci = VkCommandPoolCreateInfo { s_type: 39, p_next: std::ptr::null(), flags: 0, queue_family_index: 0 };
+    let mut pool = 0u64;
+    if create_pool(device, &pool_ci, std::ptr::null(), &mut pool) == VK_SUCCESS {
+        let cb_ai = VkCommandBufferAllocateInfo { s_type: 40, p_next: std::ptr::null(), command_pool: pool, level: 0, command_buffer_count: 1 };
+        let mut cb = 0usize;
+        if alloc_cb(device, &cb_ai, &mut cb) == VK_SUCCESS {
+            let bi = VkCommandBufferBeginInfo { s_type: 42, p_next: std::ptr::null(), flags: 1, p_inheritance_info: std::ptr::null() };
+            let _ = begin_cb(cb, &bi);
+            let to_src = VkImageMemoryBarrier {
+                s_type: 45, p_next: std::ptr::null(), src_access_mask: 0, dst_access_mask: 0x0800,
+                old_layout: 1000001002, new_layout: 6, src_queue_family_index: !0, dst_queue_family_index: !0,
+                image, subresource_range: VkImageSubresourceRange { aspect_mask: 1, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 },
+            };
+            cmd_barrier(cb, 0x10000, 0x1000, 0, 0, std::ptr::null(), 0, std::ptr::null(), 1, &to_src);
+            let region = VkBufferImageCopy {
+                buffer_offset: 0, buffer_row_length: 0, buffer_image_height: 0,
+                image_subresource: VkImageSubresourceLayers { aspect_mask: 1, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                image_offset: VkOffset3D { x: 0, y: 0, z: 0 },
+                image_extent: VkExtent3D { width: w, height: h, depth: 1 },
+            };
+            cmd_copy(cb, image, 6, buf, 1, &region);
+            let to_pres = VkImageMemoryBarrier {
+                s_type: 45, p_next: std::ptr::null(), src_access_mask: 0x0800, dst_access_mask: 0,
+                old_layout: 6, new_layout: 1000001002, src_queue_family_index: !0, dst_queue_family_index: !0,
+                image, subresource_range: to_src.subresource_range,
+            };
+            cmd_barrier(cb, 0x1000, 0x10000, 0, 0, std::ptr::null(), 0, std::ptr::null(), 1, &to_pres);
+            let _ = end_cb(cb);
+            #[repr(C)]
+            struct Submit { s_type: u32, p_next: *const c_void, wsc: u32, pws: *const c_void, pds: *const c_void, cbc: u32, pcb: *const usize, ssc: u32, pss: *const c_void }
+            let sub = Submit { s_type: 4, p_next: std::ptr::null(), wsc: 0, pws: std::ptr::null(), pds: std::ptr::null(), cbc: 1, pcb: &cb, ssc: 0, pss: std::ptr::null() };
+            let _ = q_submit(queue, 1, &sub as *const Submit as *const VkSubmitInfo, 0);
+            let _ = q_wait(queue);
+        }
+        destroy_pool(device, pool, std::ptr::null());
+    }
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    if map_mem(device, mem, 0, size, 0, &mut ptr) == VK_SUCCESS && !ptr.is_null() {
+        let bytes = std::slice::from_raw_parts(ptr, size as usize);
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        let is_bgr = fourcc == u32::from_le_bytes(*b"XR24") || fourcc == u32::from_le_bytes(*b"AR24");
+        for px in bytes.chunks_exact(4) {
+            if is_bgr {
+                ppm.extend_from_slice(&[px[2], px[1], px[0]]);
+            } else {
+                ppm.extend_from_slice(&[px[0], px[1], px[2]]);
+            }
+        }
+        let _ = std::fs::write(&out_path, ppm);
+        eprintln!("[vkshim] dumped frame {n} to {out_path}");
+        unmap_mem(device, mem);
+    }
+    destroy_buf(device, buf, std::ptr::null());
+    free_mem(device, mem, std::ptr::null());
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vkQueuePresentKHR(
     queue: VkQueue,
@@ -1964,6 +2216,8 @@ pub unsafe extern "C" fn vkQueuePresentKHR(
             let dup_fd = libc::dup(img.dmabuf_fd.as_raw_fd());
             (
                 sid,
+                sc.device,
+                img.image,
                 sc.width,
                 sc.height,
                 img.stride,
@@ -1973,7 +2227,8 @@ pub unsafe extern "C" fn vkQueuePresentKHR(
                 dup_fd,
             )
         };
-        let (sid, w, h, stride, fourcc, modifier, offset, dup_fd) = present_params;
+        let (sid, dev, vk_img, w, h, stride, fourcc, modifier, offset, dup_fd) = present_params;
+        dump_vk_frame_if_requested(dev, queue, vk_img, w, h, fourcc);
         if dup_fd >= 0 {
             let res = present_dmabuf_to_daemon(sid, w, h, stride, fourcc, modifier, offset, dup_fd);
             libc::close(dup_fd);

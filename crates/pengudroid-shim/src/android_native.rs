@@ -39,6 +39,7 @@ struct AssetManager {
 struct Asset {
     data: Vec<u8>,
     pos: usize,
+    backing: Option<(String, u64, u64)>,
 }
 
 struct AssetDir {
@@ -101,6 +102,7 @@ pub unsafe extern "C" fn AAssetManager_open(
     }
     let name = CStr::from_ptr(filename).to_string_lossy();
     let name = name.trim_start_matches('/');
+    let trace = std::env::var_os("PENGUDROID_TRACE_ASSETS").is_some();
     let asset_path = if name.starts_with("assets/") {
         None
     } else {
@@ -109,13 +111,18 @@ pub unsafe extern "C" fn AAssetManager_open(
     for archive in &asset_manager().archives {
         if let Some(ref ap) = asset_path {
             if let Ok(data) = archive.read(ap) {
-                return Box::into_raw(Box::new(Asset { data, pos: 0 })) as *mut c_void;
+                let backing = archive.raw_location(ap);
+                if trace { eprintln!("[shim] AAssetManager_open({name}) -> FOUND ({} bytes)", data.len()); }
+                return Box::into_raw(Box::new(Asset { data, pos: 0, backing })) as *mut c_void;
             }
         }
         if let Ok(data) = archive.read(name) {
-            return Box::into_raw(Box::new(Asset { data, pos: 0 })) as *mut c_void;
+            let backing = archive.raw_location(name);
+            if trace { eprintln!("[shim] AAssetManager_open({name}) -> FOUND ({} bytes)", data.len()); }
+            return Box::into_raw(Box::new(Asset { data, pos: 0, backing })) as *mut c_void;
         }
     }
+    if trace { eprintln!("[shim] AAssetManager_open({name}) -> NULL"); }
     std::ptr::null_mut()
 }
 
@@ -235,21 +242,57 @@ pub unsafe extern "C" fn AAsset_isAllocated(_asset: *mut c_void) -> c_int {
 /// (assets are decompressed in memory, not mapped from the APK).
 #[no_mangle]
 pub unsafe extern "C" fn AAsset_openFileDescriptor(
-    _asset: *mut c_void,
-    _out_start: *mut i32,
-    _out_length: *mut i32,
+    asset: *mut c_void,
+    out_start: *mut i32,
+    out_length: *mut i32,
 ) -> c_int {
-    -1
+    let mut start = 0i64;
+    let mut len = 0i64;
+    let fd = AAsset_openFileDescriptor64(asset, &mut start, &mut len);
+    if fd >= 0 {
+        if !out_start.is_null() { *out_start = start as i32; }
+        if !out_length.is_null() { *out_length = len as i32; }
+    }
+    fd
 }
 
 /// `AAsset_openFileDescriptor64(asset, outStart, outLength)`.
 #[no_mangle]
 pub unsafe extern "C" fn AAsset_openFileDescriptor64(
-    _asset: *mut c_void,
-    _out_start: *mut i64,
-    _out_length: *mut i64,
+    asset: *mut c_void,
+    out_start: *mut i64,
+    out_length: *mut i64,
 ) -> c_int {
-    -1
+    let Some(a) = asset_ref(asset) else {
+        return -1;
+    };
+    if let Some((ref path, start, len)) = a.backing {
+        if let Ok(cpath) = CString::new(path.as_str()) {
+            let fd = libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if fd >= 0 {
+                if !out_start.is_null() { *out_start = start as i64; }
+                if !out_length.is_null() { *out_length = len as i64; }
+                return fd;
+            }
+        }
+    }
+    let fd = libc::memfd_create(c"pengu-asset".as_ptr(), libc::MFD_CLOEXEC);
+    if fd < 0 {
+        return -1;
+    }
+    let mut off = 0usize;
+    while off < a.data.len() {
+        let n = libc::write(fd, a.data[off..].as_ptr() as *const c_void, a.data.len() - off);
+        if n <= 0 {
+            libc::close(fd);
+            return -1;
+        }
+        off += n as usize;
+    }
+    let _ = libc::lseek(fd, 0, libc::SEEK_SET);
+    if !out_start.is_null() { *out_start = 0; }
+    if !out_length.is_null() { *out_length = a.data.len() as i64; }
+    fd
 }
 
 /// `AAssetManager_openDir(mgr, dirName)`.

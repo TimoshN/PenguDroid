@@ -54,6 +54,9 @@ impl Vm {
             let mut st = jni_state().lock().unwrap();
             init_builtin_statics(&mut st.heap, &mut static_fields);
         }
+        for (k, v) in &static_fields {
+            crate::jni_host::set_static_field(k, v.clone());
+        }
         Self {
             dexes: Vec::new(),
             classes: Arc::new(HashMap::new()),
@@ -182,7 +185,7 @@ impl Vm {
         self.find_method_in_hierarchy(class, method, descriptor, true).is_some()
     }
 
-    fn find_method_in_hierarchy(
+    pub(crate) fn find_method_in_hierarchy(
         &self,
         start_class: &str,
         name: &str,
@@ -234,9 +237,15 @@ impl Vm {
     pub fn all_missing_methods(&self) -> BTreeMap<String,u64> { self.threads.missing_methods.lock().unwrap().clone() }
 
     fn builtin_exception(&mut self,error:String,descriptor:&str)->Result<Value,String> {
-        let name=error.split(':').next().unwrap_or("");
-        if !matches!(name,"NoSuchMethodException" | "NoSuchFieldException" | "NullPointerException" | "InterruptedException" | "IllegalMonitorStateException" | "IllegalThreadStateException" | "IllegalArgumentException" | "IllegalStateException" | "ClassCastException" | "RuntimeException") { return Err(error); }
-        let mut state=jni_state().lock().unwrap();let id=state.heap.new_instance(&format!("Ljava/lang/{name};"));let message=state.heap.new_string(error);
+        let name=error.split(':').next().unwrap_or("").rsplit('.').next().unwrap_or("");
+        let exc_class = match name {
+            "NoSuchMethodException" | "NoSuchFieldException" | "NullPointerException" | "InterruptedException" | "IllegalMonitorStateException" | "IllegalThreadStateException" | "IllegalArgumentException" | "IllegalStateException" | "ClassCastException" | "RuntimeException" => format!("Ljava/lang/{name};"),
+            "JSONException" => "Lorg/json/JSONException;".to_string(),
+            "NoSuchElementException" => "Ljava/util/NoSuchElementException;".to_string(),
+            "FileNotFoundException" | "IOException" => format!("Ljava/io/{name};"),
+            _ => return Err(error),
+        };
+        let mut state=jni_state().lock().unwrap();let id=state.heap.new_instance(&exc_class);let message=state.heap.new_string(error);
         if let Some(HeapObject::Instance{fields,..})=state.heap.get_mut(id){fields.insert("detailMessage".into(),Value::Ref(Some(message)));}
         self.pending_exception=Some(id);Ok(default_return_for_descriptor(descriptor))
     }
@@ -313,16 +322,15 @@ impl Vm {
             let key = (class_name.to_string(), method_name.to_string(), descriptor.to_string());
             if self.wrapped_natives.lock().unwrap().get(&key) != Some(&fn_ptr) {
                 if self.needs_bridge && self.pointer_wrapper.is_none() {
-                    return Err(format!("ARM64 JNI method was not prepared before worker execution: {key:?}"));
-                }
-                if let Some(wrapper) = self.pointer_wrapper.as_mut() {
+                    fn_ptr = self.request_native_wrap(class_name, method_name, descriptor, fn_ptr)?;
+                } else if let Some(wrapper) = self.pointer_wrapper.as_mut() {
                     let shorty = descriptor_to_shorty(descriptor);
                     if let Some(wrapped) = wrapper(fn_ptr, &shorty) {
                         crate::jni_host::register_native(class_name, method_name, descriptor, wrapped);
                         fn_ptr = wrapped;
                     }
+                    self.wrapped_natives.lock().unwrap().insert(key, fn_ptr);
                 }
-                self.wrapped_natives.lock().unwrap().insert(key, fn_ptr);
             }
             let is_static = resolved_method.as_ref()
                 .map(|(_, _, method)| method.access_flags & 0x0008 != 0)
@@ -341,8 +349,8 @@ impl Vm {
                 method_name,
                 descriptor,
                 args,
-            )?;
-            while matches!(res, BuiltinResult::NotBuiltin) {
+            );
+            while matches!(res, Ok(BuiltinResult::NotBuiltin)) {
                 let Some(sup) = crate::stdlib::builtin_superclass(&cur) else {
                     break;
                 };
@@ -354,9 +362,13 @@ impl Vm {
                     method_name,
                     descriptor,
                     args,
-                )?;
+                );
             }
             res
+        };
+        let builtin = match builtin {
+            Ok(b) => b,
+            Err(error) => return self.builtin_exception(error, descriptor),
         };
         match builtin {
             BuiltinResult::Handled(v) => return Ok(v),
@@ -428,7 +440,7 @@ impl Vm {
             }
         }
 
-        if matches!((method_name,descriptor),("getClass","()Ljava/lang/Class;") | ("hashCode","()I") | ("equals","(Ljava/lang/Object;)Z") | ("toString","()Ljava/lang/String;")) {
+        if matches!((method_name,descriptor),("getClass","()Ljava/lang/Class;") | ("getClass","()Ljava/lang/Object;") | ("hashCode","()I") | ("equals","(Ljava/lang/Object;)Z") | ("toString","()Ljava/lang/String;")) {
             let mut state=jni_state().lock().unwrap();
             if let BuiltinResult::Handled(value)=try_invoke_builtin(&mut state.heap,&mut self.static_fields,"Ljava/lang/Object;",method_name,descriptor,args)? { return Ok(value); }
         }
@@ -552,7 +564,9 @@ impl Vm {
         let object = self.new_instance(application_class)?;
         let key = "PENGUDROID_APPLICATION".to_string();
         self.static_fields.insert(key.clone(), Value::Ref(Some(object)));
-        self.threads.statics.lock().unwrap().insert(key, Value::Ref(Some(object)));
+        self.threads.statics.lock().unwrap().insert(key.clone(), Value::Ref(Some(object)));
+        crate::jni_host::set_static_field(&key, Value::Ref(Some(object)));
+        crate::jni_host::set_static_field("PENGUDROID_ACTIVITY", Value::Ref(Some(object)));
         let context = self.new_instance("Landroid/content/Context;")?;
         for (name, signature, arguments) in [
             ("<init>", "()V", vec![Value::Ref(Some(object))]),
@@ -688,7 +702,7 @@ impl Vm {
 
         while pc < insns.len() {
             steps += 1;
-            if steps > 5_000_000 {
+            if self.owns_runtime && steps > 5_000_000 {
                 return Err(format!(
                     "VM instruction budget exceeded at pc={pc} op=0x{:02x}",
                     insns[pc] & 0xff
@@ -836,7 +850,7 @@ impl Vm {
                     }
                     0x1f => {
                         let target=&self.dexes[dex_idx].types[insns[pc+1] as usize];
-                        if let Some(id)=regs[aa].as_ref(){if !self.is_instance_of(id,target){let exception=jni_state().lock().unwrap().heap.new_instance("Ljava/lang/ClassCastException;");return Err(OpErr::Thrown(exception));}}
+                        if let Some(id)=regs[aa].as_ref(){if !self.is_instance_of(id,target){let mut st=jni_state().lock().unwrap();let actual=st.heap.class_name(id).unwrap_or("?").to_string();let exception=st.heap.new_instance("Ljava/lang/ClassCastException;");let msg=st.heap.new_string(format!("{actual} cannot be cast to {target}"));if let Some(HeapObject::Instance{fields,..})=st.heap.get_mut(exception){fields.insert("detailMessage".into(),Value::Ref(Some(msg)));}return Err(OpErr::Thrown(exception));}}
                         pc+=2;
                     }
                     0x20 => {
@@ -1208,6 +1222,7 @@ impl Vm {
                         self.ensure_clinit(&f.class_name).map_err(OpErr::Fatal)?;
                         let key = format!("{}.{}", f.class_name, f.name);
                         self.threads.statics.lock().unwrap().insert(key.clone(), regs[aa].clone());
+                        crate::jni_host::set_static_field(&key, regs[aa].clone());
                         self.static_fields.insert(key, regs[aa].clone());
                         pc += 2;
                     }
@@ -1474,7 +1489,7 @@ pub(crate) fn descriptor_to_shorty(sig: &str) -> String {
     format!("{}{}", if ret.is_empty() { "V" } else { &ret }, params)
 }
 
-fn default_return_for_descriptor(desc: &str) -> Value {
+pub(crate) fn default_return_for_descriptor(desc: &str) -> Value {
     let ret = desc.rsplit(')').next().unwrap_or("V");
     match ret.chars().next() {
         Some('V') | None => Value::Void,

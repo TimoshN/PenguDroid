@@ -24,6 +24,8 @@ fn fixture(d: usize) -> DexFile {
         access_flags: 1,
         superclass: None,
         interfaces: vec![],
+        signature: None,
+        field_annotations: HashMap::new(),
         static_fields: vec![],
         instance_fields: vec![],
         direct_methods: (0..methods.len())

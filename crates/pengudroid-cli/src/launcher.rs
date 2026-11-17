@@ -830,8 +830,26 @@ fn guest_root_for_bridge(bridge_dir: &Path) -> Option<PathBuf> {
     for anc in bridge_dir.ancestors().take(5) {
         for rel in ["share/pengudroid/guest-arm64", "guest-arm64"] {
             let candidate = anc.join(rel);
-            if candidate.is_dir() {
+            if candidate.join("pengudroid-runtime.json").is_file()
+                || candidate.join("system/bin/arm64/app_process64").is_file()
+            {
                 return Some(candidate);
+            }
+        }
+    }
+    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    {
+        if let Ok(entries) = std::fs::read_dir(cache.join("pengudroid/appimage")) {
+            let mut dirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path().join("usr/share/pengudroid/guest-arm64"))
+                .filter(|d| d.join("system/bin/arm64/app_process64").is_file())
+                .collect();
+            dirs.sort();
+            if let Some(d) = dirs.into_iter().next() {
+                return Some(d);
             }
         }
     }
@@ -867,7 +885,13 @@ fn find_arm64_bridge_dir() -> Option<(PathBuf, Option<PathBuf>)> {
                 .flatten()
                 .map(|e| e.path().join("usr/lib/pengudroid/bridge"))
                 .collect();
-            dirs.sort();
+            dirs.sort_by_key(|d| {
+                let has_vk = d.join("libberberis_proxy_libvulkan.so").is_file();
+                let mtime = std::fs::metadata(d)
+                    .and_then(|m| m.modified())
+                    .ok();
+                (std::cmp::Reverse(has_vk), std::cmp::Reverse(mtime))
+            });
             candidates.extend(dirs);
         }
     }
@@ -879,14 +903,20 @@ fn find_arm64_bridge_dir() -> Option<(PathBuf, Option<PathBuf>)> {
     }
     candidates.push(PathBuf::from("/usr/lib/pengudroid/bridge"));
 
+    let mut fallback: Option<(PathBuf, Option<PathBuf>)> = None;
     for dir in candidates {
         if dir.join("libberberis_arm64.so").is_file() {
             let canon = std::fs::canonicalize(&dir).unwrap_or(dir);
             let guest = guest_root_for_bridge(&canon);
-            return Some((canon, guest));
+            if canon.join("libberberis_proxy_libvulkan.so").is_file() {
+                return Some((canon, guest));
+            }
+            if fallback.is_none() {
+                fallback = Some((canon, guest));
+            }
         }
     }
-    None
+    fallback
 }
 
 fn apply_env(cmd: &mut std::process::Command, env: &[(String, String)]) {
@@ -1019,9 +1049,45 @@ fn prepare_pengu_process(info: &ApkInfo, prefix: &Path) -> Option<i32> {
                     }
                 }
             }
-            lib_paths.push(staged_bridge.to_string_lossy().into_owned());
+            if let Some(gleshim) = crate::nativelib::find_gleshim() {
+                let link = staged_bridge.join("libpengudroid_gleshim.so");
+                let _ = std::fs::remove_file(&link);
+                let _ = std::os::unix::fs::symlink(&gleshim, &link);
+            }
+            if let Some(vkshim) = crate::nativelib::find_vkshim() {
+                let link = staged_bridge.join("libpengudroid_vkshim.so");
+                let _ = std::fs::remove_file(&link);
+                let _ = std::os::unix::fs::symlink(&vkshim, &link);
+            }
+            let dst_vk = staged_bridge.join("libvulkan.so");
+            if !dst_vk.is_file() {
+                let mut vk_candidates: Vec<PathBuf> = Vec::new();
+                for anc in bridge_dir.ancestors().take(5) {
+                    vk_candidates.push(anc.join("share/pengudroid/guest-arm64/native/lib64/libvulkan.so"));
+                    vk_candidates.push(anc.join("guest-arm64/native/lib64/libvulkan.so"));
+                }
+                if let Some(ref gr) = guest_root {
+                    vk_candidates.push(gr.join("native/lib64/libvulkan.so"));
+                }
+                if let Some(guest_vk) = vk_candidates.into_iter().find(|p| p.is_file()) {
+                    if let Ok(raw) = std::fs::read(&guest_vk) {
+                        if let Ok(stripped) = pengudroid_elf::strip_android_versions(&raw) {
+                            let _ = std::fs::write(&dst_vk, stripped);
+                        } else {
+                            let _ = std::fs::copy(&guest_vk, &dst_vk);
+                        }
+                    }
+                }
+            }
+            lib_paths.insert(0, staged_bridge.to_string_lossy().into_owned());
             cmd.env("PENGUDROID_NATIVE_BRIDGE_LIB", &staged_bridge);
             if let Some(gr) = guest_root {
+                if std::env::var_os(pengudroid_runtime::ENV).is_none() {
+                    let manifest = gr.join("pengudroid-runtime.json");
+                    if manifest.is_file() {
+                        cmd.env(pengudroid_runtime::ENV, manifest);
+                    }
+                }
                 cmd.env("PENGUDROID_ARM64_GUEST_ROOT", gr);
             }
         }
@@ -1052,6 +1118,14 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
         }
     };
     let mut vm = pengudroid_dexvm::Vm::new();
+    unsafe {
+        type SetJavaVm = unsafe extern "C" fn(*mut std::ffi::c_void);
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, c"__pengudroid_set_java_vm".as_ptr());
+        if !sym.is_null() {
+            let f: SetJavaVm = std::mem::transmute(sym);
+            f(pengudroid_dexvm::jni_host::java_vm_ptr());
+        }
+    }
     vm.set_package_name(&info.package);
     vm.set_split_apks(split_paths);
     let lib_dir = prefix.join("lib");
@@ -1113,7 +1187,8 @@ fn run_pengu_vm(apk_path: &str, split_paths: &[String], info: &ApkInfo, prefix: 
                 std::env::set_var(
                     "LD_LIBRARY_PATH",
                     format!(
-                        "{}:{}:/system/lib64/arm64/bootstrap:/system/lib64/arm64",
+                        "{}:{}:{}:/system/lib64/arm64/bootstrap:/system/lib64/arm64",
+                        staged_bridge.display(),
                         arm64_dir.display(),
                         lib_dir.display()
                     ),

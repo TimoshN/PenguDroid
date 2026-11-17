@@ -7,7 +7,10 @@ pub mod dex;
 pub mod jni_host;
 pub mod stdlib;
 mod stdlib_fs;
+mod stdlib_json;
+mod stdlib_regex;
 mod stdlib_sync;
+mod resources;
 mod native_abi;
 mod jni_strings;
 pub mod value;
@@ -364,7 +367,7 @@ mod sdk_regressions {
         vm.load_parsed_dex(DexFile {
             strings:vec![], types:vec![name.into()], protos:vec![ProtoId{shorty:"V".into(),return_type:"V".into(),params:vec![]}], fields:vec![],
             methods:vec![MethodId{class_name:name.into(),proto_idx:0,name:"onCreate".into(),descriptor:"()V".into()}],
-            classes:vec![ClassDef{name:name.into(),access_flags:1,superclass:Some("Landroid/app/Application;".into()),interfaces:vec![],static_fields:vec![],instance_fields:vec![],direct_methods:vec![],virtual_methods:vec![EncodedMethod{method_idx:0,access_flags:0x101,code:None}]}],
+            classes:vec![ClassDef{name:name.into(),access_flags:1,superclass:Some("Landroid/app/Application;".into()),interfaces:vec![],signature:None,field_annotations:std::collections::HashMap::new(),static_fields:vec![],instance_fields:vec![],direct_methods:vec![],virtual_methods:vec![EncodedMethod{method_idx:0,access_flags:0x101,code:None}]}],
             class_by_name:std::collections::HashMap::from([(name.into(),0)]),
         }).unwrap();
         jni_host::register_native(name,"onCreate","()V",application_created as *const () as usize);

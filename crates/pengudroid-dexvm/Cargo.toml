@@ -9,3 +9,4 @@ description = "PenguDroid's independent Dalvik DEX virtual machine, JNI host, an
 
 [dependencies]
 libc = { workspace = true }
+miniz_oxide = { workspace = true }

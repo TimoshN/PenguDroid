@@ -3533,8 +3533,45 @@ pub unsafe extern "C" fn __pengudroid_publish_java_vm() -> bool {
     true
 }
 
+static PENGU_JAVA_VM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_set_java_vm(vm: *mut c_void) {
+    PENGU_JAVA_VM.store(vm as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn JNI_GetCreatedJavaVMs(
+    vm_buf: *mut *mut c_void,
+    buf_len: c_int,
+    n_vms: *mut c_int,
+) -> c_int {
+    let vm = PENGU_JAVA_VM.load(std::sync::atomic::Ordering::Acquire);
+    if vm != 0 {
+        if !vm_buf.is_null() && buf_len >= 1 {
+            *vm_buf = vm as *mut c_void;
+        }
+        if !n_vms.is_null() {
+            *n_vms = 1;
+        }
+        return 0;
+    }
+    type GetCreatedJavaVMs = unsafe extern "C" fn(*mut *mut c_void, i32, *mut i32) -> i32;
+    if let Some(get_vms) = dlsym_next::<GetCreatedJavaVMs>(b"JNI_GetCreatedJavaVMs\0") {
+        return get_vms(vm_buf, buf_len, n_vms);
+    }
+    if !n_vms.is_null() {
+        *n_vms = 0;
+    }
+    0
+}
+
 /// The process's `JavaVM`, via the JNI invocation API.
 unsafe fn created_java_vm() -> *mut c_void {
+    let vm = PENGU_JAVA_VM.load(std::sync::atomic::Ordering::Acquire);
+    if vm != 0 {
+        return vm as *mut c_void;
+    }
     type GetCreatedJavaVMs = unsafe extern "C" fn(*mut *mut c_void, i32, *mut i32) -> i32;
     let Some(get_vms) = dlsym_next::<GetCreatedJavaVMs>(b"JNI_GetCreatedJavaVMs\0") else {
         return std::ptr::null_mut();
@@ -4389,6 +4426,84 @@ pub unsafe extern "C" fn ASensorManager_createEventQueue(
     _data: *mut c_void,
 ) -> *mut c_void {
     Box::into_raw(Box::new(0usize)) as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AThermal_acquireManager() -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AThermal_releaseManager(_manager: *mut c_void) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn AThermal_getCurrentThermalStatus(_manager: *mut c_void) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AThermal_getThermalHeadroom(
+    _manager: *mut c_void,
+    _forecast_seconds: c_int,
+) -> f32 {
+    f32::NAN
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AThermal_registerThermalStatusListener(
+    _manager: *mut c_void,
+    _callback: *const c_void,
+    _data: *mut c_void,
+) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn AThermal_unregisterThermalStatusListener(
+    _manager: *mut c_void,
+    _callback: *const c_void,
+    _data: *mut c_void,
+) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn APerformanceHint_getManager() -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn APerformanceHint_createSession(
+    _manager: *mut c_void,
+    _thread_ids: *const i32,
+    _size: usize,
+    _initial_target_work_duration_nanos: i64,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn APerformanceHint_closeSession(_session: *mut c_void) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn APerformanceHint_getPreferredUpdateRateNanos(_manager: *mut c_void) -> i64 {
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn APerformanceHint_updateTargetWorkDuration(
+    _session: *mut c_void,
+    _target_duration_nanos: i64,
+) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn APerformanceHint_reportActualWorkDuration(
+    _session: *mut c_void,
+    _actual_duration_nanos: i64,
+) -> c_int {
+    0
 }
 
 #[no_mangle]

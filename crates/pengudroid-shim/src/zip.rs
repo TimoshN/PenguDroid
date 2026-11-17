@@ -20,6 +20,7 @@ pub struct Entry {
 
 /// A parsed ZIP archive (the file is read once, on first use).
 pub struct Archive {
+    path: String,
     data: Vec<u8>,
     entries: BTreeMap<String, Entry>,
 }
@@ -29,7 +30,23 @@ impl Archive {
     pub fn open(path: &str) -> Result<Archive, String> {
         let data = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let entries = read_central_directory(&data)?;
-        Ok(Archive { data, entries })
+        Ok(Archive { path: path.to_string(), data, entries })
+    }
+
+    /// Return `(apk_path, data_offset, size)` if `name` is stored uncompressed.
+    pub fn raw_location(&self, name: &str) -> Option<(String, u64, u64)> {
+        let entry = self.entries.get(name)?;
+        if entry.method != 0 {
+            return None;
+        }
+        let l = entry.local_offset;
+        if le_u32(&self.data, l).ok()? != 0x0403_4b50 {
+            return None;
+        }
+        let name_len = le_u16(&self.data, l + 26).ok()? as usize;
+        let extra_len = le_u16(&self.data, l + 28).ok()? as usize;
+        let start = l + 30 + name_len + extra_len;
+        Some((self.path.clone(), start as u64, entry.compressed_size as u64))
     }
 
     /// Names directly under `prefix` (one path component deep), as

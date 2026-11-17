@@ -204,6 +204,7 @@ pub fn jni_env_ptr() -> *mut c_void {
         t[4] = jni_get_version as *const () as usize;
         t[6] = jni_find_class as *const () as usize;
         t[7] = jni_from_reflected_method as *const () as usize;
+        t[8] = jni_from_reflected_field as *const () as usize;
         t[9] = jni_to_reflected_method as *const () as usize;
         t[11] = jni_is_assignable_from as *const () as usize;
         t[10] = jni_get_superclass as *const () as usize;
@@ -227,7 +228,18 @@ pub fn jni_env_ptr() -> *mut c_void {
         t[33] = jni_get_method_id as *const () as usize;
         t[94] = jni_get_field_id as *const () as usize;
         t[95] = jni_get_object_field as *const () as usize;
+        t[96] = jni_get_boolean_field as *const () as usize;
+        t[97] = jni_get_byte_field as *const () as usize;
+        t[98] = jni_get_char_field as *const () as usize;
+        t[99] = jni_get_short_field as *const () as usize;
         t[100] = jni_get_int_field as *const () as usize;
+        t[101] = jni_get_long_field as *const () as usize;
+        t[102] = jni_get_float_field as *const () as usize;
+        t[103] = jni_get_double_field as *const () as usize;
+        t[104] = jni_set_object_field as *const () as usize;
+        t[105] = jni_set_boolean_field as *const () as usize;
+        t[109] = jni_set_int_field as *const () as usize;
+        t[110] = jni_set_long_field as *const () as usize;
         t[113] = jni_get_static_method_id as *const () as usize;
         t[144] = jni_get_static_field_id as *const () as usize;
         t[145] = jni_get_static_object_field as *const () as usize;
@@ -252,13 +264,20 @@ pub fn jni_env_ptr() -> *mut c_void {
         t[176] = jni_new_byte_array as *const () as usize;
         t[179] = jni_new_int_array as *const () as usize;
         t[184] = jni_get_byte_array_elements as *const () as usize;
+        t[187] = jni_get_int_array_elements as *const () as usize;
         t[192] = jni_release_byte_array_elements as *const () as usize;
+        t[195] = jni_release_int_array_elements as *const () as usize;
         t[215] = jni_register_natives as *const () as usize;
         t[216] = jni_unregister_natives as *const () as usize;
         t[217] = jni_monitor_enter as *const () as usize;
         t[218] = jni_monitor_exit as *const () as usize;
         t[219] = jni_get_java_vm as *const () as usize;
+        t[226] = jni_new_global_ref as *const () as usize;
+        t[227] = jni_delete_global_ref as *const () as usize;
         t[228] = jni_exception_check as *const () as usize;
+        t[229] = jni_new_direct_byte_buffer as *const () as usize;
+        t[230] = jni_get_direct_buffer_address as *const () as usize;
+        t[231] = jni_get_direct_buffer_capacity as *const () as usize;
         unsafe extern "C" { fn pengu_install_jni_calls(table: *mut usize); }
         unsafe { pengu_install_jni_calls(t.as_mut_ptr()); }
         let _ = WIRED_JNI_SLOTS.set((4..t.len()).filter(|&i| t[i] != placeholders[i]).collect());
@@ -290,7 +309,7 @@ unsafe extern "C" fn vm_attach(_vm: *mut c_void, p_env: *mut *mut c_void, _args:
 
 unsafe extern "C" fn vm_detach(_vm: *mut c_void) -> c_int {
     if !crate::threads::detach_native_thread() { return JNI_ERR; }
-    JNI_ATTACHED.with(|attached| attached.set(false));
+    let _ = JNI_ATTACHED.try_with(|attached| attached.set(false));
     JNI_OK
 }
 
@@ -298,7 +317,7 @@ unsafe extern "C" fn vm_get_env(_vm: *mut c_void, p_env: *mut *mut c_void, versi
     if p_env.is_null() { return JNI_ERR; }
     *p_env = std::ptr::null_mut();
     if !matches!(version, 0x00010001 | 0x00010002 | 0x00010004 | JNI_VERSION_1_6) { return -3; }
-    if !JNI_ATTACHED.with(|attached| attached.get()) { return -2; }
+    if !JNI_ATTACHED.try_with(|attached| attached.get()).unwrap_or(false) { return -2; }
     crate::threads::attach_native_thread();
     if !p_env.is_null() {
         *p_env = jni_env_ptr();
@@ -387,6 +406,80 @@ unsafe extern "C" fn jni_exception_describe(_env: *mut c_void) {
     }
 }
 unsafe extern "C" fn jni_exception_clear(_env: *mut c_void) { take_pending_exception(); }
+static DIRECT_BUFFERS: OnceLock<Mutex<HashMap<ObjId, Box<[u8]>>>> = OnceLock::new();
+
+fn direct_buffers() -> &'static Mutex<HashMap<ObjId, Box<[u8]>>> {
+    DIRECT_BUFFERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn alloc_direct_buffer(id: ObjId, cap: usize) {
+    let buf = vec![0u8; cap].into_boxed_slice();
+    direct_buffers().lock().unwrap().insert(id, buf);
+}
+
+pub(crate) fn direct_buffer_slice_mut<F, R>(id: ObjId, f: F) -> Option<R>
+where
+    F: FnOnce(&mut [u8]) -> R,
+{
+    let mut map = direct_buffers().lock().unwrap();
+    map.get_mut(&id).map(|b| f(b))
+}
+
+unsafe extern "C" fn jni_new_direct_byte_buffer(
+    _env: *mut c_void,
+    address: *mut c_void,
+    capacity: i64,
+) -> *mut c_void {
+    if address.is_null() || capacity < 0 {
+        return std::ptr::null_mut();
+    }
+    let mut st = jni_state().lock().unwrap();
+    let id = st.heap.new_instance("Ljava/nio/ByteBuffer;");
+    if let Some(HeapObject::Instance { fields, .. }) = st.heap.get_mut(id) {
+        fields.insert("capacity".into(), Value::Int(capacity as i32));
+        fields.insert("limit".into(), Value::Int(capacity as i32));
+        fields.insert("position".into(), Value::Int(0));
+        fields.insert("ext_addr".into(), Value::Long(address as usize as i64));
+    }
+    id as *mut c_void
+}
+
+unsafe extern "C" fn jni_get_direct_buffer_address(_env: *mut c_void, buf: *mut c_void) -> *mut c_void {
+    if buf.is_null() {
+        return std::ptr::null_mut();
+    }
+    let id = buf as ObjId;
+    if let Some(b) = direct_buffers().lock().unwrap().get_mut(&id) {
+        return b.as_mut_ptr() as *mut c_void;
+    }
+    let st = jni_state().lock().unwrap();
+    if let Some(HeapObject::Instance { fields, .. }) = st.heap.get(id) {
+        if let Some(Ok(addr)) = fields.get("ext_addr").map(|v| v.as_long()) {
+            return addr as usize as *mut c_void;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn jni_get_direct_buffer_capacity(_env: *mut c_void, buf: *mut c_void) -> i64 {
+    if buf.is_null() {
+        return -1;
+    }
+    let id = buf as ObjId;
+    if let Some(b) = direct_buffers().lock().unwrap().get(&id) {
+        return b.len() as i64;
+    }
+    let st = jni_state().lock().unwrap();
+    match st.heap.get(id) {
+        Some(HeapObject::Instance { fields, .. }) => fields
+            .get("capacity")
+            .and_then(|v| v.as_int().ok())
+            .map(|c| c as i64)
+            .unwrap_or(-1),
+        _ => -1,
+    }
+}
+
 unsafe extern "C" fn jni_exception_check(_env: *mut c_void) -> u8 {
     PENDING_JNI_EXCEPTION.with(|slot| slot.get().is_some() as u8)
 }
@@ -412,16 +505,16 @@ std::thread_local! {
     static VM_INVOKER: std::cell::Cell<Option<(usize, VmInvokeFn)>> = const { std::cell::Cell::new(None) };
 }
 
-pub(crate) fn has_vm_invoker() -> bool { VM_INVOKER.with(|slot| slot.get().is_some()) }
-pub(crate) fn clear_vm_invoker() { VM_INVOKER.with(|slot| slot.set(None)); }
+pub(crate) fn has_vm_invoker() -> bool { VM_INVOKER.try_with(|slot| slot.get().is_some()).unwrap_or(false) }
+pub(crate) fn clear_vm_invoker() { let _ = VM_INVOKER.try_with(|slot| slot.set(None)); }
 
 pub fn set_vm_invoker(ctx: usize, f: VmInvokeFn) {
-    VM_INVOKER.with(|c| c.set(Some((ctx, f))));
+    let _ = VM_INVOKER.try_with(|c| c.set(Some((ctx, f))));
 }
 
 pub struct VmInvokerGuard(Option<(usize, VmInvokeFn)>);
 impl Drop for VmInvokerGuard {
-    fn drop(&mut self) { VM_INVOKER.with(|slot| slot.set(self.0)); }
+    fn drop(&mut self) { let _ = VM_INVOKER.try_with(|slot| slot.set(self.0)); }
 }
 pub fn scoped_vm_invoker(ctx: usize, callback: VmInvokeFn) -> VmInvokerGuard {
     VmInvokerGuard(VM_INVOKER.with(|slot| slot.replace(Some((ctx, callback)))))
@@ -576,6 +669,42 @@ unsafe extern "C" fn jni_get_object_field(
     res
 }
 
+unsafe extern "C" fn jni_set_object_field(_env: *mut c_void, obj: *mut c_void, fid: *mut c_void, val: *mut c_void) {
+    if obj.is_null() { return; }
+    let mut st = jni_state().lock().unwrap();
+    let Some((_, fname, _)) = st.field_ids.get(fid as usize).cloned() else { return; };
+    if let Some(HeapObject::Instance { fields, .. }) = st.heap.get_mut(obj as ObjId) {
+        fields.insert(fname, Value::Ref((!val.is_null()).then_some(val as ObjId)));
+    }
+}
+
+unsafe extern "C" fn jni_set_boolean_field(_env: *mut c_void, obj: *mut c_void, fid: *mut c_void, val: u8) {
+    if obj.is_null() { return; }
+    let mut st = jni_state().lock().unwrap();
+    let Some((_, fname, _)) = st.field_ids.get(fid as usize).cloned() else { return; };
+    if let Some(HeapObject::Instance { fields, .. }) = st.heap.get_mut(obj as ObjId) {
+        fields.insert(fname, Value::Int((val != 0) as i32));
+    }
+}
+
+unsafe extern "C" fn jni_set_int_field(_env: *mut c_void, obj: *mut c_void, fid: *mut c_void, val: c_int) {
+    if obj.is_null() { return; }
+    let mut st = jni_state().lock().unwrap();
+    let Some((_, fname, _)) = st.field_ids.get(fid as usize).cloned() else { return; };
+    if let Some(HeapObject::Instance { fields, .. }) = st.heap.get_mut(obj as ObjId) {
+        fields.insert(fname, Value::Int(val));
+    }
+}
+
+unsafe extern "C" fn jni_set_long_field(_env: *mut c_void, obj: *mut c_void, fid: *mut c_void, val: i64) {
+    if obj.is_null() { return; }
+    let mut st = jni_state().lock().unwrap();
+    let Some((_, fname, _)) = st.field_ids.get(fid as usize).cloned() else { return; };
+    if let Some(HeapObject::Instance { fields, .. }) = st.heap.get_mut(obj as ObjId) {
+        fields.insert(fname, Value::Long(val));
+    }
+}
+
 unsafe extern "C" fn jni_get_int_field(
     _env: *mut c_void,
     obj: *mut c_void,
@@ -601,24 +730,92 @@ unsafe extern "C" fn jni_get_int_field(
     res
 }
 
+unsafe extern "C" fn jni_get_boolean_field(env: *mut c_void, obj: *mut c_void, fid: *mut c_void) -> u8 {
+    (jni_get_int_field(env, obj, fid) != 0) as u8
+}
+unsafe extern "C" fn jni_get_byte_field(env: *mut c_void, obj: *mut c_void, fid: *mut c_void) -> i8 {
+    jni_get_int_field(env, obj, fid) as i8
+}
+unsafe extern "C" fn jni_get_char_field(env: *mut c_void, obj: *mut c_void, fid: *mut c_void) -> u16 {
+    jni_get_int_field(env, obj, fid) as u16
+}
+unsafe extern "C" fn jni_get_short_field(env: *mut c_void, obj: *mut c_void, fid: *mut c_void) -> i16 {
+    jni_get_int_field(env, obj, fid) as i16
+}
+unsafe extern "C" fn jni_get_long_field(_env: *mut c_void, obj: *mut c_void, fid: *mut c_void) -> i64 {
+    if obj.is_null() { return 0; }
+    let st = jni_state().lock().unwrap();
+    let Some((_, fname, _)) = st.field_ids.get(fid as usize) else { return 0; };
+    match st.heap.get(obj as ObjId) {
+        Some(HeapObject::Instance { fields, .. }) => fields.get(fname).and_then(|v| v.as_long().ok()).unwrap_or(0),
+        _ => 0,
+    }
+}
+unsafe extern "C" fn jni_get_float_field(_env: *mut c_void, obj: *mut c_void, fid: *mut c_void) -> f32 {
+    if obj.is_null() { return 0.0; }
+    let st = jni_state().lock().unwrap();
+    let Some((_, fname, _)) = st.field_ids.get(fid as usize) else { return 0.0; };
+    match st.heap.get(obj as ObjId) {
+        Some(HeapObject::Instance { fields, .. }) => match fields.get(fname) {
+            Some(Value::Float(f)) => *f,
+            _ => 0.0,
+        },
+        _ => 0.0,
+    }
+}
+unsafe extern "C" fn jni_get_double_field(_env: *mut c_void, obj: *mut c_void, fid: *mut c_void) -> f64 {
+    if obj.is_null() { return 0.0; }
+    let st = jni_state().lock().unwrap();
+    let Some((_, fname, _)) = st.field_ids.get(fid as usize) else { return 0.0; };
+    match st.heap.get(obj as ObjId) {
+        Some(HeapObject::Instance { fields, .. }) => match fields.get(fname) {
+            Some(Value::Double(d)) => *d,
+            _ => 0.0,
+        },
+        _ => 0.0,
+    }
+}
+
+static GLOBAL_STATICS: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
+
+fn global_statics() -> &'static Mutex<HashMap<String, Value>> {
+    GLOBAL_STATICS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn set_static_field(key: &str, value: Value) {
+    global_statics().lock().unwrap().insert(key.to_string(), value);
+}
+
 unsafe extern "C" fn jni_get_static_object_field(
     _env: *mut c_void,
     _cls: *mut c_void,
     fid: *mut c_void,
 ) -> *mut c_void {
-    let mut st = jni_state().lock().unwrap();
-    let Some((cname, fname, _fsig)) = st.field_ids.get(fid as usize).cloned() else {
-        return std::ptr::null_mut();
+    let (cname, fname) = {
+        let st = jni_state().lock().unwrap();
+        let Some((cname, fname, _fsig)) = st.field_ids.get(fid as usize) else {
+            return std::ptr::null_mut();
+        };
+        (cname.clone(), fname.clone())
     };
     if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
         eprintln!("[pengu-jni] GetStaticObjectField {cname}.{fname}");
     }
+    let key = format!("{cname}.{fname}");
+    if let Some(val) = global_statics().lock().unwrap().get(&key).cloned() {
+        return val.as_ref().map_or(std::ptr::null_mut(), |id| id as *mut c_void);
+    }
+    if cname == "Lcom/unity3d/player/UnityPlayer;" && fname == "currentActivity" {
+        if let Some(val) = global_statics().lock().unwrap().get("PENGUDROID_ACTIVITY").cloned() {
+            return val.as_ref().map_or(std::ptr::null_mut(), |id| id as *mut c_void);
+        }
+    }
+    let mut st = jni_state().lock().unwrap();
     match (cname.as_str(), fname.as_str()) {
-        ("Landroid/os/Build;", "MODEL") => st.heap.new_string("PenguDroid".into()) as *mut c_void,
-        ("Landroid/os/Build;", "MANUFACTURER" | "BRAND") => {
+        ("Landroid/os/Build;", "MODEL" | "MANUFACTURER" | "BRAND" | "DEVICE" | "PRODUCT" | "HARDWARE" | "BOARD" | "ID" | "FINGERPRINT") => {
             st.heap.new_string("PenguDroid".into()) as *mut c_void
         }
-        ("Landroid/os/Build$VERSION;", "RELEASE") => {
+        ("Landroid/os/Build$VERSION;", "RELEASE" | "INCREMENTAL") => {
             st.heap.new_string("15".into()) as *mut c_void
         }
         ("Landroid/content/Context;", "WINDOW_SERVICE") => {
@@ -639,12 +836,21 @@ unsafe extern "C" fn jni_get_static_int_field(
     _cls: *mut c_void,
     fid: *mut c_void,
 ) -> c_int {
-    let st = jni_state().lock().unwrap();
-    let Some((cname, fname, _fsig)) = st.field_ids.get(fid as usize) else {
-        return 0;
+    let (cname, fname) = {
+        let st = jni_state().lock().unwrap();
+        let Some((cname, fname, _fsig)) = st.field_ids.get(fid as usize) else {
+            return 0;
+        };
+        (cname.clone(), fname.clone())
     };
     if std::env::var_os("PENGUDROID_TRACE_VM").is_some() {
         eprintln!("[pengu-jni] GetStaticIntField {cname}.{fname}");
+    }
+    let key = format!("{cname}.{fname}");
+    if let Some(val) = global_statics().lock().unwrap().get(&key).cloned() {
+        if let Ok(i) = val.as_int() {
+            return i;
+        }
     }
     match (cname.as_str(), fname.as_str()) {
         ("Landroid/os/Build$VERSION;", "SDK_INT") => 37,
@@ -806,6 +1012,34 @@ unsafe extern "C" fn jni_new_byte_array(_env: *mut c_void, len: c_int) -> *mut c
         .new_array("[B", len.max(0) as usize)
         .unwrap_or(0) as *mut c_void
 }
+
+unsafe extern "C" fn jni_get_int_array_elements(
+    _env: *mut c_void,
+    arr: *mut c_void,
+    is_copy: *mut u8,
+) -> *mut c_int {
+    if !is_copy.is_null() {
+        *is_copy = 0;
+    }
+    if arr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut st = jni_state().lock().unwrap();
+    match st.heap.get_mut(arr as ObjId) {
+        Some(HeapObject::Array {
+            data: ArrayData::Int(v),
+            ..
+        }) => v.as_mut_ptr(),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn jni_release_int_array_elements(
+    _env: *mut c_void,
+    _arr: *mut c_void,
+    _elems: *mut c_int,
+    _mode: c_int,
+) {}
 
 unsafe extern "C" fn jni_get_byte_array_elements(
     _env: *mut c_void,
@@ -1047,6 +1281,12 @@ unsafe extern "C" fn jni_from_reflected_method(_env:*mut c_void,object:*mut c_vo
     let mut state=jni_state().lock().unwrap();let key=(class,name,sig);
     if let Some(&id)=state.method_index.get(&key){return id as *mut c_void}
     let id=state.method_ids.len();state.method_ids.push(key.clone());state.method_index.insert(key,id);id as *mut c_void
+}
+unsafe extern "C" fn jni_from_reflected_field(_env:*mut c_void,object:*mut c_void)->*mut c_void {
+    let Ok((class,name,sig,_))=crate::reflection::method_info(object as usize) else { return std::ptr::null_mut(); };
+    let mut state=jni_state().lock().unwrap();let key=(class,name,sig);
+    if let Some(&id)=state.field_index.get(&key){return id as *mut c_void}
+    let id=state.field_ids.len();state.field_ids.push(key.clone());state.field_index.insert(key,id);id as *mut c_void
 }
 unsafe extern "C" fn jni_to_reflected_method(_env:*mut c_void,_class:*mut c_void,id:*mut c_void,is_static:u8)->*mut c_void {
     let entry=jni_state().lock().unwrap().method_ids.get(id as usize).cloned();

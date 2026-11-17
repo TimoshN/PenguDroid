@@ -3026,6 +3026,7 @@ name = "pengudroid-dexvm"
 version = "0.3.0"
 dependencies = [
  "libc",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
