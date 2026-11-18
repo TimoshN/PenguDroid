@@ -239,6 +239,12 @@ fn find_gleshim() -> Option<PathBuf> {
             return Some(std::fs::canonicalize(&p).unwrap_or(p));
         }
     }
+    if let Some(dir) = option_env!("PENGUDROID_AURORA_LIBDIR") {
+        let candidate = PathBuf::from(dir).join("libpengudroid_gleshim.so");
+        if candidate.exists() {
+            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+        }
+    }
     let exe = std::env::current_exe().ok()?;
     let candidate = exe.parent()?.join("libpengudroid_gleshim.so");
     candidate.exists().then(|| std::fs::canonicalize(&candidate).unwrap_or(candidate))

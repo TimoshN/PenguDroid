@@ -723,6 +723,9 @@ struct Frame {
     intent_launcher: bool,
     /// This frame is `<application>`.
     is_application: bool,
+    /// This frame is `<queries>`; its provider entries declare package
+    /// visibility filters, not instantiable application components.
+    is_queries: bool,
     /// `<meta-data>` name and value, set on a `meta-data` frame.
     meta_name: Option<String>,
     meta_value: Option<MetaValue>,
@@ -793,6 +796,10 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                             info.application_class = Some(info.resolve(&n));
                         }
                     }
+                    "queries" => {
+                        frame.is_queries = true;
+                    }
+                    "provider" if stack.last().is_some_and(|parent| parent.is_queries) => {}
                     "activity" | "service" | "receiver" | "provider" => {
                         let kind = match name.as_str() {
                             "activity" => CompKind::Activity,
@@ -1301,6 +1308,22 @@ mod tests {
         b.end("application");
         b.end("manifest");
         b.finish()
+    }
+
+    #[test]
+    fn queries_provider_does_not_require_a_component_name() {
+        let mut b = Axml::new();
+        b.start("manifest", &[("package", A::Str("com.example.demo"))]);
+        b.start("queries", &[]);
+        b.start("provider", &[("authorities", A::Str("ru.pay.flip.authority"))]);
+        b.end("provider");
+        b.end("queries");
+        b.start("application", &[]);
+        b.end("application");
+        b.end("manifest");
+        let info = parse_axml(&b.finish()).expect("queries provider is valid");
+        assert_eq!(info.package, "com.example.demo");
+        assert!(info.providers.is_empty());
     }
 
     #[test]

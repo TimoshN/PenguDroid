@@ -36,7 +36,11 @@ use std::fmt;
 /// v6 adds held hardware decoding (`VideoHeld*`): frames the guest's own
 /// pipeline presents by id.
 /// v7 adds `SetPointerLock` and relative pointer input (mouse-look).
-pub const PROTO_VERSION: u16 = 7;
+/// v8 adds `SetImeState` for focus-driven system keyboard visibility.
+/// v9 adds Maliit commit/preedit text events and finish-composing.
+/// v10 adds plain-text clipboard set/get/clear through Wayland data-device.
+/// v11 adds explicit Maliit Copy/Cut/Paste actions.
+pub const PROTO_VERSION: u16 = 11;
 
 /// Marker used by the daemon's pid/heartbeat file.
 pub const PROTO_MAGIC: u32 = 0x5044_5247; // "PDRG"
@@ -112,6 +116,11 @@ pub enum MsgKind {
     SubscribeInput = 87,
     InputEvent = 88,
     SetPointerLock = 89,
+    SetImeState = 106,
+    ClipboardSet = 107,
+    ClipboardGet = 108,
+    ClipboardClear = 109,
+    ClipboardText = 110,
 
     Ack = 80,
 
@@ -180,6 +189,11 @@ impl MsgKind {
             87 => SubscribeInput,
             88 => InputEvent,
             89 => SetPointerLock,
+            106 => SetImeState,
+            107 => ClipboardSet,
+            108 => ClipboardGet,
+            109 => ClipboardClear,
+            110 => ClipboardText,
             80 => Ack,
             90 => Shutdown,
             91 => Goodbye,
@@ -239,7 +253,7 @@ pub struct ProcInfo {
 ///
 /// Coordinates are in surface pixels, with the origin at the top-left, which is
 /// what `MotionEvent` expects.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InputKind {
     PointerEnter { x: f32, y: f32 },
     PointerLeave,
@@ -253,6 +267,14 @@ pub enum InputKind {
     /// Relative pointer motion while the pointer is locked to the surface
     /// (mouse-look). There is no position: the cursor does not move.
     PointerRelative { dx: f32, dy: f32 },
+    /// Committed Maliit text for the active Android InputConnection.
+    CommitText { text: String },
+    /// Current composing text; replaces, rather than commits, the composition.
+    PreeditText { text: String },
+    /// Finish/reset composition after the input method hides or loses focus.
+    FinishComposing,
+    /// 0=copy, 1=cut, 2=paste for the focused Android editor.
+    ClipboardAction { action: u8 },
 }
 
 impl InputKind {
@@ -265,6 +287,10 @@ impl InputKind {
             InputKind::PointerAxis { .. } => 5,
             InputKind::Key { .. } => 6,
             InputKind::PointerRelative { .. } => 7,
+            InputKind::CommitText { .. } => 8,
+            InputKind::PreeditText { .. } => 9,
+            InputKind::FinishComposing => 10,
+            InputKind::ClipboardAction { .. } => 11,
         }
     }
 }
@@ -451,6 +477,12 @@ pub enum Message {
     /// locked the cursor is hidden and motion arrives as `PointerRelative`.
     /// Replied to with `Ack`, or `Error` when the compositor cannot lock.
     SetPointerLock { surface_id: u32, locked: bool },
+    /// Show/hide the host input method after Android text-focus changes.
+    SetImeState { surface_id: u32, visible: bool },
+    ClipboardSet { surface_id: u32, text: String },
+    ClipboardGet { surface_id: u32 },
+    ClipboardClear { surface_id: u32 },
+    ClipboardText { text: String },
 
     /// Generic acknowledgement for fire-and-forget requests.
     Ack,
@@ -533,6 +565,11 @@ impl Message {
             SubscribeInput { .. } => MsgKind::SubscribeInput,
             InputEvent { .. } => MsgKind::InputEvent,
             SetPointerLock { .. } => MsgKind::SetPointerLock,
+            SetImeState { .. } => MsgKind::SetImeState,
+            ClipboardSet { .. } => MsgKind::ClipboardSet,
+            ClipboardGet { .. } => MsgKind::ClipboardGet,
+            ClipboardClear { .. } => MsgKind::ClipboardClear,
+            ClipboardText { .. } => MsgKind::ClipboardText,
             Ack => MsgKind::Ack,
             Shutdown => MsgKind::Shutdown,
             Goodbye => MsgKind::Goodbye,
@@ -759,6 +796,10 @@ impl Message {
             }
             SubscribeInput { surface_id } => e.u32(*surface_id),
             SetPointerLock { surface_id, locked } => { e.u32(*surface_id); e.u8(u8::from(*locked)); }
+            SetImeState { surface_id, visible } => { e.u32(*surface_id); e.u8(u8::from(*visible)); }
+            ClipboardSet { surface_id, text } => { e.u32(*surface_id); e.str(text); }
+            ClipboardGet { surface_id } | ClipboardClear { surface_id } => e.u32(*surface_id),
+            ClipboardText { text } => e.str(text),
             InputEvent { surface_id, event } => {
                 e.u32(*surface_id);
                 e.u8(event.tag());
@@ -785,6 +826,9 @@ impl Message {
                         e.f32(*dx);
                         e.f32(*dy);
                     }
+                    InputKind::CommitText { text } | InputKind::PreeditText { text } => e.str(text),
+                    InputKind::FinishComposing => {}
+                    InputKind::ClipboardAction { action } => e.u8(*action),
                 }
             }
         }
@@ -968,6 +1012,11 @@ impl Message {
             K::AudioWrite => AudioWrite { offset: d.u32()?, len: d.u32()? },
             K::SubscribeInput => SubscribeInput { surface_id: d.u32()? },
             K::SetPointerLock => SetPointerLock { surface_id: d.u32()?, locked: d.u8()? != 0 },
+            K::SetImeState => SetImeState { surface_id: d.u32()?, visible: d.u8()? != 0 },
+            K::ClipboardSet => ClipboardSet { surface_id: d.u32()?, text: d.str()? },
+            K::ClipboardGet => ClipboardGet { surface_id: d.u32()? },
+            K::ClipboardClear => ClipboardClear { surface_id: d.u32()? },
+            K::ClipboardText => ClipboardText { text: d.str()? },
             K::InputEvent => {
                 let surface_id = d.u32()?;
                 let event = match d.u8()? {
@@ -978,6 +1027,10 @@ impl Message {
                     5 => InputKind::PointerAxis { axis: d.u8()?, value: d.f32()? },
                     6 => InputKind::Key { keycode: d.u32()?, pressed: d.u8()? != 0 },
                     7 => InputKind::PointerRelative { dx: d.f32()?, dy: d.f32()? },
+                    8 => InputKind::CommitText { text: d.str()? },
+                    9 => InputKind::PreeditText { text: d.str()? },
+                    10 => InputKind::FinishComposing,
+                    11 => InputKind::ClipboardAction { action: d.u8()? },
                     other => return Err(ProtoError::BadKind(other)),
                 };
                 InputEvent { surface_id, event }
@@ -1123,10 +1176,21 @@ pub mod abi {
     pub const WL_DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
     /// The Android `HAL_PIXEL_FORMAT_RGBA_8888` value.
     pub const ANDROID_RGBA_8888: u32 = 1;
+    /// PresentShm carries a linear native/gralloc fd, not a CPU memfd image.
+    pub const NATIVE_FD_FLAG: u32 = 0x8000_0000;
 
-    /// Android 17 (API 37) x86_64 — the only supported runtime platform.
+    /// Android 17 (API 37) runtime identity.
     pub const ANDROID_API_LEVEL: i32 = 37;
     pub const ANDROID_RELEASE: &str = "17";
+
+    #[cfg(target_arch = "x86_64")]
+    pub const HOST_RUNTIME_ARCH: &str = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    pub const HOST_RUNTIME_ARCH: &str = "arm64";
+    #[cfg(target_arch = "x86_64")]
+    pub const HOST_CPU_ABI: &str = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    pub const HOST_CPU_ABI: &str = "arm64-v8a";
 
     /// Guard generic overrides against changing an already validated platform
     /// identity. `current` must come from the raw property store, not its
@@ -1146,7 +1210,7 @@ pub mod abi {
             || pengudroid_device::is_protected_profile_key(base);
         if protected && current != Some(value) {
             return Err(format!(
-                "immutable Android {ANDROID_RELEASE} / API {ANDROID_API_LEVEL} x86_64 platform property {name}: current {current:?}, requested {value:?}"
+                "immutable Android {ANDROID_RELEASE} / API {ANDROID_API_LEVEL} {HOST_RUNTIME_ARCH} platform property {name}: current {current:?}, requested {value:?}"
             ));
         }
         Ok(())
@@ -1225,6 +1289,17 @@ mod tests {
         assert_eq!(len, frame.len() - 4, "length prefix must match body");
         let decoded = Message::from_body(&frame[4..]).unwrap();
         assert_eq!(m, decoded);
+    }
+
+    #[test]
+    fn maliit_text_events_roundtrip_without_pointer_packing() {
+        for event in [
+            InputKind::CommitText { text: "123".into() },
+            InputKind::PreeditText { text: " composing ".into() },
+            InputKind::FinishComposing,
+        ] {
+            roundtrip(Message::InputEvent { surface_id: 7, event });
+        }
     }
 
     #[test]

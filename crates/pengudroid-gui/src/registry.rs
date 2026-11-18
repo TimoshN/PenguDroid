@@ -318,8 +318,15 @@ fn describe(apk: &Path) -> Result<(String, String, Option<String>), String> {
     }
 }
 
-/// The `pengudroid` binary: next to this executable, or on `PATH`.
+/// The `pengudroid` binary: explicit override, an installed Aurora location,
+/// next to this executable, or on `PATH`.
 pub fn pengudroid_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("PENGUDROID_CLI").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = option_env!("PENGUDROID_AURORA_CLI") {
+        return PathBuf::from(path);
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let sibling = dir.join("pengudroid");

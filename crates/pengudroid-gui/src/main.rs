@@ -2,6 +2,7 @@
 //! blocking installation and shutdown work stays off Slint's event loop.
 mod registry;
 mod runner;
+mod dispatch;
 
 use registry::Registry;
 use slint::{ModelRc, VecModel};
@@ -60,6 +61,11 @@ fn prepare_runtime(ui: &MainWindow, state: Shared) {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    dispatch::run();
+    gui_main()
+}
+
+fn gui_main() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let (sender, events) = std::sync::mpsc::channel();
     let state = Rc::new(RefCell::new(State {

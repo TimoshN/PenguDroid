@@ -7,7 +7,7 @@
 //! numbers. [`JniEnv::version`] is used as a self-check: slot 4 must return
 //! `JNI_VERSION_1_6`, which catches an off-by-one base.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 
 /// JNI object references are opaque pointers.
 pub type JObject = *mut c_void;
@@ -187,7 +187,7 @@ impl JniEnv {
     /// `FindClass(name)`.
     pub fn find_class(&self, name: &str) -> Option<JClass> {
         let cname = std::ffi::CString::new(name).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, *const i8) -> JClass =
+        let f: unsafe extern "C" fn(*mut c_void, *const c_char) -> JClass =
             unsafe { self.func(slot::FIND_CLASS) };
         let c = unsafe { f(self.0, cname.as_ptr()) };
         if c.is_null() {
@@ -200,7 +200,7 @@ impl JniEnv {
     /// `FindClass(name)`, clearing any pending exception quietly without printing a stack trace.
     pub fn find_class_quiet(&self, name: &str) -> Option<JClass> {
         let cname = std::ffi::CString::new(name).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, *const i8) -> JClass =
+        let f: unsafe extern "C" fn(*mut c_void, *const c_char) -> JClass =
             unsafe { self.func(slot::FIND_CLASS) };
         let c = unsafe { f(self.0, cname.as_ptr()) };
         if c.is_null() {
@@ -248,7 +248,7 @@ impl JniEnv {
     pub fn static_method_id(&self, class: JClass, name: &str, sig: &str) -> Option<JMethodId> {
         let cname = std::ffi::CString::new(name).ok()?;
         let csig = std::ffi::CString::new(sig).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JMethodId =
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const c_char, *const c_char) -> JMethodId =
             unsafe { self.func(slot::GET_STATIC_METHOD_ID) };
         let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if m.is_null() {
@@ -262,7 +262,7 @@ impl JniEnv {
     pub fn static_method_id_quiet(&self, class: JClass, name: &str, sig: &str) -> Option<JMethodId> {
         let cname = std::ffi::CString::new(name).ok()?;
         let csig = std::ffi::CString::new(sig).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JMethodId =
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const c_char, *const c_char) -> JMethodId =
             unsafe { self.func(slot::GET_STATIC_METHOD_ID) };
         let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if m.is_null() {
@@ -276,7 +276,7 @@ impl JniEnv {
     pub fn static_field_id(&self, class: JClass, name: &str, sig: &str) -> Option<JFieldId> {
         let cname = std::ffi::CString::new(name).ok()?;
         let csig = std::ffi::CString::new(sig).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JFieldId =
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const c_char, *const c_char) -> JFieldId =
             unsafe { self.func(slot::GET_STATIC_FIELD_ID) };
         let id = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if id.is_null() {
@@ -293,7 +293,7 @@ impl JniEnv {
     pub fn try_static_field_id(&self, class: JClass, name: &str, sig: &str) -> Option<JFieldId> {
         let cname = std::ffi::CString::new(name).ok()?;
         let csig = std::ffi::CString::new(sig).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JFieldId =
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const c_char, *const c_char) -> JFieldId =
             unsafe { self.func(slot::GET_STATIC_FIELD_ID) };
         let id = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if id.is_null() {
@@ -315,7 +315,7 @@ impl JniEnv {
     /// `NewStringUTF(bytes)`.
     pub fn new_string(&self, s: &str) -> JObject {
         let c = std::ffi::CString::new(s).unwrap_or_default();
-        let f: unsafe extern "C" fn(*mut c_void, *const i8) -> JObject =
+        let f: unsafe extern "C" fn(*mut c_void, *const c_char) -> JObject =
             unsafe { self.func(slot::NEW_STRING_UTF) };
         unsafe { f(self.0, c.as_ptr()) }
     }
@@ -324,7 +324,7 @@ impl JniEnv {
     pub fn method_id(&self, class: JClass, name: &str, sig: &str) -> Option<JMethodId> {
         let cname = std::ffi::CString::new(name).ok()?;
         let csig = std::ffi::CString::new(sig).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JMethodId =
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const c_char, *const c_char) -> JMethodId =
             unsafe { self.func(slot::GET_METHOD_ID) };
         let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if m.is_null() {
@@ -338,7 +338,7 @@ impl JniEnv {
     pub fn method_id_quiet(&self, class: JClass, name: &str, sig: &str) -> Option<JMethodId> {
         let cname = std::ffi::CString::new(name).ok()?;
         let csig = std::ffi::CString::new(sig).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JMethodId =
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const c_char, *const c_char) -> JMethodId =
             unsafe { self.func(slot::GET_METHOD_ID) };
         let m = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if m.is_null() {
@@ -368,7 +368,7 @@ impl JniEnv {
     pub fn field_id(&self, class: JClass, name: &str, sig: &str) -> Option<JFieldId> {
         let cname = std::ffi::CString::new(name).ok()?;
         let csig = std::ffi::CString::new(sig).ok()?;
-        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JFieldId =
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const c_char, *const c_char) -> JFieldId =
             unsafe { self.func(slot::GET_FIELD_ID) };
         let id = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
         if id.is_null() {
@@ -643,9 +643,9 @@ impl JniEnv {
         if s.is_null() {
             return None;
         }
-        let get: unsafe extern "C" fn(*mut c_void, JObject, *mut u8) -> *const i8 =
+        let get: unsafe extern "C" fn(*mut c_void, JObject, *mut u8) -> *const c_char =
             unsafe { self.func(slot::GET_STRING_UTF_CHARS) };
-        let release: unsafe extern "C" fn(*mut c_void, JObject, *const i8) =
+        let release: unsafe extern "C" fn(*mut c_void, JObject, *const c_char) =
             unsafe { self.func(slot::RELEASE_STRING_UTF_CHARS) };
         unsafe {
             let p = get(self.0, s, std::ptr::null_mut());

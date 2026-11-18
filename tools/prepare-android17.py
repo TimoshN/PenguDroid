@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the pinned API-37 x86_64 runtime without mounts or root privileges.
+"""Prepare a pinned API-37 x86_64 or ARM64 runtime without mounts or root.
 
 The GSI is an acquisition archive, never a mounted/booted runtime dependency.
 Only extracted files survive preparation. Review Google's GSI license before
@@ -7,9 +7,10 @@ obtaining the archive; do not redistribute its binaries with this project.
 
     python3 -B tools/prepare-android17.py --archive /path/to/aosp_x86_64-....zip
     python3 -B tools/prepare-android17.py --download --cache
+    python3 -B tools/prepare-android17.py --arch arm64 --download --cache
 
 `--cache` installs into the per-user runtime cache
-(`$XDG_CACHE_HOME/pengudroid/runtime/android17-x86_64`, else
+(`$XDG_CACHE_HOME/pengudroid/runtime/android17-<arch>`, else
 `~/.cache/pengudroid/...`) and points `--archive` at the matching download
 directory, so no path has to be repeated on later runs. `--download` fetches
 the pinned archive when it is absent, verifying SHA-256 before preparation.
@@ -38,8 +39,15 @@ REPO = Path(__file__).resolve().parent.parent
 FILENAME = "aosp_x86_64-exp-CP2A.260605.012-15430684-3da2ca55.zip"
 URL = "https://dl.google.com/developers/android/cinnamonbun/images/gsi/" + FILENAME
 SHA256 = "3da2ca5599d304c4d92fe8c72f31d035a59db57c93ce073740ed4015ee034a8e"
+ARM64_FILENAME = "aosp_arm64-exp-CP2A.260605.012-15430684-8e545e1e.zip"
+ARM64_SHA256 = "8e545e1e1e977c3b43b4e54a3af463f3e7d1c3177b120e772138334e15f48f75"
 BUILD = "CP2A.260605.012"
 OWNER = "PenguDroid API-37 runtime preparation"
+DEFAULT_ARCH = "x86_64"
+ARCHITECTURES = {
+    "x86_64": {"boot": "x86_64", "machine": 62, "manifest": "x86_64", "label": "x86_64"},
+    "arm64": {"boot": "arm64", "machine": 183, "manifest": "aarch64", "label": "ARM64"},
+}
 MANIFEST = "pengudroid-runtime.json"
 SPARSE_MAGIC = 0xED26FF3A
 MAX_IMAGE = 16 * 1024**3
@@ -71,13 +79,39 @@ REQUIRED = (
 )
 
 
+def architecture(arch=DEFAULT_ARCH):
+    try:
+        return ARCHITECTURES[arch]
+    except KeyError as error:
+        raise PreparationError(f"unsupported runtime architecture: {arch}") from error
+
+
+def archive_source(arch=DEFAULT_ARCH):
+    """Pinned archive identity for one runtime architecture."""
+    if arch == DEFAULT_ARCH:
+        return FILENAME, URL, SHA256
+    architecture(arch)
+    return ARM64_FILENAME, "https://dl.google.com/developers/android/cinnamonbun/images/gsi/" + ARM64_FILENAME, ARM64_SHA256
+
+
+def required(arch=DEFAULT_ARCH):
+    boot = architecture(arch)["boot"]
+    return tuple(path.replace("framework/x86_64/", f"framework/{boot}/") for path in REQUIRED)
+
+
 class PreparationError(RuntimeError):
     pass
 
 
 def digest(path):
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        if hasattr(hashlib, "file_digest"):
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+        # Python 3.10 compatibility for Aurora/Linux build hosts.
+        checksum = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(BUFFER), b""):
+            checksum.update(chunk)
+        return checksum.hexdigest()
 
 
 def cache_home(env=None):
@@ -92,10 +126,11 @@ def cache_home(env=None):
     return Path(home) / ".cache" / "pengudroid"
 
 
-def cache_paths(env=None):
+def cache_paths(env=None, arch=DEFAULT_ARCH):
     """(download archive, runtime output) inside the per-user cache."""
+    filename, _, _ = archive_source(arch)
     base = cache_home(env)
-    return base / "downloads" / FILENAME, base / "runtime" / "android17-x86_64"
+    return base / "downloads" / filename, base / "runtime" / f"android17-{arch}"
 
 
 def download(archive, url=URL, expected=SHA256, stream=None, opener=None):
@@ -230,10 +265,11 @@ def filesystem(image):
     raise PreparationError("image is neither EROFS nor ext4")
 
 
-def image_from_archive(archive, work):
-    if digest(archive) != SHA256:
-        raise PreparationError(f"GSI SHA-256 mismatch: expected {SHA256}; nothing extracted")
-    print(f"verified {archive.name}: {SHA256}", flush=True)
+def image_from_archive(archive, work, arch=DEFAULT_ARCH):
+    _, _, expected_sha256 = archive_source(arch)
+    if digest(archive) != expected_sha256:
+        raise PreparationError(f"GSI SHA-256 mismatch: expected {expected_sha256}; nothing extracted")
+    print(f"verified {archive.name}: {expected_sha256}", flush=True)
     with zipfile.ZipFile(archive) as container:
         # Never extractall: only this exact member is read, ignoring ZIP paths.
         members = [entry for entry in container.infolist() if entry.filename == "system.img"]
@@ -263,8 +299,10 @@ def tool(name, explicit=None):
     raise PreparationError(f"missing {name}; supply --{name.replace('.', '-')} or install it locally")
 
 
-def validate_runtime(root):
-    for relative in REQUIRED:
+def validate_runtime(root, arch=DEFAULT_ARCH):
+    config = architecture(arch)
+    required_files = required(arch)
+    for relative in required_files:
         path = root / relative
         if not path.is_file() or not path.stat().st_size:
             raise PreparationError(f"incomplete API-37 runtime: {relative}")
@@ -285,13 +323,15 @@ def validate_runtime(root):
             raise PreparationError(f"{key}: expected {expected}, found {props.get(key)!r}; no runtime fallback")
     with (root / "system/apex/com.android.art/lib64/libart.so").open("rb") as stream:
         header = exact(stream, 20)
-    if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 62:
-        raise PreparationError("ART must be a little-endian ELF64 x86_64 library")
-    return {relative: digest(root / relative) for relative in REQUIRED}
+    if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != config["machine"]:
+        raise PreparationError(f"ART must be a little-endian ELF64 {config['label']} library")
+    return {relative: digest(root / relative) for relative in required_files}
 
 
 
-def prepare(archive, output, erofs=None, debugfs=None):
+def prepare(archive, output, erofs=None, debugfs=None, arch=DEFAULT_ARCH):
+    config = architecture(arch)
+    _, archive_url, expected_sha256 = archive_source(arch)
     if output.is_symlink():
         raise PreparationError(f"refusing output symlink: {output}")
     if output.exists():
@@ -299,22 +339,23 @@ def prepare(archive, output, erofs=None, debugfs=None):
         if not manifest.is_file():
             raise PreparationError(f"refusing existing unowned directory: {output}")
         record = json.loads(manifest.read_text())
-        if record.get("tool") != OWNER or record.get("archive_sha256") != SHA256:
-            raise PreparationError("existing runtime was prepared from a different source")
-        hashes = validate_runtime(output)
+        if (record.get("tool") != OWNER or record.get("archive_sha256") != expected_sha256
+                or record.get("architecture", DEFAULT_ARCH) != config["manifest"]):
+            raise PreparationError("existing runtime was prepared from a different source or architecture")
+        hashes = validate_runtime(output, arch)
         if record.get("files") != hashes:
             raise PreparationError("prepared runtime files changed; not overwriting them")
-        print(f"API-37 x86_64 runtime already verified: {output}", flush=True)
+        print(f"API-37 {config['label']} runtime already verified: {output}", flush=True)
         return
     if not archive.is_file():
-        raise PreparationError(f"missing archive: {archive}\nOfficial source: {URL}\nExpected SHA-256: {SHA256}")
+        raise PreparationError(f"missing archive: {archive}\nOfficial source: {archive_url}\nExpected SHA-256: {expected_sha256}")
     erofs = tool("fsck.erofs", erofs)
     debugfs = tool("debugfs", debugfs)
     if shutil.disk_usage(output.parent).free < 12 * 1024**3:
         raise PreparationError("runtime preparation requires at least 12 GiB free disk space")
     with tempfile.TemporaryDirectory(prefix=".prepare-api37-", dir=output.parent) as temporary:
         work = Path(temporary)
-        image = image_from_archive(archive, work)
+        image = image_from_archive(archive, work, arch)
         root = work / "root"
         root.mkdir()
         kind = filesystem(image)
@@ -338,23 +379,27 @@ def prepare(archive, output, erofs=None, debugfs=None):
         subprocess.run([sys.executable, "-B", str(REPO / "tools/art/unpack-apex.py"), str(root), "--erofs", erofs],
                        check=True, env=env, timeout=300)
         subprocess.run([sys.executable, "-B", str(REPO / "tools/art/sysroot-relink.py"), str(root)], check=True, timeout=60)
-        files = validate_runtime(root)
-        record = {"tool": OWNER, "schema": 1, "archive_url": URL, "archive_sha256": SHA256,
-                  "build": BUILD, "sdk": 37, "release": "17", "architecture": "x86_64", "files": files,
+        files = validate_runtime(root, arch)
+        record = {"tool": OWNER, "schema": 1, "archive_url": archive_url, "archive_sha256": expected_sha256,
+                  "build": BUILD, "sdk": 37, "release": "17", "architecture": config["manifest"], "files": files,
                   "note": "Local compatibility-test fixture only; no image is mounted, booted, or redistributed."}
         (root / MANIFEST).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
         # Never merge into a partially prepared/user-owned runtime.
         if output.exists() or output.is_symlink():
             raise PreparationError(f"destination appeared during preparation: {output}")
         root.rename(output)
-    print(f"prepared Android 17 / API 37 x86_64: {output}", flush=True)
+    print(f"prepared Android 17 / API 37 {config['label']}: {output}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--archive", type=Path, default=REPO / ".toolchain/downloads" / FILENAME)
-    parser.add_argument("--output", type=Path, default=REPO / ".toolchain/sysroot-android17")
+    parser.add_argument("--arch", choices=sorted(ARCHITECTURES), default=DEFAULT_ARCH,
+                        help="Android runtime architecture (default: x86_64)")
+    parser.add_argument("--archive", type=Path,
+                        help="GSI archive (default: the pinned archive for --arch)")
+    parser.add_argument("--output", type=Path,
+                        help="output tree (default: .toolchain/sysroot-android17[-arm64])")
     parser.add_argument("--cache", action="store_true",
                         help="install into the per-user cache (XDG_CACHE_HOME/pengudroid)")
     parser.add_argument("--download", action="store_true",
@@ -362,16 +407,22 @@ def main():
     parser.add_argument("--fsck-erofs", dest="erofs")
     parser.add_argument("--debugfs")
     args = parser.parse_args()
+    filename, archive_url, expected_sha256 = archive_source(args.arch)
     if args.cache:
-        args.archive, args.output = cache_paths()
+        args.archive, args.output = cache_paths(arch=args.arch)
+    if args.archive is None:
+        args.archive = REPO / ".toolchain/downloads" / filename
+    if args.output is None:
+        suffix = "-arm64" if args.arch == "arm64" else ""
+        args.output = REPO / f".toolchain/sysroot-android17{suffix}"
     output = args.output.absolute()
     try:
         # An already-prepared runtime is verified without touching the archive,
         # so a repeated `--cache` run never re-downloads the GSI.
         if args.download and not output.exists():
-            download(args.archive.absolute())
+            download(args.archive.absolute(), url=archive_url, expected=expected_sha256)
         output.parent.mkdir(parents=True, exist_ok=True)
-        prepare(args.archive.absolute(), output, args.erofs, args.debugfs)
+        prepare(args.archive.absolute(), output, args.erofs, args.debugfs, arch=args.arch)
     except (PreparationError, OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(f"prepare-android17: {error}", file=sys.stderr)
         return 1

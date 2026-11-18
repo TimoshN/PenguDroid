@@ -241,7 +241,8 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
         || std::fs::read_to_string(&marker).ok().as_deref() != Some(identity.as_str())
     {
         let rawdir = spec.data_dir.join("webview-provider/raw");
-        crate::apk::extract_prefix(&apk.display().to_string(), "lib/x86_64/", &rawdir).ok()?;
+        let prefix = format!("lib/{}/", crate::nativelib::host_abi());
+        crate::apk::extract_prefix(&apk.display().to_string(), &prefix, &rawdir).ok()?;
         std::fs::create_dir_all(&libdir).ok()?;
         for entry in std::fs::read_dir(&rawdir).ok()? {
             let entry = entry.ok()?;
@@ -273,7 +274,7 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
             "credentialProtectedDataDir",
             spec.data_dir.join("webview-provider").display().to_string(),
         ),
-        ("primaryCpuAbi", "x86_64".to_string()),
+        ("primaryCpuAbi", crate::nativelib::host_abi().to_string()),
     ] {
         env.set_object_field(
             application,

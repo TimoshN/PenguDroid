@@ -10,10 +10,10 @@
 //!   Bionic shim, loads `libart.so`, and calls `JNI_CreateJavaVM`. It prints
 //!   ART's own diagnostic when the runtime cannot start.
 //!
-//! Only an extracted Android 17 / API 37 x86_64 root is supported:
+//! Extracted Android 17 / API 37 x86_64 and ARM64 roots are recognized:
 //! `system/lib64`, `system/apex/com.android.art/lib64`, and
-//! `system/framework/x86_64/boot.art`. The runtime's own `system/build.prop`
-//! and ART ELF header must identify this target; legacy flat layouts are not
+//! `system/framework/{x86_64,arm64}/boot.art`. The runtime's own
+//! `system/build.prop` and ART ELF header must identify the target; legacy flat layouts are not
 //! accepted. Framework boot jars come from `system/etc/classpaths/bootclasspath.pb`.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -23,13 +23,14 @@ use std::process::Command;
 
 use crate::deps::find_shim;
 use crate::nativelib::ensure_compat_dir;
+use crate::runtime::{RuntimeArch, HOST_ARCH};
 use pengudroid_nativebridge::{RuntimeCallbacks, Shorty, Translator};
 
 /// Validate the runtime itself, independently of APK minSdk/targetSdk metadata.
-fn validate_runtime(system: &Path) -> Result<(), String> {
+fn validate_runtime(system: &Path) -> Result<RuntimeArch, String> {
     let props_path = system.join("build.prop");
     let props = std::fs::read_to_string(&props_path).map_err(|e| format!(
-        "Android 17 / API 37 x86_64 requires {}: {e}", props_path.display()
+        "Android 17 / API 37 x86_64/ARM64 requires {}: {e}", props_path.display()
     ))?;
     let sdk: Vec<&str> = props.lines().filter_map(|line| {
         let (key, value) = line.split_once('=')?;
@@ -37,7 +38,7 @@ fn validate_runtime(system: &Path) -> Result<(), String> {
     }).collect();
     if sdk.len() != 1 || sdk[0] != "37" {
         return Err(format!(
-            "unsupported runtime in {}: expected Android 17 / API 37 x86_64 \
+            "unsupported runtime in {}: expected Android 17 / API 37 x86_64 or ARM64 \
              (ro.build.version.sdk=37), found {}",
             props_path.display(),
             if sdk.is_empty() { "no SDK property".into() } else { sdk.join(", ") }
@@ -50,28 +51,30 @@ fn validate_runtime(system: &Path) -> Result<(), String> {
     let mut header = [0u8; 20];
     std::fs::File::open(&art).and_then(|mut file| file.read_exact(&mut header))
         .map_err(|e| format!(
-            "Android 17 / API 37 x86_64 requires an ART ELF header at {}: {e}",
+            "Android 17 / API 37 x86_64/ARM64 requires an ART ELF header at {}: {e}",
             art.display()
         ))?;
     if &header[..4] != b"\x7fELF" {
-        return Err(format!("{} is not an ELF file; Android 17 / API 37 x86_64 is required", art.display()));
+        return Err(format!("{} is not an ELF file; Android 17 / API 37 x86_64 or ARM64 is required", art.display()));
     }
     let machine = u16::from_le_bytes([header[18], header[19]]);
-    if header[4] != 2 || header[5] != 1 || machine != 0x3e {
+    let arch = RuntimeArch::from_elf_machine(machine);
+    if header[4] != 2 || header[5] != 1 || arch.is_none() {
         return Err(format!(
             "unsupported ART runtime {}: Android 17 / API 37 requires a 64-bit \
-             little-endian x86_64 ELF (class=2, data=1, machine=62); \
+             little-endian x86_64 ELF or ARM64 ELF (class=2, data=1, machine=62 or 183); \
              found class={}, data={}, machine={} ({})",
             art.display(), header[4], header[5], machine, pengudroid_elf::machine_name(machine)
         ));
     }
-    Ok(())
+    Ok(arch.unwrap())
 }
 
 /// Where the pieces of an Android system tree live.
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub root: PathBuf,
+    pub arch: RuntimeArch,
     /// Directories to put on `LD_LIBRARY_PATH`.
     pub lib_dirs: Vec<PathBuf>,
     pub art_root: PathBuf,
@@ -219,7 +222,7 @@ impl Layout {
             .map_err(|e| format!("cannot resolve sysroot {}: {e}", root.display()))?;
         if !root.join("system").is_dir() {
             return Err(format!(
-                "unsupported sysroot {}: expected an extracted Android 17 / API 37 x86_64 \
+                "unsupported sysroot {}: expected an extracted Android 17 / API 37 x86_64 or ARM64 \
                  root with system/build.prop and system/apex/com.android.art/lib64/libart.so; \
                  legacy flat sysroots are not supported",
                 root.display()
@@ -230,7 +233,7 @@ impl Layout {
 
     fn android(root: &Path) -> Result<Layout, String> {
         let system = root.join("system");
-        validate_runtime(&system)?;
+        let arch = validate_runtime(&system)?;
         let art_root = system.join("apex/com.android.art");
         let framework = system.join("framework");
         // Every APEX ships its own lib64; ART's dependency closure reaches
@@ -303,10 +306,11 @@ impl Layout {
 
         Ok(Layout {
             root: root.to_path_buf(),
+            arch,
             lib_dirs,
             art_root,
             framework: framework.clone(),
-            boot_images: framework.join("x86_64"),
+            boot_images: framework.join(arch.boot_dir()),
             boot_jars,
             boot_locations,
             apex_manifest: system.join("apex/com.android.art/apex_manifest.pb"),
@@ -380,7 +384,7 @@ pub fn sysroot(args: &[String]) -> i32 {
     };
 
     println!("sysroot:  {}", layout.root.display());
-    println!("layout:   android (Android 17 / API 37 x86_64)");
+    println!("layout:   android (Android 17 / API 37 {})", layout.arch.label());
     println!("art root: {}", layout.art_root.display());
     println!("boot:     {}", layout.boot_images.display());
     println!();
@@ -417,17 +421,18 @@ pub fn sysroot(args: &[String]) -> i32 {
 /// `ANDROID_DATA` for ART (its `dalvik-cache`): the runtime's own `data`
 /// directory when it is writable, else a per-user one. A runtime embedded in
 /// the AppImage is a read-only mount.
-fn android_data_dir(root: &Path) -> PathBuf {
-    let own = root.join("data");
+fn android_data_dir(layout: &Layout) -> PathBuf {
+    let own = layout.root.join("data");
+    let cache = format!("dalvik-cache/{}", layout.arch.boot_dir());
     let probe = own.join(format!(".pengudroid-write-{}", std::process::id()));
-    if std::fs::create_dir_all(own.join("dalvik-cache/x86_64")).is_ok() && std::fs::write(&probe, b"").is_ok() {
+    if std::fs::create_dir_all(own.join(&cache)).is_ok() && std::fs::write(&probe, b"").is_ok() {
         let _ = std::fs::remove_file(&probe);
         return own;
     }
     let fallback = crate::runtime::cache_root()
         .unwrap_or_else(std::env::temp_dir)
         .join("android-data");
-    let _ = std::fs::create_dir_all(fallback.join("dalvik-cache/x86_64"));
+    let _ = std::fs::create_dir_all(fallback.join(cache));
     fallback
 }
 
@@ -485,6 +490,17 @@ fn prepare_art_libs(layout: &Layout, work: &Path) -> Result<PathBuf, String> {
                 }
             }
         }
+    }
+    // Never expose the GSI's own EGL loader through the prepared library path.
+    // Some host Aurora EGL stacks explicitly dlopen("libEGL.so") internally;
+    // if the guest copy wins, host eglGetProcAddress re-enters Android EGL and
+    // aborts because no Android vendor driver is configured. The gleshim is
+    // also already preloaded, but the explicit soname lookup needs this file.
+    if let Some(gleshim) = crate::nativelib::find_gleshim() {
+        let target = out.join("libEGL.so");
+        let _ = std::fs::remove_file(&target);
+        std::os::unix::fs::symlink(&gleshim, &target)
+            .map_err(|e| format!("cannot point libEGL.so at the gleshim: {e}"))?;
     }
     if let Some(source) = std::env::var_os("PENGUDROID_GL_FORWARDERS") {
         let source = PathBuf::from(source);
@@ -865,6 +881,10 @@ pub fn art_test(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if layout.arch != HOST_ARCH {
+        eprintln!("pengudroid: {} runtime cannot execute on a {} host", layout.arch.label(), HOST_ARCH.label());
+        return 1;
+    }
     let configured_guest = std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT");
     let guest_requested = passthrough.iter().any(|arg| matches!(arg.as_str(), "--init-bridge" | "--bridge-selftest"));
     let guest_root = if guest_requested {
@@ -898,13 +918,35 @@ pub fn art_test(args: &[String]) -> i32 {
     };
 
     let work = std::env::temp_dir().join(format!("pengudroid-art-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    prune_stale_work_dirs();
-    let art_libs = match prepare_art_libs(&layout, &work) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("pengudroid: {e}");
-            return 1;
+    let art_libs = if let Some(provisioned) = std::env::var_os("PENGUDROID_ART_LIBS") {
+        // Read-only/package-owned provisioning for hosts where user-written
+        // files cannot be mmapped with PROT_EXEC (Aurora's home is noexec and
+        // its application policy also rejects pushed shared libraries). The
+        // normal scratch/de-bionic path remains the default everywhere else.
+        let path = PathBuf::from(provisioned);
+        match std::fs::canonicalize(&path) {
+            Ok(path) if path.join("libart.so").is_file() => {
+                println!("art: using pre-provisioned libraries in {}", path.display());
+                path
+            }
+            Ok(path) => {
+                eprintln!("pengudroid: PENGUDROID_ART_LIBS={} has no libart.so", path.display());
+                return 1;
+            }
+            Err(error) => {
+                eprintln!("pengudroid: cannot use PENGUDROID_ART_LIBS={}: {error}", path.display());
+                return 1;
+            }
+        }
+    } else {
+        let _ = std::fs::remove_dir_all(&work);
+        prune_stale_work_dirs();
+        match prepare_art_libs(&layout, &work) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("pengudroid: {e}");
+                return 1;
+            }
         }
     };
 
@@ -965,11 +1007,15 @@ pub fn art_test(args: &[String]) -> i32 {
         let native_abi = if std::env::var_os("PENGUDROID_NATIVE_BRIDGE_LIB").is_some() {
             "arm64-v8a"
         } else {
-            "x86_64"
+            crate::nativelib::host_abi()
         };
-        let dir = std::env::temp_dir().join(format!(
-            "pengudroid-libs/{package}/lib/{native_abi}"
-        ));
+        let dir = std::env::var_os("PENGUDROID_NATIVE_LIB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!(
+                    "pengudroid-libs/{package}/lib/{native_abi}"
+                ))
+            });
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(libs) = crate::apk::native_libs(&apk) {
             for lib in libs.iter().filter(|l| l.abi == native_abi) {
@@ -1053,19 +1099,34 @@ pub fn art_test(args: &[String]) -> i32 {
     if let Some(g) = &gleshim {
         preload_parts.push(g.display().to_string());
     }
-    if let Some(vk) = crate::nativelib::find_vkshim() {
-        preload_parts.push(vk.display().to_string());
-        for cand in [
-            "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
-            "/lib/x86_64-linux-gnu/libvulkan.so.1",
-            "/usr/lib64/libvulkan.so.1",
-            "/usr/lib/libvulkan.so.1",
-        ] {
-            if std::path::Path::new(cand).exists() {
-                preload_parts.push(cand.to_string());
-                break;
+    if std::env::var_os("PENGUDROID_EGL_ONLY").is_none() {
+        if let Some(vk) = crate::nativelib::find_vkshim() {
+            preload_parts.push(vk.display().to_string());
+            for cand in [
+                "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+                "/lib/x86_64-linux-gnu/libvulkan.so.1",
+                "/usr/lib64/libvulkan.so.1",
+                "/usr/lib/libvulkan.so.1",
+            ] {
+                if std::path::Path::new(cand).exists() {
+                    preload_parts.push(cand.to_string());
+                    break;
+                }
             }
         }
+    }
+    // Allocator diagnostics must be present before the first allocation. Keep
+    // this separate from PENGUDROID_EXTRA_PRELOAD, which intentionally dlopens
+    // diagnostics only after ART has initialized.
+    if let Some(early) = std::env::var_os("PENGUDROID_EARLY_PRELOAD") {
+        let mut diagnostic: Vec<String> = early
+            .to_string_lossy()
+            .split(':')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect();
+        diagnostic.append(&mut preload_parts);
+        preload_parts = diagnostic;
     }
     let preload = preload_parts.join(":");
     // Extra preloads for diagnostics are loaded *after* the VM instead (see
@@ -1080,7 +1141,7 @@ pub fn art_test(args: &[String]) -> i32 {
         .env("LD_LIBRARY_PATH", crate::runtime::host_library_path(&ld_path))
         .env("ANDROID_ROOT", &layout.android_root)
         .env("ANDROID_ART_ROOT", &layout.art_root)
-        .env("ANDROID_DATA", android_data_dir(&layout.root))
+        .env("ANDROID_DATA", android_data_dir(&layout))
         .env("ANDROID_TZDATA_ROOT", layout.root.join("system/apex/com.android.tzdata"))
         .env("ANDROID_RUNTIME_ROOT", layout.root.join("system/apex/com.android.runtime"))
         .env("ANDROID_I18N_ROOT", layout.root.join("system/apex/com.android.i18n"))
@@ -1124,7 +1185,10 @@ pub fn art_test(args: &[String]) -> i32 {
             .env("PENGUDROID_PROP_ro.dalvik.vm.isa.arm.variant", "generic");
         println!("art: native bridge = {bridge}");
     }
-    match cmd.status() {
+    println!("art: launching helper with libraries from {}", art_libs.display());
+    let helper_status = cmd.status();
+    eprintln!("art: helper status result = {helper_status:?}");
+    match helper_status {
         Ok(s) if s.success() => 0,
         Ok(s) => {
             if let Some(code) = s.code() {
@@ -1292,6 +1356,10 @@ pub fn art_main(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if layout.arch != HOST_ARCH {
+        diag(&format!("art: {} runtime cannot execute on a {} host", layout.arch.label(), HOST_ARCH.label()));
+        return 1;
+    }
     if bridge_isa.is_some() {
         let configured = std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT");
         let guest_root = match bridge_guest_root(&layout.root, configured.as_deref()) {
@@ -2351,6 +2419,9 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         eprintln!("apphost: ActivityThread.currentActivityThread() is null");
         return false;
     }
+    if std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some() {
+        eprintln!("apphost: reading APK metadata after acquiring ActivityThread");
+    }
     let info = match crate::apk::read_apk(&apk) {
         Ok(i) => i,
         Err(e) => {
@@ -2366,13 +2437,20 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
     let native_abi = if std::env::var_os("PENGUDROID_NATIVE_BRIDGE_LIB").is_some() {
         "arm64-v8a"
     } else {
-        "x86_64"
+        crate::nativelib::host_abi()
     };
+    if std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some() {
+        eprintln!("apphost: APK metadata read; preparing application directories");
+    }
     let apk_path = std::path::PathBuf::from(&apk);
     let data_dir = crate::launcher::app_data_dir(&package);
-    let lib_dir = std::env::temp_dir().join(format!(
-        "pengudroid-libs/{package}/lib/{native_abi}"
-    ));
+    let lib_dir = std::env::var_os("PENGUDROID_NATIVE_LIB_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "pengudroid-libs/{package}/lib/{native_abi}"
+            ))
+        });
     // `handleBindApplication` creates `code_cache` under the data directory and
     // logs "Data directory doesn't exist" (plus a stack trace) when the parent
     // is missing, so lay the tree out the way the framework expects.
@@ -2390,6 +2468,9 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
     // exist or `statvfs` fails with ENOENT and the app sees "Invalid path".
     if let Some(root) = std::env::var_os("PENGUDROID_ROOT") {
         let _ = std::fs::create_dir_all(std::path::Path::new(&root).join("data"));
+    }
+    if std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some() {
+        eprintln!("apphost: application directories prepared; extracting native libraries");
     }
     // `System.loadLibrary` resolves through `ApplicationInfo.nativeLibraryDir`,
     // so the APK's own `lib/<abi>/*.so` have to exist on disk there. Without
@@ -2410,7 +2491,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
             eprintln!("apphost: {apk}: {} libraries, abis {abis:?}", libs.len());
             eprintln!("apphost: native lib dir = {}", lib_dir.display());
         }
-        for lib in libs.iter().filter(|l| l.abi == "x86_64") {
+        for lib in libs.iter().filter(|l| l.abi == native_abi) {
             let dest = lib_dir.join(&lib.file);
             if dest.exists() {
                 continue;
@@ -2467,6 +2548,9 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         })
         .cloned()
         .collect();
+    if std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some() {
+        eprintln!("apphost: APK and provider scan complete; building application spec");
+    }
     let spec = crate::apphost::AppSpec {
         package: &package,
         apk: &apk_path,
@@ -2506,6 +2590,9 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         application_meta: &info.application_meta,
         services: &info.services,
     };
+    if std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some() {
+        eprintln!("apphost: calling handleBindApplication for {package}");
+    }
     crate::apphost::bind_application(env, thread, &spec)
 }
 
@@ -2685,9 +2772,14 @@ mod tests {
         }
 
         fn android17() -> Self {
+            Self::android17_arch(RuntimeArch::X86_64)
+        }
+
+        fn android17_arch(arch: RuntimeArch) -> Self {
             let fixture = Self::empty();
             fixture.write("system/build.prop", b"ro.build.version.sdk=37\nro.build.version.release=17\n");
-            fixture.write("system/apex/com.android.art/lib64/libart.so", &elf_header(2, 1, 0x3e));
+            let machine = match arch { RuntimeArch::X86_64 => 0x3e, RuntimeArch::Arm64 => 0xb7 };
+            fixture.write("system/apex/com.android.art/lib64/libart.so", &elf_header(2, 1, machine));
             for name in ["core-oj", "core-libart", "okhttp", "bouncycastle", "apache-xml"] {
                 fixture.write(&format!("system/apex/com.android.art/javalib/{name}.jar"), b"jar");
             }
@@ -2905,9 +2997,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_x86_64_or_invalid_art_without_layout_retry() {
+    fn rejects_unknown_or_invalid_art_without_layout_retry() {
         let fixture = Fixture::android17();
-        for (class, data, machine) in [(2, 1, 0xb7), (1, 1, 3), (2, 2, 0x3e), (1, 1, 0x3e)] {
+        for (class, data, machine) in [(2, 1, 3), (1, 1, 3), (2, 2, 0x3e), (1, 1, 0x3e)] {
             fixture.write("system/apex/com.android.art/lib64/libart.so", &elf_header(class, data, machine));
             let error = fixture.error();
             assert!(error.contains("x86_64 ELF"), "{error}");
@@ -2922,6 +3014,14 @@ mod tests {
         std::fs::remove_file(fixture.0.join("system/apex/com.android.art/lib64/libart.so")).unwrap();
         let error = fixture.error();
         assert!(error.contains("requires an ART ELF header"), "{error}");
+    }
+
+    #[test]
+    fn detects_android17_arm64_layout() {
+        let fixture = Fixture::android17_arch(RuntimeArch::Arm64);
+        let android = Layout::detect(&fixture.0).unwrap();
+        assert_eq!(android.arch, RuntimeArch::Arm64);
+        assert_eq!(android.boot_images, android.android_root.join("framework/arm64"));
     }
 
     #[test]

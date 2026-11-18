@@ -156,10 +156,19 @@ def unchanged(stream, before, path):
         raise PreparationError(f"file changed while reading: {path}")
 
 
+def stream_digest(stream):
+    if hasattr(hashlib, "file_digest"):
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+    checksum = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(BUFFER), b""):
+        checksum.update(chunk)
+    return checksum.hexdigest()
+
+
 def digest(path):
     with regular(path) as stream:
         before = os.fstat(stream.fileno())
-        result = hashlib.file_digest(stream, "sha256").hexdigest()
+        result = stream_digest(stream)
         unchanged(stream, before, path)
         return result
 
@@ -580,7 +589,7 @@ def extract_image(archive, work):
         # Hash and read the same open inode, not a subsequently replaced pathname.
         with regular(archive) as stream:
             before = os.fstat(stream.fileno())
-            if hashlib.file_digest(stream, "sha256").hexdigest() != SHA256:
+            if stream_digest(stream) != SHA256:
                 raise PreparationError(f"ARM64 GSI SHA-256 mismatch: expected {SHA256}; nothing extracted")
             stream.seek(0)
             with zipfile.ZipFile(stream) as container:

@@ -82,7 +82,10 @@ pub unsafe extern "C" fn __pthread_cleanup_pop(cleanup: *mut BionicCleanup, exec
         }
     }
 }
-use pengudroid_proto::abi::{validate_platform_property_override, ANDROID_API_LEVEL, ANDROID_RELEASE};
+use pengudroid_proto::abi::{
+    validate_platform_property_override, ANDROID_API_LEVEL, ANDROID_RELEASE, HOST_CPU_ABI,
+    HOST_RUNTIME_ARCH,
+};
 
 mod ahardwarebuffer;
 mod android_native;
@@ -95,6 +98,7 @@ mod mediasession;
 mod virtual_input;
 mod blast;
 mod codec2;
+mod clipboard;
 #[cfg(all(
     target_os = "linux",
     target_env = "gnu",
@@ -111,7 +115,10 @@ mod bridge_exec;
 mod bridge_tls;
 mod netdb;
 mod pathshim;
+#[cfg(any(target_arch = "aarch64", test))]
+mod pthread_sync;
 mod rootfs;
+mod semaphore;
 mod syscall_paths;
 mod vlog;
 mod zip;
@@ -247,6 +254,73 @@ extern "C" {
     fn backtrace(buffer: *mut *mut c_void, size: c_int) -> c_int;
 }
 
+/// Dump one live thread for an explicit, development-only HWUI deadlock probe.
+/// SIGSTKFLT is unused by ART and by glibc; unlike Thread.getAllStackTraces this
+/// does not suspend the VM, and unlike the fatal handler the target continues.
+const THREAD_DUMP_SIGNAL: c_int = libc::SIGSTKFLT;
+
+extern "C" fn pengudroid_thread_dump_handler(
+    _sig: c_int,
+    _info: *mut c_void,
+    ctx: *mut c_void,
+) {
+    let pc = unsafe { fault_rip(ctx) };
+    let sp = unsafe { fault_rsp(ctx) };
+    let mut out = [0u8; 8192];
+    let mut n = 0usize;
+    append(
+        &mut out,
+        &mut n,
+        &format!("[pengudroid] live thread tid={} pc={pc:#x} sp={sp:#x}\n", unsafe { libc::gettid() }),
+    );
+    unsafe {
+        let mut frames = [std::ptr::null_mut::<c_void>(); 48];
+        let count = backtrace(frames.as_mut_ptr(), frames.len() as c_int).max(0) as usize;
+        for (index, &frame) in frames[..count].iter().enumerate() {
+            let mut info: libc::Dl_info = std::mem::zeroed();
+            let mut line = format!("[pengudroid]   #{index} {frame:p}");
+            if libc::dladdr(frame, &mut info) != 0 {
+                if !info.dli_fbase.is_null() {
+                    line.push_str(&format!(" +{:#x}", frame as usize - info.dli_fbase as usize));
+                }
+                if !info.dli_sname.is_null() {
+                    line.push(' ');
+                    line.push_str(&CStr::from_ptr(info.dli_sname).to_string_lossy());
+                }
+                if !info.dli_fname.is_null() {
+                    line.push_str(" (");
+                    line.push_str(&CStr::from_ptr(info.dli_fname).to_string_lossy());
+                    line.push(')');
+                }
+            }
+            line.push('\n');
+            append(&mut out, &mut n, &line);
+        }
+        append(&mut out, &mut n, "[pengudroid] live frame-pointer chain:\n");
+        append_frame_chain(&mut out, &mut n, fault_rbp(ctx), sp);
+        libc::write(2, out.as_ptr() as *const c_void, n);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_dump_native_thread(tid: libc::pid_t) -> c_int {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe {
+        let Some(real_sigaction) = dlsym_next::<RealSigaction>(b"sigaction\0") else {
+            return;
+        };
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = pengudroid_thread_dump_handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        real_sigaction(THREAD_DUMP_SIGNAL, &sa, std::ptr::null_mut());
+    });
+    if tid <= 0 {
+        return libc::EINVAL;
+    }
+    libc::tgkill(libc::getpid(), tid, THREAD_DUMP_SIGNAL)
+}
+
 /// Signals the last-resort handler takes over.
 const CRASH_SIGNALS: [c_int; 5] = [
     libc::SIGSEGV,
@@ -283,6 +357,11 @@ static mut SAVED_HANDLERS: [SavedHandler; CRASH_SIGNALS.len()] =
 /// through to the dump below.
 #[no_mangle]
 pub extern "C" fn __pengudroid_install_crash_handler() {
+    if std::env::var_os("PENGUDROID_TRACE_EARLY_NATIVE").is_some() {
+        // Early loader probe: ART has not replaced unexpected-signal handlers
+        // yet. A non-positive TID installs the handler without sending a signal.
+        unsafe { __pengudroid_dump_native_thread(0); }
+    }
     // `sigaction`/`sigaltstack` are *interposed* by this shim (Bionic layout in,
     // glibc layout out), so naming them directly binds to our own translation
     // and a glibc `struct sigaction` would be reinterpreted as Bionic — the
@@ -377,7 +456,12 @@ extern "C" fn pengudroid_fault_handler(sig: c_int, info: *mut c_void, ctx: *mut 
     // handler returns after copying the missing page in, and the faulting
     // instruction simply re-executes; dumping and exiting here would turn a
     // normal compacting collection into a crash.
-    if unsafe { chain_to_saved_handler(sig, info, ctx) } {
+    // Diagnostic escape for a fault which ART's own handler otherwise turns
+    // into an unhelpful nested `HandleUnexpectedSignal reenter` message.
+    // Normal operation keeps the existing chain-first behaviour, including
+    // ART's resolvable userfaultfd SIGBUS faults.
+    let dump_before_art = std::env::var_os("PENGUDROID_DUMP_BEFORE_ART").is_some();
+    if !dump_before_art && unsafe { chain_to_saved_handler(sig, info, ctx) } {
         return;
     }
     // Write first, allocate later: if the fault happened inside the allocator or
@@ -386,17 +470,18 @@ extern "C" fn pengudroid_fault_handler(sig: c_int, info: *mut c_void, ctx: *mut 
     unsafe { libc::write(2, ENTER.as_ptr() as *const c_void, ENTER.len()) };
     let rip = unsafe { fault_rip(ctx) };
     let rsp = unsafe { fault_rsp(ctx) };
-    let addr = if info.is_null() {
-        0
+    let (addr, code) = if info.is_null() {
+        (0, 0)
     } else {
-        unsafe { (*(info as *const libc::siginfo_t)).si_addr() as usize }
+        let info = unsafe { &*(info as *const libc::siginfo_t) };
+        (unsafe { info.si_addr() } as usize, info.si_code)
     };
     let mut out = [0u8; 8192];
     let mut n = 0usize;
     append(
         &mut out,
         &mut n,
-        &format!("[pengudroid] fatal signal {sig} rip={rip:#x} rsp={rsp:#x} addr={addr:#x}\n"),
+        &format!("[pengudroid] fatal signal {sig} code={code} rip={rip:#x} rsp={rsp:#x} addr={addr:#x}\n"),
     );
     unsafe {
         let mut frames = [std::ptr::null_mut::<c_void>(); 48];
@@ -446,10 +531,11 @@ fn append(out: &mut [u8], n: &mut usize, text: &str) {
     *n += take;
 }
 
-/// Read `REG_RIP` out of the `ucontext_t` a `SA_SIGINFO` handler receives.
+/// Read the interrupted program counter out of a `SA_SIGINFO` signal frame.
 ///
 /// # Safety
 /// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "x86_64")]
 unsafe fn fault_rip(ctx: *mut c_void) -> u64 {
     if ctx.is_null() {
         return 0;
@@ -458,10 +544,22 @@ unsafe fn fault_rip(ctx: *mut c_void) -> u64 {
     (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as u64
 }
 
-/// Read `REG_RSP` out of the signal frame.
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "aarch64")]
+unsafe fn fault_rip(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let uc = ctx as *const libc::ucontext_t;
+    (*uc).uc_mcontext.pc
+}
+
+/// Read the interrupted stack pointer out of the signal frame.
 ///
 /// # Safety
 /// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "x86_64")]
 unsafe fn fault_rsp(ctx: *mut c_void) -> u64 {
     if ctx.is_null() {
         return 0;
@@ -470,16 +568,39 @@ unsafe fn fault_rsp(ctx: *mut c_void) -> u64 {
     (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] as u64
 }
 
-/// Read `REG_RBP` out of the `ucontext_t` a `SA_SIGINFO` handler receives.
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "aarch64")]
+unsafe fn fault_rsp(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let uc = ctx as *const libc::ucontext_t;
+    (*uc).uc_mcontext.sp
+}
+
+/// Read the interrupted frame pointer (`rbp`/`x29`).
 ///
 /// # Safety
 /// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "x86_64")]
 unsafe fn fault_rbp(ctx: *mut c_void) -> u64 {
     if ctx.is_null() {
         return 0;
     }
     let uc = ctx as *const libc::ucontext_t;
     (*uc).uc_mcontext.gregs[libc::REG_RBP as usize] as u64
+}
+
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "aarch64")]
+unsafe fn fault_rbp(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let uc = ctx as *const libc::ucontext_t;
+    (*uc).uc_mcontext.regs[29]
 }
 
 /// Walk the saved frame-pointer chain of the *faulting* thread.
@@ -1073,6 +1194,20 @@ pub unsafe extern "C" fn freeaddrinfo(res: *mut netdb::BionicAddrinfo) {
     netdb::free_bionic_addrinfo(res)
 }
 
+/// `getnameinfo` — sockaddr/NI flags are ABI-compatible; EAI errors are not.
+#[no_mangle]
+pub unsafe extern "C" fn getnameinfo(
+    address: *const libc::sockaddr,
+    address_len: libc::socklen_t,
+    host: *mut c_char,
+    host_len: libc::socklen_t,
+    service: *mut c_char,
+    service_len: libc::socklen_t,
+    flags: c_int,
+) -> c_int {
+    netdb::resolve_name(address, address_len, host, host_len, service, service_len, flags)
+}
+
 /// `gai_strerror` — Bionic's wording and numbering.
 #[no_mangle]
 pub unsafe extern "C" fn gai_strerror(code: c_int) -> *const c_char {
@@ -1111,7 +1246,53 @@ pub unsafe extern "C" fn __b64_pton(
     }
 }
 
-/// Bionic allocator introspection (`libmemunreachable`).
+//// Diagnostic boundary for libpng's jmpbuf ownership. Android's ImageDecoder
+/// calls this twice around decode/errors; tracing is opt-in and does not alter
+/// the real libpng result.
+#[no_mangle]
+pub unsafe extern "C" fn png_set_longjmp_fn(
+    png: *mut c_void,
+    longjmp_fn: *mut c_void,
+    size: usize,
+) -> *mut c_void {
+    type Real = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    let Some(real) = dlsym_next::<Real>(b"png_set_longjmp_fn\0") else {
+        return std::ptr::null_mut();
+    };
+    let trace = std::env::var_os("PENGUDROID_TRACE_PNG").is_some();
+    let mut host_libpng16 = false;
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(real as *const c_void, &mut info) } != 0 && !info.dli_fname.is_null() {
+        let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+        // Host libpng16 embeds glibc's 312-byte AArch64 jmp_buf. The guest
+        // passes Bionic's 256-byte PNG jmpbuf size. The actual non-local jump
+        // still uses our Bionic longjmp_fn; only libpng's capacity check needs
+        // the host size, otherwise its second set_longjmp call returns NULL.
+        host_libpng16 = cfg!(target_arch = "aarch64") && path.contains("libpng16.so");
+        if trace {
+            eprintln!(
+                "[png] real={real:p} library={} offset={:#x}",
+                path,
+                (real as usize).wrapping_sub(info.dli_fbase as usize)
+            );
+        }
+    }
+    let real_size = if host_libpng16 && size == 256 { 312 } else { size };
+    if trace && !png.is_null() {
+        let state = |offset: usize| (png as *const u8).add(offset).cast::<usize>().read();
+        eprintln!(
+            "[png] before png={png:p} longjmp={longjmp_fn:p} size={size} fn={:#x} buf={:#x} sizeField={:#x}",
+            state(256), state(264), state(272)
+        );
+    }
+    let result = real(png, longjmp_fn, real_size);
+    if trace {
+        eprintln!("[png] after png={png:p} result={result:p} host_size={real_size}");
+    }
+    result
+}
+
+// Bionic allocator introspection (`libmemunreachable`).
 ///
 /// The host allocator cannot enumerate its heap, so these report "unsupported"
 /// instead of pretending to walk it.
@@ -1498,7 +1679,7 @@ fn overlay_version_properties(props: &mut BTreeMap<String, String>, text: &str) 
         let actual = image.get(key).copied();
         if actual != Some(expected) {
             return Err(format!(
-                "Android {ANDROID_RELEASE} / API {ANDROID_API_LEVEL} x86_64 only: {key} must be {expected:?}, got {actual:?}"
+                "Android {ANDROID_RELEASE} / API {ANDROID_API_LEVEL} {HOST_RUNTIME_ARCH} only: {key} must be {expected:?}, got {actual:?}"
             ));
         }
     }
@@ -1569,12 +1750,12 @@ fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, Str
         ("ro.build.characteristics", "default"),
         // `Build.<clinit>` reads these. An empty ABI list makes it index an
         // empty array and the whole framework fails to initialise, so they have
-        // to be present. Only x86_64 is claimed: that is what a guest library
-        // can actually run here without the ARM translator.
-        ("ro.product.cpu.abilist", "x86_64"),
-        ("ro.product.cpu.abilist64", "x86_64"),
+        // Advertise only the ABI that native host code can actually load.
+        // On x86_64 the optional ARM translator adds its own guest properties.
+        ("ro.product.cpu.abilist", HOST_CPU_ABI),
+        ("ro.product.cpu.abilist64", HOST_CPU_ABI),
         ("ro.product.cpu.abilist32", ""),
-        ("ro.product.cpu.abi", "x86_64"),
+        ("ro.product.cpu.abi", HOST_CPU_ABI),
         ("ro.product.cpu.abi2", ""),
         ("ro.product.name", "pengudroid"),
         ("ro.product.device", "pengudroid"),
@@ -1618,6 +1799,17 @@ fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, Str
     // and release-like debug/root flags, but no runtime ABI or host privilege.
     for (key, value) in pengudroid_device::DEFAULT_PROFILE {
         props.insert((*key).to_string(), (*value).to_string());
+    }
+    // Hybris shares its Android graphics stack with the guest RenderThread.
+    // HWUI's disk shader cache currently crashes in that configuration while
+    // hashing the driver identity; the framework's emulator path disables only
+    // this optional disk cache, not GL rendering or application behaviour.
+    if cfg!(target_arch = "aarch64")
+        && std::path::Path::new("/usr/lib/libhybris-common.so.1").is_file()
+        && std::path::Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file()
+    {
+        props.insert("ro.boot.qemu".to_string(), "1".to_string());
+        props.insert("ro.kernel.qemu".to_string(), "1".to_string());
     }
     for (key, value) in overrides {
         if let Some(rest) = key.strip_prefix("PENGUDROID_PROP_") {
@@ -2386,13 +2578,14 @@ pub unsafe extern "C" fn __fread_chk(
     libc::fread(buf, size, count, stream)
 }
 
-/// `__fgets_chk(buf, size, buf_size, stream)`.
+/// `__fgets_chk(buf, size, stream, buf_size)` — Bionic keeps stream third,
+/// unlike glibc's fortified helper, which places buf_size third.
 #[no_mangle]
 pub unsafe extern "C" fn __fgets_chk(
     buf: *mut c_char,
     size: c_int,
-    _buf_size: usize,
     stream: *mut libc::FILE,
+    _buf_size: usize,
 ) -> *mut c_char {
     libc::fgets(buf, size, stream)
 }
@@ -3435,6 +3628,93 @@ pub unsafe extern "C" fn android_reset_stack_guards() {
     libc::abort(); // no validated host TLS layout for another architecture yet
 }
 
+unsafe fn trace_abort_stack(reason: &str) {
+    if std::env::var_os("PENGUDROID_TRACE_ABORT").is_none() { return; }
+    unsafe extern "C" {
+        fn backtrace(frames: *mut *mut c_void, size: c_int) -> c_int;
+        fn backtrace_symbols_fd(frames: *const *mut c_void, size: c_int, fd: c_int);
+    }
+    let mut frames = [std::ptr::null_mut(); 96];
+    let count = backtrace(frames.as_mut_ptr(), frames.len() as c_int).max(0);
+    eprintln!("abort-trace: {reason}, native stack ({count} frames)");
+    backtrace_symbols_fd(frames.as_ptr(), count, 2);
+}
+
+/// Diagnostic native stack before the host aborts. ART otherwise replaces the
+/// first fault while reporting it, leaving only pthread_kill in the log.
+#[no_mangle]
+pub unsafe extern "C" fn abort() -> ! {
+    trace_abort_stack("abort()");
+    type Abort = unsafe extern "C" fn() -> !;
+    if let Some(real) = dlsym_next::<Abort>(b"abort\0") {
+        real()
+    }
+    libc::syscall(libc::SYS_exit_group, 134);
+    std::hint::unreachable_unchecked()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn tgkill(tgid: c_int, tid: c_int, signal: c_int) -> c_int {
+    if signal == libc::SIGABRT { trace_abort_stack("tgkill(SIGABRT)"); }
+    type Tgkill = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
+    if let Some(real) = dlsym_next::<Tgkill>(b"tgkill\0") {
+        return real(tgid, tid, signal);
+    }
+    libc::syscall(libc::SYS_tgkill, tgid, tid, signal) as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn raise(signal: c_int) -> c_int {
+    if signal == libc::SIGABRT { trace_abort_stack("raise(SIGABRT)"); }
+    type Raise = unsafe extern "C" fn(c_int) -> c_int;
+    if let Some(real) = dlsym_next::<Raise>(b"raise\0") { return real(signal); }
+    libc::syscall(libc::SYS_tgkill, libc::getpid(), libc::gettid(), signal) as c_int
+}
+
+/// Bionic's crt compatibility entry point used by Crashlytics' trampoline.
+/// The host glibc is already initialized; running Bionic __libc_preinit_impl
+/// against its linker would instead crash in __loader_android_link_namespaces.
+#[no_mangle]
+pub unsafe extern "C" fn __libc_init(
+    _raw_args: *mut c_void,
+    _onexit: *mut c_void,
+    _slingshot: *mut c_void,
+    _globals: *mut c_void,
+) -> c_int {
+    0
+}
+
+/// Diagnostic workaround for hosted graphics/HIDL: some stack combinations mark
+/// app Binder calls as fatal-on-oneway, although RenderThread legitimately uses
+/// oneway transactions. Opt-in preserves the default until device-verified.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android8hardware12ProcessState18setCallRestrictionENS1_15CallRestrictionE(
+    this: *mut c_void,
+    restriction: c_int,
+) {
+    type Set = unsafe extern "C" fn(*mut c_void, c_int);
+    let value = if std::env::var_os("PENGUDROID_ALLOW_ONEWAY").is_some() { 0 } else { restriction };
+    if let Some(real) = dlsym_next::<Set>(
+        b"_ZN7android8hardware12ProcessState18setCallRestrictionENS1_15CallRestrictionE\0"
+    ) {
+        real(this, value);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android12ProcessState18setCallRestrictionENS0_15CallRestrictionE(
+    this: *mut c_void,
+    restriction: c_int,
+) {
+    type Set = unsafe extern "C" fn(*mut c_void, c_int);
+    let value = if std::env::var_os("PENGUDROID_ALLOW_ONEWAY").is_some() { 0 } else { restriction };
+    if let Some(real) = dlsym_next::<Set>(
+        b"_ZN7android12ProcessState18setCallRestrictionENS0_15CallRestrictionE\0"
+    ) {
+        real(this, value);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `AndroidRuntime` entry points
 // ---------------------------------------------------------------------------
@@ -3532,6 +3812,92 @@ unsafe fn created_java_vm() -> *mut c_void {
     vm
 }
 
+unsafe fn exit_jni_func<T: Copy>(env: *mut c_void, slot: usize) -> T {
+    let table = *(env as *const *const *const c_void);
+    let function = *table.add(slot);
+    std::mem::transmute_copy(&function)
+}
+
+/// Print the calling Java thread's stack immediately before ART terminates the
+/// process. This is diagnostic-only and intentionally contains no app data.
+unsafe fn trace_java_exit(status: c_int) {
+    let env = _ZN7android14AndroidRuntime9getJNIEnvEv();
+    if env.is_null() {
+        eprintln!("exit-trace: status={status}, no JNIEnv");
+        return;
+    }
+    type FindClass = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
+    type GetStaticMethod = unsafe extern "C" fn(
+        *mut c_void, *mut c_void, *const c_char, *const c_char,
+    ) -> *mut c_void;
+    type GetMethod = GetStaticMethod;
+    type CallStaticObject = unsafe extern "C" fn(
+        *mut c_void, *mut c_void, *mut c_void, *const c_void,
+    ) -> *mut c_void;
+    type CallObject = CallStaticObject;
+    type ArrayLength = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+    type ArrayGet = unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> *mut c_void;
+    type GetUtf = unsafe extern "C" fn(
+        *mut c_void, *mut c_void, *mut u8,
+    ) -> *const c_char;
+    type ReleaseUtf = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char);
+
+    let find: FindClass = exit_jni_func(env, 6);
+    let thread_class = find(env, c"java/lang/Thread".as_ptr());
+    if thread_class.is_null() { return; }
+    let get_static: GetStaticMethod = exit_jni_func(env, 113);
+    let current_method = get_static(
+        env, thread_class, c"currentThread".as_ptr(), c"()Ljava/lang/Thread;".as_ptr(),
+    );
+    if current_method.is_null() { return; }
+    let call_static: CallStaticObject = exit_jni_func(env, 116);
+    let thread = call_static(env, thread_class, current_method, std::ptr::null());
+    if thread.is_null() { return; }
+    let get_method: GetMethod = exit_jni_func(env, 33);
+    let stack_method = get_method(
+        env, thread_class, c"getStackTrace".as_ptr(), c"()[Ljava/lang/StackTraceElement;".as_ptr(),
+    );
+    if stack_method.is_null() { return; }
+    let call_object: CallObject = exit_jni_func(env, 36);
+    let frames = call_object(env, thread, stack_method, std::ptr::null());
+    if frames.is_null() { return; }
+    let element_class = find(env, c"java/lang/StackTraceElement".as_ptr());
+    if element_class.is_null() { return; }
+    let to_string = get_method(env, element_class, c"toString".as_ptr(), c"()Ljava/lang/String;".as_ptr());
+    if to_string.is_null() { return; }
+    let length: ArrayLength = exit_jni_func(env, 171);
+    let get: ArrayGet = exit_jni_func(env, 173);
+    let get_utf: GetUtf = exit_jni_func(env, 169);
+    let release_utf: ReleaseUtf = exit_jni_func(env, 170);
+    eprintln!("exit-trace: System/Runtime exit status={status}, Java stack:");
+    for index in 0..length(env, frames).min(96) {
+        let frame = get(env, frames, index);
+        if frame.is_null() { continue; }
+        let line = call_object(env, frame, to_string, std::ptr::null());
+        if line.is_null() { continue; }
+        let text = get_utf(env, line, std::ptr::null_mut());
+        if !text.is_null() {
+            eprintln!("exit-trace:   at {}", CStr::from_ptr(text).to_string_lossy());
+            release_utf(env, line, text);
+        }
+    }
+}
+
+/// ART implements Runtime.nativeExit through `_exit`. Keep the ordinary path
+/// direct; PENGUDROID_TRACE_EXIT=1 additionally captures the Java caller.
+#[no_mangle]
+pub unsafe extern "C" fn _exit(status: c_int) -> ! {
+    if std::env::var_os("PENGUDROID_TRACE_EXIT").is_some() {
+        trace_java_exit(status);
+    }
+    type Exit = unsafe extern "C" fn(c_int) -> !;
+    if let Some(real) = dlsym_next::<Exit>(b"_exit\0") {
+        real(status)
+    }
+    libc::syscall(libc::SYS_exit_group, status);
+    std::hint::unreachable_unchecked()
+}
+
 /// `AndroidRuntime::setArgv0(proc_name, set_proc_name)`
 ///
 /// On a device, `app_process` constructs an `AndroidRuntime` and publishes it
@@ -3563,9 +3929,15 @@ pub unsafe extern "C" fn _ZN7android14AndroidRuntime8setArgv0EPKcb(
         }
         return;
     }
+    if std::env::var_os("PENGUDROID_TRACE_SETARGV0").is_some() {
+        eprintln!("[pengudroid] AndroidRuntime::setArgv0 runtime={runtime:p}, proc_name={proc_name:p}, set_proc_name={set_proc_name}");
+    }
     type SetArgv0 = unsafe extern "C" fn(*mut c_void, *const c_char, bool);
     if let Some(real) = dlsym_next::<SetArgv0>(b"_ZN7android14AndroidRuntime8setArgv0EPKcb\0") {
         real(runtime, proc_name, set_proc_name);
+    }
+    if std::env::var_os("PENGUDROID_TRACE_SETARGV0").is_some() {
+        eprintln!("[pengudroid] AndroidRuntime::setArgv0 returned");
     }
 }
 
@@ -3872,6 +4244,25 @@ pub unsafe extern "C" fn sigaction(
     if rc == 0 && !oldact.is_null() {
         *oldact = sigaction_from_glibc(&gold);
     }
+    if rc == 0
+        && gact.is_some()
+        && std::env::var_os("PENGUDROID_DUMP_BEFORE_ART").is_some()
+    {
+        if let Some(index) = CRASH_SIGNALS.iter().position(|&s| s == signum) {
+            let replacement = gact.unwrap();
+            if replacement.sa_sigaction != pengudroid_fault_handler as usize {
+                SAVED_HANDLERS[index] = SavedHandler {
+                    action: replacement.sa_sigaction,
+                    flags: replacement.sa_flags,
+                };
+                let mut ours: libc::sigaction = std::mem::zeroed();
+                ours.sa_sigaction = pengudroid_fault_handler as usize;
+                ours.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                libc::sigemptyset(&mut ours.sa_mask);
+                real(signum, &ours, std::ptr::null_mut());
+            }
+        }
+    }
     rc
 }
 
@@ -4129,6 +4520,7 @@ pub unsafe extern "C" fn sigaction64(
 /// be given (the common case: a thread asking about itself).
 #[no_mangle]
 pub unsafe extern "C" fn pthread_gettid_np(thread: libc::pthread_t) -> libc::pid_t {
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64", target_pointer_width = "64"))]
     if let Some(tid) = bridge_tls::guest_record_tid(thread as usize) { return tid; }
     type Gettid = unsafe extern "C" fn(libc::pthread_t) -> libc::pid_t;
     static NEXT: OnceLock<Option<Gettid>> = OnceLock::new();
@@ -4136,6 +4528,18 @@ pub unsafe extern "C" fn pthread_gettid_np(thread: libc::pthread_t) -> libc::pid
         Some(next) => next(thread),
         None => libc::gettid(),
     }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64", target_pointer_width = "64"))]
+fn host_pthread_handle(handle: libc::pthread_t) -> libc::pthread_t {
+    bridge_tls::host_handle(handle as usize) as libc::pthread_t
+}
+
+// Native AArch64 guests use real host pthread handles. Digitalis' synthetic
+// Bionic TLS records are an x86_64-host-only mechanism.
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64", target_pointer_width = "64")))]
+fn host_pthread_handle(handle: libc::pthread_t) -> libc::pthread_t {
+    handle
 }
 
 // A translated ARM64 thread's `pthread_self()` is a synthetic Bionic record
@@ -4152,15 +4556,82 @@ macro_rules! host_pthread_call {
             type Next = unsafe extern "C" fn(libc::pthread_t $(, $ty)*) -> $ret;
             static NEXT: OnceLock<Option<Next>> = OnceLock::new();
             let Some(next) = *NEXT.get_or_init(|| dlsym_next($symbol)) else { return libc::ENOSYS as $ret };
-            next(bridge_tls::host_handle(thread as usize) as libc::pthread_t $(, $arg)*)
+            next(host_pthread_handle(thread) $(, $arg)*)
         }
     };
 }
 host_pthread_call!(pthread_detach, b"pthread_detach\0", () -> c_int);
 host_pthread_call!(pthread_join, b"pthread_join\0", (retval: *mut *mut c_void) -> c_int);
 host_pthread_call!(pthread_kill, b"pthread_kill\0", (signal: c_int) -> c_int);
-host_pthread_call!(pthread_getattr_np, b"pthread_getattr_np\0", (attr: *mut libc::pthread_attr_t) -> c_int);
-host_pthread_call!(pthread_setname_np, b"pthread_setname_np\0", (name: *const c_char) -> c_int);
+#[repr(C)]
+struct BionicPthreadAttr {
+    flags: u32,
+    _pad: u32,
+    stack_base: *mut c_void,
+    stack_size: usize,
+    guard_size: usize,
+    sched_policy: c_int,
+    sched_priority: c_int,
+    _reserved: [u8; 16],
+}
+const _: () = assert!(std::mem::size_of::<BionicPthreadAttr>() == 56);
+
+/// `pthread_getattr_np(thread, attr)` with an explicit Bionic layout.
+///
+/// Bionic's 56-byte attribute is smaller than glibc's 64-byte one. Never let
+/// glibc write its struct into the guest allocation: query each field instead.
+#[no_mangle]
+pub unsafe extern "C" fn pthread_getattr_np(
+    thread: libc::pthread_t,
+    attr: *mut BionicPthreadAttr,
+) -> c_int {
+    if attr.is_null() {
+        return libc::EINVAL;
+    }
+    type GetAttr = unsafe extern "C" fn(libc::pthread_t, *mut libc::pthread_attr_t) -> c_int;
+    let Some(real) = dlsym_next::<GetAttr>(b"pthread_getattr_np\0") else {
+        return libc::ENOSYS;
+    };
+    let mut host: libc::pthread_attr_t = std::mem::zeroed();
+    let rc = real(host_pthread_handle(thread), &mut host);
+    if rc != 0 {
+        return rc;
+    }
+    let out = &mut *attr;
+    // glibc and Bionic share the first 56 bytes on AArch64. Copy exactly
+    // those bytes and no more: the remaining 8 bytes belong only to glibc.
+    std::ptr::copy_nonoverlapping(
+        &host as *const libc::pthread_attr_t as *const u8,
+        out as *mut BionicPthreadAttr as *mut u8,
+        56,
+    );
+    if std::env::var_os("PENGUDROID_TRACE_PTHREAD_ATTR").is_some() {
+        eprintln!("[pengudroid] pthread_getattr_np: stack={:?} size={} guard={} policy={} priority={} flags={:#x}",
+            out.stack_base, out.stack_size, out.guard_size, out.sched_policy, out.sched_priority, out.flags);
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setname_np(
+    thread: libc::pthread_t,
+    name: *const c_char,
+) -> c_int {
+    type Next = unsafe extern "C" fn(libc::pthread_t, *const c_char) -> c_int;
+    static NEXT: OnceLock<Option<Next>> = OnceLock::new();
+    let Some(next) = *NEXT.get_or_init(|| dlsym_next(b"pthread_setname_np\0")) else {
+        return libc::ENOSYS;
+    };
+    let result = next(host_pthread_handle(thread), name);
+    if std::env::var_os("PENGUDROID_TRACE_SYNC").is_some() {
+        eprintln!(
+            "[sync] setname thread={} name={} result={result}",
+            host_pthread_handle(thread),
+            cstr_lossy(name)
+        );
+    }
+    result
+}
 host_pthread_call!(pthread_getname_np, b"pthread_getname_np\0", (name: *mut c_char, len: usize) -> c_int);
 host_pthread_call!(pthread_getschedparam, b"pthread_getschedparam\0", (policy: *mut c_int, param: *mut libc::sched_param) -> c_int);
 host_pthread_call!(pthread_setschedparam, b"pthread_setschedparam\0", (policy: c_int, param: *const libc::sched_param) -> c_int);
@@ -4171,7 +4642,7 @@ host_pthread_call!(pthread_sigqueue, b"pthread_sigqueue\0", (signal: c_int, valu
 /// `pthread_equal(a, b)` — a guest record and its host thread are one thread.
 #[no_mangle]
 pub extern "C" fn pthread_equal(a: libc::pthread_t, b: libc::pthread_t) -> c_int {
-    (bridge_tls::host_handle(a as usize) == bridge_tls::host_handle(b as usize)) as c_int
+    (host_pthread_handle(a) == host_pthread_handle(b)) as c_int
 }
 
 /// Bionic's `__assert`/`__assert2`: report and abort (glibc's are different).
@@ -4607,6 +5078,12 @@ pub unsafe extern "C" fn fclose(stream: *mut c_void) -> c_int {
 static PENGUDROID_CTOR: extern "C" fn() = pengudroid_init;
 
 extern "C" fn pengudroid_init() {
+    if std::env::var_os("PENGUDROID_TRACE_EARLY_NATIVE").is_some() {
+        unsafe { __pengudroid_dump_native_thread(0); }
+    }
+    if std::env::var_os("PENGUDROID_DEBUG_EARLY_FAULTS").is_some() {
+        __pengudroid_install_crash_handler();
+    }
     #[cfg(target_arch = "x86_64")]
     unsafe { __stack_chk_guard.store(host_stack_guard(), Ordering::Relaxed); }
     // Android's libc++ (and ART) import the Itanium unwinder (`_Unwind_*`),
@@ -5709,6 +6186,22 @@ pub static __pengudroid_ver_ld: u8 = 0;
 mod tests {
     use super::*;
     use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn bionic_fgets_chk_keeps_stream_in_the_third_argument() {
+        unsafe {
+            let stream = libc::tmpfile();
+            assert!(!stream.is_null());
+            let line = b"cpu\n";
+            assert_eq!(libc::fwrite(line.as_ptr().cast(), 1, line.len(), stream), line.len());
+            libc::rewind(stream);
+            let mut buf = [0 as c_char; 16];
+            let result = __fgets_chk(buf.as_mut_ptr(), buf.len() as c_int, stream, buf.len());
+            assert_eq!(result, buf.as_mut_ptr());
+            assert_eq!(std::ffi::CStr::from_ptr(buf.as_ptr()).to_bytes(), b"cpu\n");
+            libc::fclose(stream);
+        }
+    }
 
     #[test]
     fn memset_explicit_returns_destination_and_fills_only_requested_bytes() {

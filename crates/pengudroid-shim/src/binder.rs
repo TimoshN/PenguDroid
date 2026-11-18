@@ -2450,6 +2450,7 @@ fn hosted_interface_descriptor(handle: u32) -> Option<&'static str> {
         "surface_composer_client" => Some("android.gui.ISurfaceComposerClient"),
         "display_event_connection" => Some("android.gui.IDisplayEventConnection"),
         "pengudroid.activity_host" => Some(ACTIVITY_HOST_DESCRIPTOR),
+        "clipboard" => Some("android.content.IClipboard"),
         BILLING_SERVICE => Some("com.android.vending.billing.IInAppBillingService"),
         _ => None,
     }
@@ -2850,6 +2851,87 @@ fn push_dynamic_display_info(parcel: &mut Vec<u8>) {
     });
 }
 
+/// Android 17 IClipboard transaction order (IClipboard.java). The clipboard
+/// codec accepts plain text; unsupported payloads fail instead of being
+/// misdecoded. No clipboard contents are logged.
+static LAST_CLIP: std::sync::Mutex<Option<(String, Vec<u8>)>> = std::sync::Mutex::new(None);
+
+fn clipboard_transaction(tr: &TransactionData) -> Option<Reply> {
+    if tr.target_handle != handle_for("clipboard") { return None; }
+    let data = if tr.data_ptr != 0 && tr.data_size > 0 {
+        unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) }
+    } else { &[] };
+    let ok = |parcel: Vec<u8>| {
+        let mut body = 0u32.to_ne_bytes().to_vec(); // AIDL Status: no exception
+        body.extend_from_slice(&parcel);
+        Some(Reply { parcel: body, objects: Vec::new(), flags: 0 })
+    };
+    let bool_reply = |value: bool| ok((i32::from(value)).to_ne_bytes().to_vec());
+    match tr.code {
+        1 | 2 => { // setPrimaryClip / setPrimaryClipAsPackage
+            if std::env::var_os("PENGUDROID_TEST_CLIPBOARD").is_some() {
+                eprintln!("[clipboard:test] setPrimaryClip parcel {} bytes", data.len());
+                let _ = std::fs::write(
+                    "/srv/shared/io.github.denizomer10/PenguDroid/cache/clipboard-test-parcel.bin",
+                    data,
+                );
+            }
+            let result = crate::clipboard::parse_clip_data(data).and_then(|clip| {
+                let text = clip.text.unwrap_or_default();
+                crate::clipboard::set(text.clone())?;
+                *LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some((text, clip.raw));
+                Ok(())
+            });
+            match result {
+                Ok(()) => ok(Vec::new()),
+                Err(error) => Some(Reply::unknown_transaction(tr, &format!("clipboard set: {error}"))),
+            }
+        }
+        3 => match crate::clipboard::clear() { // clearPrimaryClip
+            Ok(()) => ok(Vec::new()),
+            Err(error) => Some(Reply::unknown_transaction(tr, &format!("clipboard clear: {error}"))),
+        },
+        4 => match crate::clipboard::get() { // getPrimaryClip
+            Ok(Some(text)) => {
+                let raw = LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                    .filter(|(saved, _)| saved == &text)
+                    .map(|(_, raw)| raw.clone())
+                    .unwrap_or_else(|| crate::clipboard::clip_data_parcel(&text));
+                let mut parcel = 1u32.to_ne_bytes().to_vec();
+                parcel.extend_from_slice(&raw);
+                if std::env::var_os("PENGUDROID_TEST_CLIPBOARD").is_some() {
+                    let _ = std::fs::write(
+                        "/srv/shared/io.github.denizomer10/PenguDroid/cache/clipboard-test-get.bin",
+                        &parcel,
+                    );
+                }
+                ok(parcel)
+            }
+            Ok(None) => ok(0u32.to_ne_bytes().to_vec()),
+            Err(error) => Some(Reply::unknown_transaction(tr, &format!("clipboard get: {error}"))),
+        },
+        5 => match crate::clipboard::get() { // getPrimaryClipDescription
+            Ok(Some(_)) => {
+                let mut parcel = 1u32.to_ne_bytes().to_vec();
+                parcel.extend_from_slice(&crate::clipboard::description_parcel());
+                ok(parcel)
+            }
+            Ok(None) => ok(0u32.to_ne_bytes().to_vec()),
+            Err(error) => Some(Reply::unknown_transaction(tr, &format!("clipboard description: {error}"))),
+        },
+        6 => bool_reply(matches!(crate::clipboard::get(), Ok(Some(_)))), // hasPrimaryClip
+        7 | 8 => ok(Vec::new()), // add/removePrimaryClipChangedListener
+        9 => bool_reply(match crate::clipboard::get() { // hasClipboardText
+            Ok(Some(text)) => !text.is_empty(),
+            _ => false,
+        }),
+        10 => ok((-1i32).to_ne_bytes().to_vec()), // getPrimaryClipSource: null
+        11 => bool_reply(false), // areClipboardAccessNotificationsEnabledForUser
+        12 => ok(Vec::new()), // setClipboardAccessNotificationsEnabledForUser
+        _ => Some(Reply::unknown_transaction(tr, "unsupported IClipboard transaction")),
+    }
+}
+
 /// Build the reply parcel for a transaction.
 ///
 /// AIDL replies start with a status word; unavailable contracts in the
@@ -2871,6 +2953,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             let parcel = string16(descriptor);
             return Reply { parcel, objects: Vec::new(), flags: 0 };
         }
+    }
+    if let Some(reply) = clipboard_transaction(tr) {
+        return reply;
     }
     let mut parcel = Vec::new();
     let mut objects = Vec::new();
@@ -4669,10 +4754,33 @@ pub unsafe extern "C" fn __pengudroid_binder_open(path: *const libc::c_char) -> 
     if bytes.starts_with(b"/dev/dma_heap/") {
         return open_dma_heap().unwrap_or(-1);
     }
+    if is_binder_device(bytes) && host_gl_call_active() {
+        // Hybris loads the phone's real Android EGL/HIDL stack. Its
+        // configstore and allocator services live behind the kernel hwbinder;
+        // only the guest ART framework should use our emulated device.
+        return -1;
+    }
     match open_device(bytes) {
         Some(fd) => fd,
         None => -1,
     }
+}
+
+fn host_gl_call_active() -> bool {
+    type Active = unsafe extern "C" fn() -> c_int;
+    static ACTIVE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let address = *ACTIVE.get_or_init(|| {
+        let name = b"__pengudroid_host_gl_active\0";
+        // SAFETY: static NUL-terminated symbol name. A missing gleshim simply
+        // means every call belongs to the ordinary guest binder path.
+        (unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr().cast()) }) as usize
+    });
+    if address == 0 {
+        return false;
+    }
+    // SAFETY: gleshim exports this exact nullary function signature.
+    let active: Active = unsafe { std::mem::transmute(address) };
+    (unsafe { active() }) > 0
 }
 
 // --- dma-buf heaps ---------------------------------------------------------

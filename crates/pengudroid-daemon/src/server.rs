@@ -516,8 +516,20 @@ fn handle(
     match msg {
         Message::Ping => (Some(Message::Pong), vec![], false),
         Message::Hello { .. } | Message::Welcome { .. } => (None, vec![], false),
+        Message::ClipboardText { .. } => (
+            Some(Message::Error { code: -22, message: "unexpected clipboard reply".into() }),
+            vec![], false,
+        ),
 
         Message::SubscribeInput { surface_id } => {
+            // An early loading surface is created by the launcher. The first
+            // guest subscription is its attach operation: transfer ownership
+            // so PresentShm/Dmabuf and compositor close events target the ART
+            // process rather than being rejected as the launcher's window.
+            if daemon.surface_owner.lock().unwrap().contains_key(&surface_id) {
+                daemon.remember_surface_owner(surface_id, peer.pid);
+                crate::info!("surface {surface_id} attached to guest {}", peer.pid);
+            }
             daemon
                 .input_sinks
                 .lock()
@@ -548,8 +560,14 @@ fn handle(
             };
             if let Some(id) = target {
                 if let Some((_, _, tx)) = sinks.get(&id) {
+                    match &event {
+                        pengudroid_proto::InputKind::CommitText { text }
+                        | pengudroid_proto::InputKind::PreeditText { text } => crate::info!(
+                            "injected text ({} bytes) on surface {id}", text.len(),
+                        ),
+                        _ => crate::info!("injected {:?} on surface {id}", event),
+                    }
                     let _ = tx.send(Message::InputEvent { surface_id: id, event });
-                    crate::info!("injected {:?} on surface {id}", event);
                 }
             } else {
                 crate::warn!("input injected but no surface is known");
@@ -801,6 +819,66 @@ fn handle(
             let ok = owned && graphics.as_mut().is_some_and(|gfx| gfx.set_pointer_lock(surface_id, locked));
             if ok { (Some(Message::Ack), vec![], false) } else {
                 (Some(Message::Error { code: -95, message: "the pointer cannot be locked: the surface is not this process's, or the compositor lacks pointer-constraints/relative-pointer".into() }), vec![], false)
+            }
+        }
+
+        Message::SetImeState { surface_id, visible } => {
+            let owned = daemon.surface_owner.lock().unwrap().get(&surface_id).copied() == Some(peer.pid);
+            if !owned {
+                return (Some(Message::Error {
+                    code: -22,
+                    message: "IME state requested for another process's surface".into(),
+                }), vec![], false);
+            }
+            let result = daemon.graphics.lock().unwrap().as_mut()
+                .ok_or_else(|| "graphics unavailable".to_string())
+                .and_then(|gfx| gfx.set_ime_state(surface_id, visible));
+            match result {
+                Ok(()) => (Some(Message::Ack), vec![], false),
+                Err(message) => (Some(Message::Error { code: -19, message }), vec![], false),
+            }
+        }
+
+        Message::ClipboardSet { surface_id, text } => {
+            let owned = daemon.surface_owner.lock().unwrap().get(&surface_id).copied() == Some(peer.pid);
+            let result = if owned {
+                daemon.graphics.lock().unwrap().as_mut()
+                    .ok_or_else(|| "graphics unavailable".to_string())
+                    .and_then(|gfx| gfx.clipboard_set(text))
+            } else {
+                Err("clipboard write requested for another process's surface".into())
+            };
+            match result {
+                Ok(()) => (Some(Message::Ack), vec![], false),
+                Err(message) => (Some(Message::Error { code: -19, message }), vec![], false),
+            }
+        }
+        Message::ClipboardGet { surface_id } => {
+            let owned = daemon.surface_owner.lock().unwrap().get(&surface_id).copied() == Some(peer.pid);
+            let result = if owned {
+                daemon.graphics.lock().unwrap().as_mut()
+                    .ok_or_else(|| "graphics unavailable".to_string())
+                    .and_then(|gfx| gfx.clipboard_read())
+            } else {
+                Err("clipboard read requested for another process's surface".into())
+            };
+            match result {
+                Ok(text) => (Some(Message::ClipboardText { text }), vec![], false),
+                Err(message) => (Some(Message::Error { code: -19, message }), vec![], false),
+            }
+        }
+        Message::ClipboardClear { surface_id } => {
+            let owned = daemon.surface_owner.lock().unwrap().get(&surface_id).copied() == Some(peer.pid);
+            let result = if owned {
+                daemon.graphics.lock().unwrap().as_mut()
+                    .ok_or_else(|| "graphics unavailable".to_string())
+                    .and_then(|gfx| gfx.clipboard_clear())
+            } else {
+                Err("clipboard clear requested for another process's surface".into())
+            };
+            match result {
+                Ok(()) => (Some(Message::Ack), vec![], false),
+                Err(message) => (Some(Message::Error { code: -19, message }), vec![], false),
             }
         }
 

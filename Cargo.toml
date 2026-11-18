@@ -35,6 +35,7 @@ wayland-client = { version = "0.31", default-features = false }
 wayland-protocols = { version = "0.31", default-features = false, features = ["client", "unstable", "staging"] }
 
 pengudroid-proto = { path = "crates/pengudroid-proto" }
+pengudroid-cli = { path = "crates/pengudroid-cli" }
 pengudroid-socket = { path = "crates/pengudroid-socket" }
 pengudroid-input = { path = "crates/pengudroid-input" }
 pengudroid-elf = { path = "crates/pengudroid-elf" }
@@ -42,6 +43,7 @@ pengudroid-nativebridge = { path = "crates/pengudroid-nativebridge" }
 pengudroid-hostgpu = { path = "crates/pengudroid-hostgpu" }
 pengudroid-gleshim = { path = "crates/pengudroid-gleshim" }
 pengudroid-device = { path = "crates/pengudroid-device" }
+pengudroid-daemon = { path = "crates/pengudroid-daemon" }
 
 [profile.release]
 opt-level = 3

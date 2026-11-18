@@ -40,7 +40,10 @@ const DENIED: &[(&str, libc::c_long)] = &[
     ("open_by_handle_at", libc::SYS_open_by_handle_at),
     ("name_to_handle_at", libc::SYS_name_to_handle_at),
     ("syslog", libc::SYS_syslog),
+    // x86 I/O-port access instructions do not exist on AArch64.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     ("iopl", libc::SYS_iopl),
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     ("ioperm", libc::SYS_ioperm),
     ("settimeofday", libc::SYS_settimeofday),
     ("clock_settime", libc::SYS_clock_settime),

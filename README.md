@@ -146,6 +146,6 @@ Some integration tests need the local Android runtime, graphics session or pinne
 
 ## Documentation and license
 
-[CLI and protocol](docs/API.md) · [Android runtime](docs/ANDROID17.md) · [Native bridge](docs/NATIVE_BRIDGE.md) · [Hardware video](docs/HARDWARE_VIDEO.md) · [Limitations](docs/LIMITATIONS.md)
+[CLI and protocol](docs/API.md) · [Android runtime](docs/ANDROID17.md) · [Native bridge](docs/NATIVE_BRIDGE.md) · [Hardware video](docs/HARDWARE_VIDEO.md) · [Limitations](docs/LIMITATIONS.md) · [Experimental Aurora/AArch64 port](docs/AURORA.md)
 
 PenguDroid is licensed under [Apache-2.0](LICENSE). Bundled third-party components retain their own licenses. Android runtime downloads are obtained separately from their official source. Genshin Impact, Beach Buggy Racing 2, NewPipe and their respective marks belong to their owners; the screenshots demonstrate compatibility and do not imply endorsement.

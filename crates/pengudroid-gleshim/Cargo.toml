@@ -14,3 +14,6 @@ crate-type = ["cdylib", "rlib"]
 libc.workspace = true
 pengudroid-proto.workspace = true
 pengudroid-socket.workspace = true
+
+[build-dependencies]
+cc = "1"

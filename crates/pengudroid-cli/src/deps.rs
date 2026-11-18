@@ -52,6 +52,12 @@ pub(crate) fn find_shim() -> Option<PathBuf> {
             return Some(std::fs::canonicalize(&p).unwrap_or(p));
         }
     }
+    if let Some(dir) = option_env!("PENGUDROID_AURORA_LIBDIR") {
+        let candidate = PathBuf::from(dir).join("libpengudroid_shim.so");
+        if candidate.exists() {
+            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+        }
+    }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let candidate = dir.join("libpengudroid_shim.so");

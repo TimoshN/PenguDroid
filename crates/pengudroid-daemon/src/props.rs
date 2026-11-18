@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use pengudroid_proto::abi::{validate_platform_property_override, ANDROID_API_LEVEL, ANDROID_RELEASE};
+use pengudroid_proto::abi::{
+    validate_platform_property_override, ANDROID_API_LEVEL, ANDROID_RELEASE, HOST_CPU_ABI,
+};
 
 /// Default properties advertised to guests. Runtime identity is immutable;
 /// ordinary configuration properties remain writable.
@@ -19,9 +21,9 @@ pub fn defaults() -> BTreeMap<String, String> {
         ("ro.build.version.release", ANDROID_RELEASE.to_string()),
         ("ro.build.version.release_or_codename", ANDROID_RELEASE.to_string()),
         ("ro.build.version.release_or_preview_display", ANDROID_RELEASE.to_string()),
-        ("ro.product.cpu.abi", "x86_64".to_string()),
-        ("ro.product.cpu.abilist", "x86_64".to_string()),
-        ("ro.product.cpu.abilist64", "x86_64".to_string()),
+        ("ro.product.cpu.abi", HOST_CPU_ABI.to_string()),
+        ("ro.product.cpu.abilist", HOST_CPU_ABI.to_string()),
+        ("ro.product.cpu.abilist64", HOST_CPU_ABI.to_string()),
         ("ro.product.cpu.abilist32", String::new()),
         ("ro.build.version.codename", "REL".to_string()),
         ("ro.build.version.security_patch", "2026-06-05".to_string()),
@@ -126,12 +128,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sdk_is_android_17_x86_64() {
+    fn sdk_and_abi_match_the_host_runtime() {
         let p = Props::new();
         assert_eq!(p.get("ro.build.version.sdk"), Some("37"));
         assert_eq!(p.get("ro.build.version.sdk_full"), Some("37.0"));
         assert_eq!(p.get("ro.build.version.release"), Some("17"));
-        assert_eq!(p.get("ro.product.cpu.abilist"), Some("x86_64"));
+        assert_eq!(p.get("ro.product.cpu.abilist"), Some(HOST_CPU_ABI));
         assert_eq!(p.get("ro.product.cpu.abilist32"), Some(""));
     }
 

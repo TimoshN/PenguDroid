@@ -83,6 +83,12 @@ pub fn find_gleshim() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    if let Some(dir) = option_env!("PENGUDROID_AURORA_LIBDIR") {
+        let candidate = PathBuf::from(dir).join("libpengudroid_gleshim.so");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let candidate = dir.join("libpengudroid_gleshim.so");
     if candidate.exists() {
@@ -99,6 +105,12 @@ pub fn find_vkshim() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         if p.exists() {
             return Some(p);
+        }
+    }
+    if let Some(dir) = option_env!("PENGUDROID_AURORA_LIBDIR") {
+        let candidate = PathBuf::from(dir).join("libpengudroid_vkshim.so");
+        if candidate.exists() {
+            return Some(candidate);
         }
     }
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();

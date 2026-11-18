@@ -2989,6 +2989,7 @@ version = "0.2.1"
 dependencies = [
  "libc",
  "miniz_oxide 0.8.9",
+ "pengudroid-daemon",
  "pengudroid-elf",
  "pengudroid-hostgpu",
  "pengudroid-input",
@@ -3010,8 +3011,11 @@ dependencies = [
  "pengudroid-socket",
  "sctk-adwaita",
  "smithay-client-toolkit",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols 0.31.2",
+ "wayland-scanner",
+ "zbus",
 ]
 
 [[package]]
@@ -3026,6 +3030,7 @@ version = "0.2.1"
 name = "pengudroid-gleshim"
 version = "0.2.1"
 dependencies = [
+ "cc",
  "libc",
  "pengudroid-proto",
  "pengudroid-socket",
@@ -3036,6 +3041,7 @@ name = "pengudroid-gui"
 version = "0.2.1"
 dependencies = [
  "libc",
+ "pengudroid-cli",
  "pengudroid-input",
  "slint",
  "slint-build",
@@ -4484,6 +4490,7 @@ version = "1.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "serde_core",
  "wasm-bindgen",

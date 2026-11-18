@@ -923,6 +923,54 @@ pub fn probe_platform_state(env: &JniEnv) -> bool {
     run().is_some()
 }
 
+/// Use the framework's logcat-only ProtoLog implementation when no Perfetto
+/// producer daemon exists. Android 17 otherwise constructs and registers a
+/// Perfetto data source during the first Activity launch, before onCreate.
+/// PENGUDROID_PERFETTO=1 keeps the native Perfetto path for a future backend.
+fn configure_protolog(env: &JniEnv) -> bool {
+    if std::env::var_os("PENGUDROID_PERFETTO").is_some() {
+        return true;
+    }
+    let Some(proto_log) = env.find_class("com/android/internal/protolog/ProtoLog") else {
+        return false;
+    };
+    let Some(controller_field) = env.static_field_id(
+        proto_log,
+        "sController",
+        "Lcom/android/internal/protolog/ProtoLogController;",
+    ) else {
+        return false;
+    };
+    let controller = env.static_object_field(proto_log, controller_field);
+    if controller.is_null() {
+        return false;
+    }
+    let Some(controller_class) = env.find_class(
+        "com/android/internal/protolog/ProtoLogController",
+    ) else {
+        return false;
+    };
+    let Some(instance_field) = env.field_id(
+        controller_class,
+        "mProtoLogInstance",
+        "Lcom/android/internal/protolog/common/IProtoLog;",
+    ) else {
+        return false;
+    };
+    if !env.object_field(controller, instance_field).is_null() {
+        return true;
+    }
+    let Some((_, logcat)) = new_instance(
+        env,
+        "com/android/internal/protolog/LogcatOnlyProtoLogImpl",
+    ) else {
+        return false;
+    };
+    env.set_object_field(controller, instance_field, logcat);
+    println!("apphost: ProtoLog uses logcat (no Perfetto daemon)");
+    true
+}
+
 /// Bind the app into `thread`, the object returned by
 /// `ActivityThread.currentActivityThread()`.
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
@@ -1129,6 +1177,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: ActivityThread.handleBindApplication not found");
         return false;
     };
+    if !configure_protolog(env) {
+        eprintln!("apphost: warning: could not select logcat-only ProtoLog");
+    }
     println!("apphost: calling handleBindApplication for {}", spec.package);
     let ok = env.call_void(thread, handle, &[JValue { l: data }]);
     if ok {
@@ -3630,6 +3681,8 @@ pub fn loop_forever(env: &JniEnv) {
         drain_activity_requests(env, &mut scratch);
         webview::probe_tick(env);
         attach_new_windows(env);
+        apply_deferred_window_updates(env);
+        drain_ime_text_events(env);
         match env.call_static_boolean(
             looper_class,
             once,
@@ -3685,8 +3738,13 @@ impl ActivityHostWaker {
                 let send = env.method_id(class, "sendEmptyMessage", "(I)Z")?;
                 ready.send(()).ok()?;
                 while !stopping.load(std::sync::atomic::Ordering::Acquire) {
-                    if unsafe { pending() } && env.call_boolean(handler, send, &[JValue { i: 0 }]) != Some(true) {
-                        eprintln!("apphost: main Handler rejected activity wakeup");
+                    let activity = unsafe { pending() };
+                    let ime = !IME_TEXT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                        || STATUSBAR_INSET_PENDING.load(std::sync::atomic::Ordering::Acquire)
+                        || CLIPBOARD_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
+                        || NETWORK_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire);
+                    if (activity || ime) && env.call_boolean(handler, send, &[JValue { i: 0 }]) != Some(true) {
+                        eprintln!("apphost: main Handler rejected activity/IME wakeup");
                         return None;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -4814,6 +4872,78 @@ fn spawn_input_pump(env: &JniEnv) {
         let Some(key_ctor) = env.method_id(key_class, "<init>", "(JJIIIIIIII)V") else {
             return;
         };
+        let Some(view_class) = env.find_class("android/view/View") else { return; };
+        let (m_view, find_focus, text_editor) = (
+            env.field_id(root_class, "mView", "Landroid/view/View;"),
+            env.method_id(view_class, "findFocus", "()Landroid/view/View;"),
+            env.method_id(view_class, "onCheckIsTextEditor", "()Z"),
+        );
+        let ime_symbol = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                b"pengudroid_set_ime_state\0".as_ptr() as *const libc::c_char,
+            )
+        };
+        type SetIme = unsafe extern "C" fn(i32) -> i32;
+        let set_ime: Option<SetIme> = if ime_symbol.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute(ime_symbol) })
+        };
+        let read_text_symbol = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                b"pengudroid_input_read_text\0".as_ptr() as *const libc::c_char,
+            )
+        };
+        type ReadText = unsafe extern "C" fn(*mut u8, u32) -> i32;
+        let read_text: Option<ReadText> = if read_text_symbol.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute(read_text_symbol) })
+        };
+        let mut ime_visible = false;
+        let mut inset_root = 0usize;
+        let mut clipboard_smoke_root = 0usize;
+        let mut network_smoke_root = 0usize;
+        let mut update_ime_focus = || {
+            let Some(set_ime) = set_ime else { return };
+            let (Some(m_view), Some(find_focus), Some(text_editor)) =
+                (m_view, find_focus, text_editor)
+            else { return };
+            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else { return };
+            let roots = env.object_field(wmg, roots_field);
+            if roots.is_null() { return; }
+            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else { return };
+            let view = env.object_field(root, m_view);
+            if view.is_null() { return; }
+            if std::env::var_os("PENGUDROID_TEST_CLIPBOARD").is_some()
+                && clipboard_smoke_root != root as usize
+            {
+                clipboard_smoke_root = root as usize;
+                CLIPBOARD_SMOKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if std::env::var_os("PENGUDROID_TEST_NETWORK").is_some()
+                && network_smoke_root != root as usize
+            {
+                network_smoke_root = root as usize;
+                NETWORK_SMOKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if inset_root != root as usize {
+                inset_root = root as usize;
+                STATUSBAR_INSET_PENDING.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let focused = env.call_object(view, find_focus, &[]);
+            let accepts = focused.is_some_and(|focused| {
+                !focused.is_null()
+                    && env.call_boolean(focused, text_editor, &[]).unwrap_or(false)
+            });
+            if accepts == ime_visible { return; }
+            if unsafe { set_ime(i32::from(accepts)) } == 1 {
+                ime_visible = accepts;
+                println!("apphost: text input focus={accepts}");
+            }
+        };
 
         const ACTION_DOWN: i32 = 0;
         const ACTION_UP: i32 = 1;
@@ -5381,6 +5511,7 @@ fn spawn_input_pump(env: &JniEnv) {
                             let _ = keyboard_root(&env, roots, root_class, size_m, get_m);
                         }
                     }
+                    update_ime_focus();
                 }
             }
             if trace_input && input_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
@@ -5444,6 +5575,28 @@ fn spawn_input_pump(env: &JniEnv) {
             if trace_input {
                 let surface = u32::from_le_bytes(buf[0..4].try_into().unwrap());
                 println!("input: received surface={surface} tag={tag} a={a} b={b}");
+            }
+            if tag == 8 || tag == 10 || tag == 11 {
+                let mut text = String::new();
+                if tag == 8 {
+                    let length = a.max(0.0) as usize;
+                    let mut bytes = vec![0u8; length];
+                    let Some(read_text) = read_text else { continue };
+                    let read = unsafe { read_text(bytes.as_mut_ptr(), length as u32) };
+                    if read < 0 || read as usize != length { continue; }
+                    text = String::from_utf8_lossy(&bytes).into_owned();
+                }
+                let mode = if tag == 10 {
+                    2
+                } else if tag == 11 {
+                    3 + a as i32
+                } else if b != 0.0 {
+                    1
+                } else {
+                    0
+                };
+                IME_TEXT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).push_back((text, mode));
+                continue;
             }
             // Mouse wheel: Wayland's axis value is positive when scrolling down,
             // while `MotionEvent.AXIS_VSCROLL` is positive when scrolling up, so
@@ -6045,6 +6198,349 @@ fn trace_key_target(env: &JniEnv, root: JObject, root_class: JClass) {
     })();
 }
 
+/// Apply the host status-bar/cutout height once per root View. Lipstick draws
+/// the bar; Android still needs an explicit inset because the gralloc surface
+/// remains full-screen. Zero disables the inset for non-Lipstick hosts.
+fn apply_statusbar_insets(env: &JniEnv, root: JObject) -> Option<()> {
+    let height = std::env::var("PENGUDROID_STATUSBAR_HEIGHT").ok()
+        .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0);
+    if height <= 0 { return Some(()); }
+    let root_class = env.find_class("android/view/ViewRootImpl")?;
+    let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+    let view = env.object_field(root, m_view);
+    if view.is_null() { return None; }
+    let view_class = env.find_class("android/view/View")?;
+    let dispatch = env.method_id(
+        view_class,
+        "dispatchApplyWindowInsets",
+        "(Landroid/view/WindowInsets;)Landroid/view/WindowInsets;",
+    )?;
+    let insets_class = env.find_class("android/graphics/Insets")?;
+    let of = env.static_method_id(
+        insets_class, "of", "(IIII)Landroid/graphics/Insets;",
+    )?;
+    let insets = env.call_static_object(insets_class, of, &[
+        JValue { i: 0 }, JValue { i: height }, JValue { i: 0 }, JValue { i: 0 },
+    ])?;
+    let types = env.find_class("android/view/WindowInsets$Type")?;
+    let status = env.static_method_id(types, "statusBars", "()I")?;
+    let status = env.call_static_int(types, status, &[])?;
+    let (_, builder) = new_instance(env, "android/view/WindowInsets$Builder")?;
+    let builder_class = env.find_class("android/view/WindowInsets$Builder")?;
+    let set = env.method_id(
+        builder_class,
+        "setInsets",
+        "(ILandroid/graphics/Insets;)Landroid/view/WindowInsets$Builder;",
+    )?;
+    let builder = env.call_object(builder, set, &[JValue { i: status }, JValue { l: insets }])?;
+    let build = env.method_id(builder_class, "build", "()Landroid/view/WindowInsets;")?;
+    let window_insets = env.call_object(builder, build, &[])?;
+    env.call_object(view, dispatch, &[JValue { l: window_insets }])?;
+    println!("apphost: applied status-bar inset {height}px");
+    Some(())
+}
+
+/// Deliver Maliit text through the focused View's real InputConnection.
+/// mode: 0=commitText, 1=setComposingText, 2=finishComposingText.
+fn deliver_input_connection_text(env: &JniEnv, root: JObject, text: &str, mode: i32) -> Option<()> {
+    let root_class = env.find_class("android/view/ViewRootImpl")?;
+    let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+    let view = env.object_field(root, m_view);
+    if view.is_null() { return None; }
+    let view_class = env.find_class("android/view/View")?;
+    let find_focus = env.method_id(view_class, "findFocus", "()Landroid/view/View;")?;
+    let focused = env.call_object(view, find_focus, &[])?;
+    if focused.is_null() { return None; }
+    let editor_class = env.find_class("android/view/inputmethod/EditorInfo")?;
+    let (_, editor) = new_instance(env, "android/view/inputmethod/EditorInfo")?;
+    let create = env.method_id(
+        view_class,
+        "onCreateInputConnection",
+        "(Landroid/view/inputmethod/EditorInfo;)Landroid/view/inputmethod/InputConnection;",
+    )?;
+    let connection = env.call_object(focused, create, &[JValue { l: editor }])?;
+    if connection.is_null() { return None; }
+    let connection_class = env.find_class("android/view/inputmethod/InputConnection")?;
+    if mode == 2 {
+        let finish = env.method_id(connection_class, "finishComposingText", "()Z")?;
+        env.call_boolean(connection, finish, &[])?;
+        return Some(());
+    }
+    let (method, signature) = if mode == 1 {
+        ("setComposingText", "(Ljava/lang/CharSequence;I)Z")
+    } else {
+        ("commitText", "(Ljava/lang/CharSequence;I)Z")
+    };
+    let method = env.method_id(connection_class, method, signature)?;
+    let text = env.new_string(text);
+    env.call_boolean(connection, method, &[JValue { l: text }, JValue { i: 1 }])?;
+    Some(())
+}
+
+/// Opt-in network diagnostic using the app's real Android context and runtime.
+/// Only fixed public endpoint metadata is logged, never application traffic.
+fn run_android_network_smoke(env: &JniEnv, root: JObject) -> Option<()> {
+    let root_class = env.find_class("android/view/ViewRootImpl")?;
+    let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+    let view = env.object_field(root, m_view);
+    let view_class = env.find_class("android/view/View")?;
+    let get_context = env.method_id(view_class, "getContext", "()Landroid/content/Context;")?;
+    let context = env.call_object(view, get_context, &[])?;
+    let context = env.new_global_ref(context)? as usize;
+    let vm = env.get_java_vm()? as usize;
+    std::thread::spawn(move || {
+        let Some(env) = attach_current_thread(vm as *mut c_void) else {
+            eprintln!("network-smoke: cannot attach diagnostic thread");
+            return;
+        };
+        let context = context as JObject;
+        let _frame = env.local_frame(96);
+
+        let connected = (|| -> Option<(bool, bool)> {
+            let context_class = env.find_class("android/content/Context")?;
+            let get_service = env.method_id(
+                context_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;",
+            )?;
+            let manager = env.call_object(context, get_service, &[
+                JValue { l: env.new_string("connectivity") },
+            ])?;
+            let manager_class = env.find_class("android/net/ConnectivityManager")?;
+            let active = env.method_id(manager_class, "getActiveNetwork", "()Landroid/net/Network;")?;
+            let network = env.call_object(manager, active, &[])?;
+            if network.is_null() { return None; }
+            let get_caps = env.method_id(
+                manager_class,
+                "getNetworkCapabilities",
+                "(Landroid/net/Network;)Landroid/net/NetworkCapabilities;",
+            )?;
+            let caps = env.call_object(manager, get_caps, &[JValue { l: network }])?;
+            if caps.is_null() { return None; }
+            let caps_class = env.find_class("android/net/NetworkCapabilities")?;
+            let has = env.method_id(caps_class, "hasCapability", "(I)Z")?;
+            let internet = env.call_boolean(caps, has, &[JValue { i: 12 }])?;
+            let validated = env.call_boolean(caps, has, &[JValue { i: 16 }])?;
+            Some((internet, validated))
+        })();
+        match connected {
+            Some((internet, validated)) => println!(
+                "network-smoke: active network, INTERNET={internet}, VALIDATED={validated}"
+            ),
+            None => eprintln!("network-smoke: no usable active network/capabilities"),
+        }
+
+        let dns = (|| -> Option<()> {
+            let inet = env.find_class("java/net/InetAddress")?;
+            let resolve = env.static_method_id(
+                inet, "getByName", "(Ljava/lang/String;)Ljava/net/InetAddress;",
+            )?;
+            let address = env.call_static_object(inet, resolve, &[
+                JValue { l: env.new_string("example.com") },
+            ])?;
+            (!address.is_null()).then_some(())
+        })();
+        if dns.is_some() {
+            println!("network-smoke: DNS resolution passed");
+        } else {
+            eprintln!("network-smoke: DNS resolution failed");
+        }
+
+        let https = (|| -> Option<i32> {
+            let url_class = env.find_class("java/net/URL")?;
+            let url_ctor = env.method_id(url_class, "<init>", "(Ljava/lang/String;)V")?;
+            let url = env.new_object(url_class, url_ctor, &[
+                JValue { l: env.new_string("https://www.google.com/generate_204") },
+            ])?;
+            let open = env.method_id(url_class, "openConnection", "()Ljava/net/URLConnection;")?;
+            let connection = env.call_object(url, open, &[])?;
+            let http = env.find_class("java/net/HttpURLConnection")?;
+            let set_connect = env.method_id(http, "setConnectTimeout", "(I)V")?;
+            let set_read = env.method_id(http, "setReadTimeout", "(I)V")?;
+            if !env.call_void(connection, set_connect, &[JValue { i: 10_000 }])
+                || !env.call_void(connection, set_read, &[JValue { i: 10_000 }])
+            {
+                return None;
+            }
+            let response = env.method_id(http, "getResponseCode", "()I")?;
+            let status = env.call_int(connection, response, &[]);
+            let disconnect = env.method_id(http, "disconnect", "()V")?;
+            env.call_void(connection, disconnect, &[]);
+            status
+        })();
+        match https {
+            Some(status) if (200..400).contains(&status) => {
+                println!("network-smoke: HTTPS request passed (status {status})")
+            }
+            Some(status) => eprintln!("network-smoke: HTTPS returned status {status}"),
+            None => eprintln!("network-smoke: HTTPS request failed"),
+        }
+        env.delete_global_ref(context);
+    });
+    Some(())
+}
+
+/// Opt-in device smoke test through the real Android ClipboardManager API.
+/// It exercises IClipboard set/get and the Wayland source/offer path without
+/// changing ordinary app behavior or logging clipboard contents.
+fn run_android_clipboard_smoke(env: &JniEnv, root: JObject) -> Option<()> {
+    let root_class = env.find_class("android/view/ViewRootImpl")?;
+    let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+    let view = env.object_field(root, m_view);
+    let view_class = env.find_class("android/view/View")?;
+    let get_context = env.method_id(view_class, "getContext", "()Landroid/content/Context;")?;
+    let context = env.call_object(view, get_context, &[])?;
+    let context_class = env.find_class("android/content/Context")?;
+    let get_service = env.method_id(
+        context_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;",
+    )?;
+    let name = env.new_string("clipboard");
+    let manager = env.call_object(context, get_service, &[JValue { l: name }])?;
+    if manager.is_null() { return None; }
+    let clip_class = env.find_class("android/content/ClipData")?;
+    let new_plain = env.static_method_id(
+        clip_class,
+        "newPlainText",
+        "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
+    )?;
+    let label = env.new_string("test");
+    let text = env.new_string("123");
+    let clip = env.call_static_object(clip_class, new_plain, &[JValue { l: label }, JValue { l: text }])?;
+    let manager_class = env.find_class("android/content/ClipboardManager")?;
+    let set = env.method_id(manager_class, "setPrimaryClip", "(Landroid/content/ClipData;)V")?;
+    if !env.call_void(manager, set, &[JValue { l: clip }]) { return None; }
+    let get = env.method_id(manager_class, "getPrimaryClip", "()Landroid/content/ClipData;")?;
+    let returned = env.call_object(manager, get, &[])?;
+    if returned.is_null() { return None; }
+    let get_item = env.method_id(clip_class, "getItemAt", "(I)Landroid/content/ClipData$Item;")?;
+    let item = env.call_object(returned, get_item, &[JValue { i: 0 }])?;
+    let item_class = env.find_class("android/content/ClipData$Item")?;
+    let get_text = env.method_id(item_class, "getText", "()Ljava/lang/CharSequence;")?;
+    let value = env.call_object(item, get_text, &[])?;
+    let char_sequence = env.find_class("java/lang/CharSequence")?;
+    let to_string = env.method_id(char_sequence, "toString", "()Ljava/lang/String;")?;
+    let value = env.call_object(value, to_string, &[])?;
+    if env.get_string(value).as_deref() != Some("123") { return None; }
+    println!("apphost: Android ClipboardManager roundtrip passed");
+    Some(())
+}
+
+/// Execute Maliit Copy/Cut/Paste on the focused Android editor on main thread.
+/// Only lengths and technical errors are logged, never clipboard contents.
+fn handle_clipboard_action(env: &JniEnv, root: JObject, action: u8) -> Option<()> {
+    let root_class = env.find_class("android/view/ViewRootImpl")?;
+    let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+    let view = env.object_field(root, m_view);
+    if view.is_null() { return None; }
+    let view_class = env.find_class("android/view/View")?;
+    let find_focus = env.method_id(view_class, "findFocus", "()Landroid/view/View;")?;
+    let focused = env.call_object(view, find_focus, &[])?;
+    if focused.is_null() { return None; }
+    if action == 2 {
+        let get = shim_symbol("pengudroid_clipboard_get_text")?;
+        let get: unsafe extern "C" fn(*mut u8, usize) -> i32 = unsafe { std::mem::transmute(get) };
+        let length = unsafe { get(std::ptr::null_mut(), 0) };
+        if length < 0 { return None; }
+        let mut bytes = vec![0u8; length as usize];
+        let read = unsafe { get(bytes.as_mut_ptr(), bytes.len()) };
+        if read != length { return None; }
+        let text = String::from_utf8(bytes).ok()?;
+        return deliver_input_connection_text(env, root, &text, 0);
+    }
+    if action > 1 { return None; }
+    let text_view = env.find_class("android/widget/TextView")?;
+    let (get_start, get_end, get_text) = (
+        env.method_id(text_view, "getSelectionStart", "()I"),
+        env.method_id(text_view, "getSelectionEnd", "()I"),
+        env.method_id(text_view, "getText", "()Ljava/lang/CharSequence;"),
+    );
+    let (Some(get_start), Some(get_end), Some(get_text)) = (get_start, get_end, get_text)
+    else { return None };
+    let start = env.call_int(focused, get_start, &[])?;
+    let end = env.call_int(focused, get_end, &[])?;
+    if start < 0 || end < 0 || start == end { return None; }
+    let text = env.call_object(focused, get_text, &[])?;
+    if text.is_null() { return None; }
+    let char_sequence = env.find_class("java/lang/CharSequence")?;
+    let sub = env.method_id(char_sequence, "subSequence", "(II)Ljava/lang/CharSequence;")?;
+    let selected = env.call_object(text, sub, &[
+        JValue { i: start.min(end) }, JValue { i: start.max(end) },
+    ])?;
+    let to_string = env.method_id(char_sequence, "toString", "()Ljava/lang/String;")?;
+    let selected = env.call_object(selected, to_string, &[])?;
+    let selected = env.get_string(selected)?;
+    let set = shim_symbol("pengudroid_clipboard_set_text")?;
+    let set: unsafe extern "C" fn(*const u8, usize) -> i32 = unsafe { std::mem::transmute(set) };
+    if unsafe { set(selected.as_ptr(), selected.len()) } != 1 { return None; }
+    println!("apphost: clipboard {} ({} bytes)", if action == 0 { "copy" } else { "cut" }, selected.len());
+    if action == 1 {
+        deliver_input_connection_text(env, root, "", 0)?;
+    }
+    Some(())
+}
+
+/// Text events are written by the input pump but applied only by the main
+/// Looper thread. Calling InputConnection from the pump races DynamicLayout.
+static IME_TEXT_EVENTS: std::sync::Mutex<std::collections::VecDeque<(String, i32)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static STATUSBAR_INSET_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CLIPBOARD_SMOKE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static NETWORK_SMOKE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn drain_ime_text_events(env: &JniEnv) {
+    loop {
+        let Some((text, mode)) = IME_TEXT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+        else { break };
+        let Some(_frame) = env.local_frame(64) else { break };
+        let Some(root) = current_keyboard_root(env) else { continue };
+        if mode >= 3 {
+            let _ = handle_clipboard_action(env, root, (mode - 3) as u8);
+            continue;
+        }
+        if deliver_input_connection_text(env, root, &text, mode).is_some() && mode == 0 {
+            println!("apphost: committed IME text on main thread ({} bytes)", text.len());
+        }
+    }
+}
+
+fn current_keyboard_root(env: &JniEnv) -> Option<JObject> {
+    let wmg_class = env.find_class("android/view/WindowManagerGlobal")?;
+    let get_instance = env.static_method_id(
+        wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;",
+    )?;
+    let wmg = env.call_static_object(wmg_class, get_instance, &[])?;
+    let roots_field = env.field_id(wmg_class, "mRoots", "Ljava/util/ArrayList;")?;
+    let roots = env.object_field(wmg, roots_field);
+    if roots.is_null() { return None; }
+    let list_class = env.find_class("java/util/ArrayList")?;
+    let size = env.method_id(list_class, "size", "()I")?;
+    let get = env.method_id(list_class, "get", "(I)Ljava/lang/Object;")?;
+    let root_class = env.find_class("android/view/ViewRootImpl")?;
+    keyboard_root(env, roots, root_class, size, get)
+}
+
+/// Apply opt-in View-mutating diagnostics only on the main Looper thread.
+fn apply_deferred_window_updates(env: &JniEnv) {
+    use std::sync::atomic::Ordering;
+    if !STATUSBAR_INSET_PENDING.load(Ordering::Acquire)
+        && !CLIPBOARD_SMOKE_PENDING.load(Ordering::Acquire)
+        && !NETWORK_SMOKE_PENDING.load(Ordering::Acquire)
+    {
+        return;
+    }
+    let Some(root) = current_keyboard_root(env) else { return };
+    if STATUSBAR_INSET_PENDING.swap(false, Ordering::AcqRel) {
+        let _ = apply_statusbar_insets(env, root);
+    }
+    if CLIPBOARD_SMOKE_PENDING.swap(false, Ordering::AcqRel) {
+        let _ = run_android_clipboard_smoke(env, root);
+    }
+    if NETWORK_SMOKE_PENDING.swap(false, Ordering::AcqRel) {
+        let _ = run_android_network_smoke(env, root);
+    }
+}
+
 fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
     size: JMethodId, get: JMethodId) -> Option<JObject> {
     let view_class = env.find_class("android/view/View")?;
@@ -6103,6 +6599,63 @@ fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
 /// way to observe `performDraw` from the outside is to read the fields it
 /// mutates. `mAttachInfo.mDrawingTime` is written by `ViewRootImpl.draw()`, so a
 /// non-zero value proves the draw path was entered.
+fn dump_main_java_stack(env: &JniEnv) {
+    let _frame = env.local_frame(128);
+    // Do not use Thread.getAllStackTraces here. It suspends every Java thread;
+    // while RenderThread is blocked in native HWUI initialization that request
+    // can itself wait forever and hides the very stack we need. The main Looper
+    // exposes its Thread directly, so only that thread needs inspecting.
+    let Some(looper_class) = env.find_class("android/os/Looper") else {
+        return;
+    };
+    let Some(get_main) = env.static_method_id(looper_class, "getMainLooper", "()Landroid/os/Looper;") else {
+        return;
+    };
+    let Some(looper) = env.call_static_object(looper_class, get_main, &[]) else {
+        return;
+    };
+    if looper.is_null() {
+        return;
+    }
+    let Some(get_thread) = env.method_id(looper_class, "getThread", "()Ljava/lang/Thread;") else {
+        return;
+    };
+    let Some(thread) = env.call_object(looper, get_thread, &[]) else {
+        return;
+    };
+    if thread.is_null() {
+        return;
+    }
+    let Some(thread_class) = env.find_class("java/lang/Thread") else {
+        return;
+    };
+    let Some(get_stack) = env.method_id(thread_class, "getStackTrace", "()[Ljava/lang/StackTraceElement;") else {
+        return;
+    };
+    let Some(frames) = env.call_object(thread, get_stack, &[]) else {
+        return;
+    };
+    let Some(element_class) = env.find_class("java/lang/StackTraceElement") else {
+        return;
+    };
+    let Some(to_string) = env.method_id(element_class, "toString", "()Ljava/lang/String;") else {
+        return;
+    };
+    println!("apphost: Java stack for main");
+    for index in 0..env.array_length(frames).min(64) {
+        let frame = env.array_get(frames, index);
+        if frame.is_null() {
+            continue;
+        }
+        if let Some(line) = env
+            .call_object(frame, to_string, &[])
+            .and_then(|line| env.get_string(line))
+        {
+            println!("apphost:   at {line}");
+        }
+    }
+}
+
 fn spawn_draw_monitor(env: &JniEnv) {
     if std::env::var_os("PENGUDROID_TRACE_DRAW").is_none() {
         return;
@@ -6118,6 +6671,15 @@ fn spawn_draw_monitor(env: &JniEnv) {
             eprintln!("apphost: draw monitor: attach failed");
             return;
         };
+        if std::env::var_os("PENGUDROID_TRACE_RENDER_NATIVE").is_some() {
+            if let Some(dump) = shim_symbol("__pengudroid_dump_native_thread") {
+                let install: unsafe extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(dump) };
+                // ART installs its unexpected-signal handlers during VM startup.
+                // Reinstall our non-fatal probe afterwards, on the monitor
+                // thread, so SIGSTKFLT does not become an ART fatal signal.
+                unsafe { install(0); }
+            }
+        }
         let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
             return;
         };
@@ -6165,6 +6727,9 @@ fn spawn_draw_monitor(env: &JniEnv) {
         let mut last = String::new();
         for tick in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            if tick == 4 {
+                dump_main_java_stack(&env);
+            }
             let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
                 continue;
             };
@@ -6298,6 +6863,70 @@ fn loaded_apk_application_info(env: &JniEnv, loaded_apk: JObject) -> JObject {
 /// This is what `system_server` triggers with `scheduleLaunchActivity`; calling
 /// it directly skips the parcel and the binder round trip, which is the same
 /// shortcut `--bind-app` takes for `handleBindApplication`.
+fn preload_activity_class(env: &JniEnv, loaded_apk: JObject, activity_name: &str) -> bool {
+    let Some(apk_class) = env.find_class("android/app/LoadedApk") else {
+        return false;
+    };
+    let Some(get_loader) = env.method_id(
+        apk_class,
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+    ) else {
+        return false;
+    };
+    let loader = env.call_object(loaded_apk, get_loader, &[]).unwrap_or(std::ptr::null_mut());
+    if loader.is_null() {
+        eprintln!("apphost: LoadedApk.getClassLoader() is null before Activity launch");
+        return false;
+    }
+    let Some(loader_class) = env.find_class("java/lang/ClassLoader") else {
+        return false;
+    };
+    let Some(load) = env.method_id(
+        loader_class,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+    ) else {
+        return false;
+    };
+    println!("apphost: preloading Activity class {activity_name}");
+    let name = env.new_string(activity_name);
+    match env.call_object(loader, load, &[JValue { l: name }]) {
+        Some(class) if !class.is_null() => {
+            println!("apphost: Activity class loaded successfully");
+            if std::env::var_os("PENGUDROID_PROBE_ACTIVITY_INSTANCE").is_some() {
+                let Some(class_class) = env.find_class("java/lang/Class") else {
+                    return false;
+                };
+                let Some(new_instance) = env.method_id(
+                    class_class,
+                    "newInstance",
+                    "()Ljava/lang/Object;",
+                ) else {
+                    return false;
+                };
+                println!("apphost: probing Class.newInstance for {activity_name}");
+                match env.call_object(class, new_instance, &[]) {
+                    Some(instance) if !instance.is_null() => {
+                        println!("apphost: Activity constructor probe returned");
+                    }
+                    _ => {
+                        env.describe_exception();
+                        eprintln!("apphost: Activity constructor probe failed");
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        _ => {
+            env.describe_exception();
+            eprintln!("apphost: could not load Activity class {activity_name}");
+            false
+        }
+    }
+}
+
 fn launch_activity(
     env: &JniEnv,
     thread: JObject,
@@ -6321,6 +6950,9 @@ fn launch_activity(
     let loaded_apk = env.object_field(data, info_field);
     if loaded_apk.is_null() {
         eprintln!("apphost: cannot launch an Activity before the app is bound");
+        return false;
+    }
+    if !preload_activity_class(env, loaded_apk, activity_name) {
         return false;
     }
     let app_info = loaded_apk_application_info(env, loaded_apk);
@@ -6532,9 +7164,8 @@ fn launch_hosted_activity(
     }
     // `Activity.attach` passes `(info.flags & ActivityInfo.FLAG_HARDWARE_ACCELERATED)
     // != 0` to `Window.setWindowManager`, and that is what puts
-    // `FLAG_HARDWARE_ACCELERATED` on the window attributes — without it
-    // `ViewRootImpl.enableHardwareAcceleration` never creates a renderer and
-    // nothing is drawn.
+    // `FLAG_HARDWARE_ACCELERATED` on the window attributes. Software-activity
+    // diagnostics deliberately clear it to use the software Canvas path.
     if let Some(id) = env.field_id(ai_class, "flags", "I") {
         // `ActivityInfo.FLAG_HARDWARE_ACCELERATED` is 0x200 in this build
         // (read out with `--dump-class`).
@@ -6594,6 +7225,97 @@ fn launch_hosted_activity(
     let (_, token) = new_instance(env, "android/os/Binder")?;
     set("token", "Landroid/os/IBinder;", token);
     let registration = register_activity_token(env, token)?;
+    if std::env::var_os("PENGUDROID_PROBE_ACTIVITY_CONTEXT").is_some() {
+        let Some(context_class) = env.find_class("android/app/ContextImpl") else {
+            return None;
+        };
+        let Some(create) = env.static_method_id(
+            context_class,
+            "createActivityContext",
+            "(Landroid/app/ActivityThread;Landroid/app/LoadedApk;Landroid/content/pm/ActivityInfo;Landroid/os/IBinder;ILandroid/content/res/Configuration;)Landroid/app/ContextImpl;",
+        ) else {
+            eprintln!("apphost: ContextImpl.createActivityContext contract missing");
+            return None;
+        };
+        println!("apphost: probing ContextImpl.createActivityContext");
+        let context = env.call_static_object(
+            context_class,
+            create,
+            &[
+                JValue { l: thread },
+                JValue { l: loaded_apk },
+                JValue { l: activity_info },
+                JValue { l: token },
+                JValue { i: 0 },
+                JValue { l: std::ptr::null_mut() },
+            ],
+        );
+        match context {
+            Some(context) if !context.is_null() => {
+                println!("apphost: createActivityContext probe returned");
+                let Some(get_loader) = env.method_id(
+                    context_class,
+                    "getClassLoader",
+                    "()Ljava/lang/ClassLoader;",
+                ) else {
+                    return None;
+                };
+                let loader = env.call_object(context, get_loader, &[])
+                    .unwrap_or(std::ptr::null_mut());
+                if loader.is_null() {
+                    eprintln!("apphost: activity context returned a null classloader");
+                    return None;
+                }
+                println!("apphost: activity context classloader returned");
+                let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
+                    return None;
+                };
+                let Some(instrumentation_field) = env.field_id(
+                    thread_class,
+                    "mInstrumentation",
+                    "Landroid/app/Instrumentation;",
+                ) else {
+                    return None;
+                };
+                let instrumentation = env.object_field(thread, instrumentation_field);
+                let Some(instrumentation_class) = env.find_class("android/app/Instrumentation") else {
+                    return None;
+                };
+                let Some(new_activity) = env.method_id(
+                    instrumentation_class,
+                    "newActivity",
+                    "(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Intent;)Landroid/app/Activity;",
+                ) else {
+                    return None;
+                };
+                let name = env.new_string(activity_name);
+                println!("apphost: probing Instrumentation.newActivity");
+                match env.call_object(
+                    instrumentation,
+                    new_activity,
+                    &[
+                        JValue { l: loader },
+                        JValue { l: name },
+                        JValue { l: intent },
+                    ],
+                ) {
+                    Some(activity) if !activity.is_null() => {
+                        println!("apphost: Instrumentation.newActivity probe returned");
+                    }
+                    _ => {
+                        env.describe_exception();
+                        eprintln!("apphost: Instrumentation.newActivity probe failed");
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                env.describe_exception();
+                eprintln!("apphost: createActivityContext probe failed");
+                return None;
+            }
+        }
+    }
     // The activity gets its own `Resources`, built from this override
     // configuration. Leaving it null makes `ResourcesManager` fall back to a
     // bare `Configuration` whose locale list is null, and
@@ -6629,14 +7351,55 @@ fn launch_hosted_activity(
     let args = [JValue { l: record }, JValue { l: pending },
         JValue { i: 0 }, // Context.DEVICE_ID_DEFAULT
         JValue { l: std::ptr::null_mut() }];
-    println!("apphost: calling handleLaunchActivity for {activity_name}");
-    match env.call_object(thread, handle, &args) {
+    let direct_perform = std::env::var_os("PENGUDROID_HANDLE_LAUNCH_ACTIVITY").is_none()
+        && (cfg!(target_arch = "aarch64")
+            || std::env::var_os("PENGUDROID_DIRECT_PERFORM_LAUNCH").is_some());
+    let activity = if direct_perform {
+        // The full handleLaunchActivity prefix hangs in this ARM64 framework's
+        // GraphicsEnvironment.hintActivityLaunch path. performLaunchActivity is
+        // the framework's own next step and preserves the real Activity attach
+        // and lifecycle. Keep WindowManagerGlobal initialization. Renderer
+        // preload is opt-in: it reproduces the same stuck launch on AArch64.
+        if let Some(window_global) = env.find_class("android/view/WindowManagerGlobal") {
+            if let Some(initialize) = env.static_method_id(window_global, "initialize", "()V") {
+                env.call_static_void(window_global, initialize, &[]);
+            }
+        }
+        if let Some(renderer) = env.find_class("android/view/ThreadedRenderer") {
+            let enabled = env
+                .static_field_id(renderer, "sRendererEnabled", "Z")
+                .map(|field| env.static_boolean_field(renderer, field))
+                .unwrap_or(false);
+            if enabled && std::env::var_os("PENGUDROID_PRELOAD_RENDERER").is_some() {
+                if let Some(hardware) = env.find_class("android/graphics/HardwareRenderer") {
+                    if let Some(preload) = env.static_method_id(hardware, "preload", "()I") {
+                        let result = env.call_static_int(hardware, preload, &[]);
+                        println!("apphost: HardwareRenderer.preload = {result:?}");
+                    }
+                }
+            }
+        }
+        let Some(perform) = env.method_id(
+            thread_class,
+            "performLaunchActivity",
+            "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/content/Intent;)Landroid/app/Activity;",
+        ) else {
+            eprintln!("apphost: ActivityThread.performLaunchActivity contract missing");
+            return None;
+        };
+        println!("apphost: calling performLaunchActivity directly for {activity_name}");
+        env.call_object(thread, perform, &[JValue { l: record }, JValue { l: intent }])
+    } else {
+        println!("apphost: calling handleLaunchActivity for {activity_name}");
+        env.call_object(thread, handle, &args)
+    };
+    match activity {
         Some(activity) if activity.is_null() => {
             eprintln!("apphost: handleLaunchActivity returned null for {activity_name}");
             None
         }
         Some(activity) => {
-            println!("apphost: handleLaunchActivity returned an Activity for {activity_name}");
+            println!("apphost: Activity launch returned for {activity_name}");
             let _ = webview::software_views(env, activity);
             // The device's TransactionExecutor steps ON_CREATE -> ON_START ->
             // ON_RESUME; deliver the missing START step so activities that gate
@@ -6847,12 +7610,28 @@ fn destroy_activity(env: &JniEnv, thread: JObject, thread_class: JClass, record:
 /// framework object is mutated in place through JNI, so the very next traversal
 /// measures against the real surface.
 fn client_window_frame(env: &JniEnv, root_class: JClass, root: JObject) -> Option<JObject> {
-    let field = env.field_id(root_class, "mClientWindowFrames", "Landroid/window/ClientWindowFrames;")?;
-    let frames = env.object_field(root, field);
-    if frames.is_null() { return None; }
-    let class = env.find_class("android/window/ClientWindowFrames")?;
-    let frame = env.field_id(class, "frame", "Landroid/graphics/Rect;")?;
-    let rect = env.object_field(frames, frame);
+    if let Some(field) = env.field_id(root_class, "mClientWindowFrames", "Landroid/window/ClientWindowFrames;") {
+        let frames = env.object_field(root, field);
+        if !frames.is_null() {
+            if let Some(class) = env.find_class("android/window/ClientWindowFrames") {
+                if let Some(frame) = env.field_id(class, "frame", "Landroid/graphics/Rect;") {
+                    let rect = env.object_field(frames, frame);
+                    if !rect.is_null() {
+                        return Some(rect);
+                    }
+                }
+            }
+        }
+    } else {
+        // This framework moved the public shape to mWinFrame. A diagnostic
+        // lookup must not poison scheduleTraversals with NoSuchFieldError.
+        env.exception_clear();
+    }
+    if env.exception_check() {
+        env.exception_clear();
+    }
+    let field = env.field_id(root_class, "mWinFrame", "Landroid/graphics/Rect;")?;
+    let rect = env.object_field(root, field);
     (!rect.is_null()).then_some(rect)
 }
 
@@ -6867,7 +7646,7 @@ fn force_window_frame(env: &JniEnv, root: JObject, width: i32, height: i32) {
 
     let target = client_window_frame(env, root_class, root);
     let Some(rect) = target.filter(|r| !r.is_null()) else {
-        eprintln!("apphost: Android 17 ViewRootImpl.mClientWindowFrames.frame is unavailable");
+        eprintln!("apphost: ViewRootImpl window frame is unavailable");
         return;
     };
     let Some(set) = set else {
@@ -6955,6 +7734,7 @@ fn schedule_roots_dump(env: &JniEnv) {
                 int("mWidth", root),
                 int("mHeight", root),
             );
+            dump_draw_state(&env, root, i as usize);
         }
     });
 }
@@ -7013,6 +7793,23 @@ fn dump_draw_state(env: &JniEnv, root: JObject, index: usize) {
     let Some(attach_class) = env.find_class("android/view/View$AttachInfo") else {
         return;
     };
+    for (name, signature) in [("mHardwareAccelerated", "Z"), ("mHardwareAccelerationRequested", "Z")] {
+        if let Some(field) = env.field_id(attach_class, name, signature) {
+            println!("apphost: root {index} {name} = {}", env.boolean_field(attach, field));
+        }
+    }
+    if let Some(attributes_field) = env.field_id(
+        root_class,
+        "mWindowAttributes",
+        "Landroid/view/WindowManager$LayoutParams;",
+    ) {
+        let attributes = env.object_field(root, attributes_field);
+        if let Some(attributes_class) = env.find_class("android/view/WindowManager$LayoutParams") {
+            if let Some(flags) = env.field_id(attributes_class, "flags", "I") {
+                println!("apphost: root {index} window flags = {:#x}", env.int_field(attributes, flags));
+            }
+        }
+    }
     if let Some(f) = env.field_id(attach_class, "mThreadedRenderer", "Landroid/view/ThreadedRenderer;") {
         let renderer = env.object_field(attach, f);
         println!(
@@ -7027,6 +7824,14 @@ fn dump_draw_state(env: &JniEnv, root: JObject, index: usize) {
                     println!(
                         "apphost: root {index} mThreadedRenderer.isEnabled() = {:?}",
                         env.call_boolean(renderer, is_enabled, &[])
+                    );
+                }
+            }
+            if let Some(hardware_class) = env.find_class("android/graphics/HardwareRenderer") {
+                if let Some(native_proxy) = env.field_id(hardware_class, "mNativeProxy", "J") {
+                    println!(
+                        "apphost: root {index} renderer native proxy = {:#x}",
+                        env.long_field(renderer, native_proxy)
                     );
                 }
             }
@@ -7336,6 +8141,30 @@ fn surface_window(env: &JniEnv, root_class: JClass, root: JObject, index: usize)
             }
         }
     }
+    // A relayout reply without WindowManager visibility state can leave the
+    // root GONE even after its window and app are visible. In that state the
+    // first traversal never completes and mFirst/drawingTime never change.
+    if let Some(field) = env.field_id(root_class, "mViewVisibility", "I") {
+        env.set_int_field(root, field, 0);
+    }
+    if let Some(field) = env.field_id(root_class, "mFullRedrawNeeded", "Z") {
+        env.set_boolean_field(root, field, true);
+    }
+    // There is no WindowManager to complete the sync transaction started by
+    // reportNextDraw. Mark this launch's sequence IDs as already reported so
+    // performDraw does not wait forever on mWindowDrawCountDown.
+    for (last, current) in [("mLastSeqId", "mSeqId"), ("mLastSyncSeqId", "mSyncSeqId")] {
+        if let (Some(last_field), Some(current_field)) = (
+            env.field_id(root_class, last, "I"),
+            env.field_id(root_class, current, "I"),
+        ) {
+            let value = env.int_field(root, current_field);
+            env.set_int_field(root, last_field, value);
+        }
+    }
+    if let Some(field) = env.field_id(root_class, "mReportNextDraw", "Z") {
+        env.set_boolean_field(root, field, false);
+    }
     force_window_frame(env, root, surface_w(), surface_h());
     dump_draw_state(env, root, index as usize);
     schedule_roots_dump(env);
@@ -7348,6 +8177,25 @@ fn surface_window(env: &JniEnv, root_class: JClass, root: JObject, index: usize)
         println!("apphost: scheduleTraversals() done for root {index}");
     } else {
         eprintln!("apphost: scheduleTraversals threw for root {index}");
+    }
+    if std::env::var_os("PENGUDROID_FORCE_TRAVERSAL").is_some() {
+        if let Some(vm) = env.get_java_vm() {
+            let vm = vm as usize;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if let Some(env) = attach_current_thread(vm as *mut c_void) {
+                    dump_main_java_stack(&env);
+                }
+            });
+        }
+        if let Some(do_traversal) = env.method_id(root_class, "doTraversal", "(J)V") {
+            println!("apphost: calling doTraversal for root {index}");
+            if env.call_void(root, do_traversal, &[JValue { j: 0 }]) {
+                println!("apphost: doTraversal returned for root {index}");
+            } else {
+                eprintln!("apphost: doTraversal threw for root {index}");
+            }
+        }
     }
 }
 
@@ -9041,6 +9889,45 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, spec: &AppSp
     if let Some(data) = marshal_object(env, app_info, "android/content/pm/ApplicationInfo") {
         install_reply(&data, "__pengudroid_binder_set_application_info");
     }
+    install_install_source_reply(env);
+}
+
+/// Answer PackageManager.getInstallSourceInfo with the APK's hosted origin.
+/// MAX queries this while OneMeApplication is being created; an absent package
+/// reply otherwise becomes NameNotFoundException and aborts application bind.
+fn install_install_source_reply(env: &JniEnv) -> Option<()> {
+    let stub = env.find_class("android/content/pm/IPackageManager$Stub")?;
+    let field = env.static_field_id(stub, "TRANSACTION_getInstallSourceInfo", "I")?;
+    let code = u32::try_from(env.static_int_field(stub, field)).ok()?;
+    let class = env.find_class("android/content/pm/InstallSourceInfo")?;
+    let ctor = env.method_id(
+        class,
+        "<init>",
+        "(Ljava/lang/String;Landroid/content/pm/SigningInfo;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V",
+    )?;
+    let installer = env.new_string("pengudroid");
+    let info = env.new_object(
+        class,
+        ctor,
+        &[
+            JValue { l: std::ptr::null_mut() },
+            JValue { l: std::ptr::null_mut() },
+            JValue { l: std::ptr::null_mut() },
+            JValue { l: installer },
+            JValue { l: std::ptr::null_mut() }, // updateOwnerPackageName
+            JValue { i: 0 }, // PACKAGE_SOURCE_LOCAL_FILE
+        ],
+    )?;
+    let body = marshal_object(env, info, "android/content/pm/InstallSourceInfo")?;
+    let setter = shim_symbol("__pengudroid_binder_set_reply")?;
+    let setter: unsafe extern "C" fn(*const u8, usize, u32, *const u8, usize) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    let service = b"package";
+    if !unsafe { setter(service.as_ptr(), service.len(), code, body.as_ptr(), body.len()) } {
+        return None;
+    }
+    println!("apphost: InstallSourceInfo reply installed (transaction {code})");
+    Some(())
 }
 
 /// Firebase discovers its registrars through ComponentDiscoveryService's
@@ -9826,7 +10713,18 @@ pub fn print_java_props(env: &JniEnv) {
 /// ART reports `NoSuchFieldError` for names that exist in another release's
 /// source; the authoritative answer is what this framework.jar actually has.
 pub fn dump_class(env: &JniEnv, name: &str) {
-    let Some(class) = env.load_class(&name.replace('.', "/")) else {
+    let descriptor = name.replace('.', "/");
+    let class = match env.load_class(&descriptor) {
+        Some(class) => Some(class),
+        None => {
+            // The system loader in the ART-only helper contains the APK but
+            // has no boot-classpath parent. Framework classes remain available
+            // through JNI FindClass, so clear the lookup error and try it.
+            env.exception_clear();
+            env.find_class(&descriptor)
+        }
+    };
+    let Some(class) = class else {
         eprintln!("--dump-class: {name} not found");
         return;
     };

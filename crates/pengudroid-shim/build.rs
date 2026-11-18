@@ -32,6 +32,8 @@ mod vlog;
 mod pathshim;
 #[path = "src/jump.rs"]
 mod jump;
+#[path = "src/jump_aarch64.rs"]
+mod jump_aarch64;
 #[path = "src/syscall_paths.rs"]
 mod syscall_paths;
 
@@ -47,18 +49,59 @@ fn main() {
     println!("cargo:rerun-if-changed=src/vlog.rs");
     println!("cargo:rerun-if-changed=src/pathshim.rs");
     println!("cargo:rerun-if-changed=src/jump.rs");
+    println!("cargo:rerun-if-changed=src/jump_aarch64.rs");
     println!("cargo:rerun-if-changed=src/syscall_paths.rs");
 }
 
+fn bionic_pthread_symbols() -> &'static [&'static str] {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
+        return &[];
+    }
+    &[
+        "pthread_mutex_lock",
+        "pthread_mutex_unlock",
+        "pthread_mutex_trylock",
+        "pthread_mutex_destroy",
+        "pthread_mutex_init",
+        "pthread_cond_wait",
+        "pthread_cond_timedwait",
+        "pthread_cond_clockwait",
+        "pthread_attr_init",
+        "pthread_attr_destroy",
+        "pthread_create",
+    ]
+}
+
+fn host_pthread_symbols() -> &'static [&'static str] {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
+        return &[];
+    }
+    &[
+        "__pengudroid_host_pthread_mutex_lock",
+        "__pengudroid_host_pthread_mutex_unlock",
+        "__pengudroid_host_pthread_mutex_trylock",
+        "__pengudroid_host_pthread_mutex_destroy",
+        "__pengudroid_host_pthread_mutex_init",
+        "__pengudroid_host_pthread_cond_wait",
+        "__pengudroid_host_pthread_cond_timedwait",
+        "__pengudroid_host_pthread_cond_clockwait",
+        "__pengudroid_host_pthread_attr_init",
+        "__pengudroid_host_pthread_attr_destroy",
+        "__pengudroid_host_pthread_create",
+    ]
+}
+
 fn jump_symbols() -> &'static [&'static str] {
-    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
-        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+    let gnu_linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
-        && std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64")
-    {
-        jump::SYMBOLS
-    } else {
-        &[]
+        && std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64");
+    if !gnu_linux {
+        return &[];
+    }
+    match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => jump::SYMBOLS,
+        Ok("aarch64") => jump_aarch64::SYMBOLS,
+        _ => &[],
     }
 }
 
@@ -68,20 +111,27 @@ fn compile_jump_shim(out_dir: &PathBuf) {
     if jump_symbols().is_empty() {
         return;
     }
-    let source = out_dir.join("jump.S");
-    let object = out_dir.join("jump.o");
-    std::fs::write(&source, jump::ASSEMBLY).expect("write jump assembly");
+    let aarch64 = std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64");
+    let source = out_dir.join(if aarch64 { "jump_aarch64.S" } else { "jump.S" });
+    let object = out_dir.join(if aarch64 { "jump_aarch64.o" } else { "jump.o" });
+    std::fs::write(
+        &source,
+        if aarch64 { jump_aarch64::ASSEMBLY } else { jump::ASSEMBLY },
+    )
+    .expect("write jump boundary");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let status = Command::new(cc)
-        .args(["-c", "-fPIC", "-x", "assembler-with-cpp"])
+    let mut command = Command::new(cc);
+    command.args(["-c", "-O2", "-fPIC", "-fvisibility=default", "-x"]);
+    command.arg("assembler-with-cpp");
+    let status = command
         .arg(&source)
         .arg("-o")
         .arg(&object)
         .status()
-        .expect("a working assembler is required for the Bionic jump boundary");
-    assert!(status.success(), "failed to assemble the Bionic jump boundary");
+        .expect("a working compiler is required for the Bionic jump boundary");
+    assert!(status.success(), "failed to compile the Bionic jump boundary");
     println!("cargo:rustc-cdylib-link-arg={}", object.display());
-    for sym in jump_symbols() {
+    for sym in jump_symbols().iter().chain(host_pthread_symbols()) {
         println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined={sym}");
     }
 }
@@ -198,10 +248,18 @@ fn compile_c_shims(out_dir: &PathBuf) {
 fn write_version_script(out_dir: &PathBuf) {
     let map = out_dir.join("pengudroid-versions.map");
     let mut libc_globals = String::from("__pengudroid_ver_libc");
+    // On AArch64 these are the default LIBC implementations. Keeping them
+    // unversioned also satisfies Android, but would additionally satisfy a
+    // host DSO's GLIBC reference before its direct GLIBC alias is considered.
+    for symbol in bionic_pthread_symbols() {
+        libc_globals.push_str("; ");
+        libc_globals.push_str(symbol);
+    }
     for sym in vlog::C_SYMBOLS
         .iter()
         .chain(pathshim::C_SYMBOLS.iter())
         .chain(jump_symbols().iter())
+        .chain(host_pthread_symbols())
         .chain(syscall_path_symbols().iter())
     {
         libc_globals.push_str("; ");
@@ -233,13 +291,19 @@ fn write_version_script(out_dir: &PathBuf) {
         "LIBNEURALNETWORKS_PACKAGE_INFO", "LIBSELINUX_R", "LIBSTATSPULL",
         "LIBSTATSSOCKET", "LIBSYNC", "LIBVNDKSUPPORT", "HEAPPROFD_API_S",
         "ZLIB_1.2.0", "ZLIB_1.2.2", "ZLIB_NDK",
+        // Host DSOs retain these versions. Their pthread entry points are
+        // direct glibc aliases; unversioned Android calls use the Bionic shim.
+        "GLIBC_2.17", "GLIBC_2.30", "GLIBC_2.34",
     ];
-    let mut script = format!("LIBC {{ global: {libc_globals}; }};");
+    let mut script = String::new();
     for node in NODES {
         let anchor = format!("__pengudroid_ver_{}", node.to_lowercase().replace('.', "_"));
         script.push_str(&format!("{node} {{ global: {anchor}; }};"));
     }
-    script.push('\n');
+    // LLD processes a same-named versioned alias and its base implementation
+    // in script order. LIBC comes last so the Android entry remains @@LIBC
+    // instead of silently reverting to an unversioned symbol.
+    script.push_str(&format!("LIBC {{ global: {libc_globals}; }};\n"));
     std::fs::write(&map, script).expect("write version script");
 
     // Applies to the cdylib target only, so the rlib/tests are unaffected.

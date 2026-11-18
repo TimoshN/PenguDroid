@@ -19,6 +19,7 @@ slint = { version = "1.6", default-features = false, features = [
     "renderer-software",
 ] }
 pengudroid-input.workspace = true
+pengudroid-cli.workspace = true
 libc.workspace = true
 
 [build-dependencies]

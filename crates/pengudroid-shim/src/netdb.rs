@@ -28,6 +28,11 @@ use libc::{c_char, c_int, c_void, sockaddr, socklen_t};
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 
+unsafe extern "C" {
+    fn inet_ntop(family: c_int, source: *const c_void, output: *mut c_char, size: socklen_t)
+        -> *mut c_char;
+}
+
 /// glibc's `getaddrinfo`, looked up past the shim's own interposition.
 ///
 /// The shim exports a symbol named `getaddrinfo`, so a plain `libc::getaddrinfo`
@@ -40,9 +45,14 @@ type GetaddrinfoFn = unsafe extern "C" fn(
     *mut *mut libc::addrinfo,
 ) -> c_int;
 type FreeaddrinfoFn = unsafe extern "C" fn(*mut libc::addrinfo);
+type GetnameinfoFn = unsafe extern "C" fn(
+    *const sockaddr, socklen_t, *mut c_char, socklen_t,
+    *mut c_char, socklen_t, c_int,
+) -> c_int;
 
 static REAL_GETADDRINFO: OnceLock<usize> = OnceLock::new();
 static REAL_FREEADDRINFO: OnceLock<usize> = OnceLock::new();
+static REAL_GETNAMEINFO: OnceLock<usize> = OnceLock::new();
 
 fn lookup(name: &CStr) -> usize {
     // SAFETY: `dlsym` with `RTLD_NEXT` is always safe to call; a missing symbol
@@ -67,6 +77,16 @@ fn real_freeaddrinfo() -> Option<FreeaddrinfoFn> {
     } else {
         // SAFETY: the symbol is glibc's `freeaddrinfo`, which has this signature.
         Some(unsafe { std::mem::transmute::<usize, FreeaddrinfoFn>(p) })
+    }
+}
+
+fn real_getnameinfo() -> Option<GetnameinfoFn> {
+    let p = *REAL_GETNAMEINFO.get_or_init(|| lookup(c"getnameinfo"));
+    if p == 0 {
+        None
+    } else {
+        // SAFETY: sockaddr and NI_* flags have the same Bionic/glibc ABI.
+        Some(unsafe { std::mem::transmute::<usize, GetnameinfoFn>(p) })
     }
 }
 
@@ -363,6 +383,59 @@ pub unsafe fn resolve(
     0
 }
 
+/// Bionic getnameinfo on top of the host resolver. In particular, Android's
+/// Inet6Address.getHostAddress uses this while formatting socket errors; a
+/// failed reverse lookup must not hide the original connect exception.
+pub unsafe fn resolve_name(
+    address: *const sockaddr,
+    address_len: socklen_t,
+    host: *mut c_char,
+    host_len: socklen_t,
+    service: *mut c_char,
+    service_len: socklen_t,
+    flags: c_int,
+) -> c_int {
+    if address.is_null() || address_len == 0 {
+        return EAI_NONAME;
+    }
+    let family = unsafe { (*address).sa_family } as c_int;
+    let numeric_host = flags & libc::NI_NUMERICHOST != 0;
+    let numeric_service = flags & libc::NI_NUMERICSERV != 0;
+    if numeric_host && !host.is_null() && host_len > 0 {
+        let source = match family {
+            libc::AF_INET => (unsafe { &(*(address as *const libc::sockaddr_in)).sin_addr })
+                as *const libc::in_addr as *const c_void,
+            libc::AF_INET6 => (unsafe { &(*(address as *const libc::sockaddr_in6)).sin6_addr })
+                as *const libc::in6_addr as *const c_void,
+            _ => return EAI_FAMILY,
+        };
+        if unsafe { inet_ntop(family, source, host, host_len) }.is_null() {
+            return EAI_OVERFLOW;
+        }
+    }
+    if numeric_service && !service.is_null() && service_len > 0 {
+        let port = match family {
+            libc::AF_INET => u16::from_be(unsafe { (*(address as *const libc::sockaddr_in)).sin_port }),
+            libc::AF_INET6 => u16::from_be(unsafe { (*(address as *const libc::sockaddr_in6)).sin6_port }),
+            _ => return EAI_FAMILY,
+        };
+        let written = unsafe {
+            libc::snprintf(service, service_len as usize, c"%u".as_ptr(), port as c_int)
+        };
+        if written < 0 || written as socklen_t >= service_len {
+            return EAI_OVERFLOW;
+        }
+    }
+    if (numeric_host || host.is_null() || host_len == 0)
+        && (numeric_service || service.is_null() || service_len == 0)
+    {
+        return 0;
+    }
+    let Some(resolve) = real_getnameinfo() else { return EAI_SYSTEM };
+    let rc = resolve(address, address_len, host, host_len, service, service_len, flags);
+    glibc_to_bionic_eai(rc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +500,28 @@ mod tests {
             assert_eq!(u32::from_be(sin.sin_addr.s_addr), 0x7f00_0001);
             free_bionic_addrinfo(res);
         }
+    }
+
+    #[test]
+    fn numeric_getnameinfo_uses_the_host_resolver() {
+        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        address.sin_family = libc::AF_INET as libc::sa_family_t;
+        address.sin_port = 12345u16.to_be();
+        address.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+        let mut host = [0 as c_char; 64];
+        let mut service = [0 as c_char; 16];
+        let rc = unsafe {
+            resolve_name(
+                &address as *const _ as *const sockaddr,
+                std::mem::size_of_val(&address) as socklen_t,
+                host.as_mut_ptr(), host.len() as socklen_t,
+                service.as_mut_ptr(), service.len() as socklen_t,
+                libc::NI_NUMERICHOST | libc::NI_NUMERICSERV,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(unsafe { CStr::from_ptr(host.as_ptr()) }.to_str().unwrap(), "127.0.0.1");
+        assert_eq!(unsafe { CStr::from_ptr(service.as_ptr()) }.to_str().unwrap(), "12345");
     }
 
     #[test]

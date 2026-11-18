@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+X-Nemo-Application-Type=silica-qt5
+Name=MaxNext
+Name[ru]=MaxNext
+GenericName=Android App Manager
+GenericName[ru]=Менеджер Android-приложений
+Comment=Experimental Android compatibility layer
+Comment[ru]=Экспериментальный слой совместимости с Android
+Exec=io.github.denizomer10.MaxNext --cli launch MaxNext.apk --backend art --width 1080 --height 2460 --log MaxNext.launch.log
+Icon=io.github.denizomer10.MaxNext
+Terminal=false
+Categories=Utility;System;
+MimeType=application/vnd.android.package-archive;
+X-Nemo-Single-Instance=yes
+
+[X-Application]
+Permissions=Internet;Audio;Downloads;Documents
+OrganizationName=io.github.denizomer10
+ApplicationName=MaxNext
+
+[X-Aurora-Application]
+Orientation=All
+IconMode=Scale

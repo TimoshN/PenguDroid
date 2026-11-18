@@ -8,6 +8,15 @@ use crate::registry::{pengudroid_binary, Entry};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+#[cfg(target_arch = "x86_64")]
+const RUNTIME_DIR: &str = "android17-x86_64";
+#[cfg(target_arch = "aarch64")]
+const RUNTIME_DIR: &str = "android17-arm64";
+#[cfg(target_arch = "x86_64")]
+const CHECKOUT_SYSROOT: &str = ".toolchain/sysroot-android17";
+#[cfg(target_arch = "aarch64")]
+const CHECKOUT_SYSROOT: &str = ".toolchain/sysroot-android17-arm64";
+
 /// An owned launcher and its dedicated process group. Keeping Child lets us
 /// reap exits and prevents stale running state and zombie launcher processes.
 pub struct RunningApp {
@@ -99,14 +108,14 @@ pub fn sysroot() -> Option<PathBuf> {
     }
     let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(".toolchain/sysroot-android17"));
+        candidates.push(cwd.join(CHECKOUT_SYSROOT));
     }
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        candidates.push(PathBuf::from(cache).join("pengudroid/runtime/android17-x86_64"));
+        candidates.push(PathBuf::from(cache).join("pengudroid/runtime").join(RUNTIME_DIR));
     }
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         candidates.push(
-            PathBuf::from(&home).join(".cache/pengudroid/runtime/android17-x86_64"),
+            PathBuf::from(&home).join(".cache/pengudroid/runtime").join(RUNTIME_DIR),
         );
         candidates.push(PathBuf::from(&home).join(".local/share/pengudroid/sysroot"));
     }

@@ -97,9 +97,9 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.work = Path(self.temporary.name)
 
-    def fixture(self):
+    def fixture(self, arch=prepare.DEFAULT_ARCH):
         root = self.work / "runtime"
-        for relative in prepare.REQUIRED:
+        for relative in prepare.required(arch):
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"fixture")
@@ -107,7 +107,7 @@ class RuntimeTests(unittest.TestCase):
             "ro.build.version.sdk=37\nro.build.version.release=17\nro.build.id=" + prepare.BUILD + "\n")
         header = bytearray(20)
         header[:6] = b"\x7fELF\x02\x01"
-        struct.pack_into("<H", header, 18, 62)
+        struct.pack_into("<H", header, 18, prepare.architecture(arch)["machine"])
         (root / "system/apex/com.android.art/lib64/libart.so").write_bytes(header)
         return root
 
@@ -147,6 +147,29 @@ class RuntimeTests(unittest.TestCase):
         art.write_bytes(header)
         with self.assertRaisesRegex(prepare.PreparationError, "x86_64"):
             prepare.validate_runtime(root)
+
+    def test_arm64_uses_native_boot_layout_and_elf_identity(self):
+        root = self.fixture("arm64")
+        self.assertTrue((root / "system/framework/arm64/boot.art").is_file())
+        self.assertFalse((root / "system/framework/x86_64/boot.art").exists())
+        hashes = prepare.validate_runtime(root, "arm64")
+        self.assertIn("system/framework/arm64/boot.oat", hashes)
+        art = root / "system/apex/com.android.art/lib64/libart.so"
+        header = bytearray(art.read_bytes())
+        struct.pack_into("<H", header, 18, 62)
+        art.write_bytes(header)
+        with self.assertRaisesRegex(prepare.PreparationError, "ARM64"):
+            prepare.validate_runtime(root, "arm64")
+
+    def test_arm64_reuse_cannot_adopt_an_x86_64_manifest(self):
+        root = self.fixture("arm64")
+        hashes = prepare.validate_runtime(root, "arm64")
+        (root / prepare.MANIFEST).write_text(json.dumps({
+            "tool": prepare.OWNER, "archive_sha256": prepare.ARM64_SHA256,
+            "architecture": "x86_64", "files": hashes,
+        }))
+        with self.assertRaisesRegex(prepare.PreparationError, "architecture"):
+            prepare.prepare(self.work / "missing.zip", root, arch="arm64")
 
     def test_rejects_links_outside_runtime(self):
         root = self.fixture()
@@ -191,6 +214,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.read_bytes(), image)
         self.assertEqual(prepare.filesystem(result), "ext4")
         self.assertFalse((self.work.parent / "escape").exists())
+
+    def test_arm64_archive_uses_the_arm64_pinned_hash(self):
+        image = bytearray(4096)
+        image[1080:1082] = b"\x53\xef"
+        archive = self.work / "fixture-arm64.zip"
+        with zipfile.ZipFile(archive, "w") as container:
+            container.writestr("system.img", image)
+        expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+        with mock.patch.object(prepare, "ARM64_SHA256", expected):
+            result = prepare.image_from_archive(archive, self.work, "arm64")
+        self.assertEqual(result.read_bytes(), image)
 
     def test_detects_erofs_and_rejects_unknown_filesystem(self):
         image = self.work / "image"
@@ -263,6 +297,9 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(output, Path("/tmp/xdg/pengudroid/runtime/android17-x86_64"))
         archive, output = prepare.cache_paths({"HOME": "/home/nobody"})
         self.assertEqual(output, Path("/home/nobody/.cache/pengudroid/runtime/android17-x86_64"))
+        archive, output = prepare.cache_paths({"HOME": "/home/nobody"}, arch="arm64")
+        self.assertEqual(archive.name, prepare.ARM64_FILENAME)
+        self.assertEqual(output, Path("/home/nobody/.cache/pengudroid/runtime/android17-arm64"))
         with self.assertRaisesRegex(prepare.PreparationError, "HOME is unset"):
             prepare.cache_home({})
 

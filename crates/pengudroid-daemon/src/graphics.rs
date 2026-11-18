@@ -62,9 +62,13 @@ mod imp {
     use pengudroid_proto::{abi, BufferCrop};
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_region,
-        wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
+        wl_data_offer, wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_region,
+        wl_touch,
+        wl_seat, wl_shell, wl_shell_surface, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     };
+    use crate::qt_extended_surface::imp::{qt_extended_surface, qt_surface_extension};
+    use std::ffi::c_void;
     use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
     use wayland_protocols::wp::linux_dmabuf::zv1::client::{
         zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
@@ -81,6 +85,7 @@ mod imp {
         /// `None` for a subsurface: only a toplevel has an `xdg_surface`.
         pub xdg_surface: Option<xdg_surface::XdgSurface>,
         pub xdg_toplevel: Option<xdg_toplevel::XdgToplevel>,
+        pub shell_surface: Option<wl_shell_surface::WlShellSurface>,
         /// Set when this surface is a child layer of another one.
         pub subsurface: Option<wl_subsurface::WlSubsurface>,
         pub parent_id: Option<u32>,
@@ -92,11 +97,14 @@ mod imp {
         /// here (the compositor holds its own reference, but the buffer's memory
         /// must stay valid while attached).
         pub dmabuf_fd: Option<std::os::fd::OwnedFd>,
-        pending_frames: Vec<wl_buffer::WlBuffer>,
+        pending_frames: Vec<PendingFrame>,
         pub width: u32,
         pub height: u32,
         pub configured: bool,
         pub closed: bool,
+        /// Until the first guest frame arrives, the daemon animates a spinner
+        /// in this surface instead of leaving the user on the system splash.
+        loading: bool,
         pub fps_meter: bool,
         pub title: String,
         /// Guest pixels are independent of the compositor's content dimensions.
@@ -106,6 +114,21 @@ mod imp {
         pub position: (i32, i32),
         pub window_state: WindowState,
         desktop_configured: bool,
+    }
+
+    struct PendingFrame {
+        buffer: wl_buffer::WlBuffer,
+        /// Direct PresentShm keeps the guest memfd alive until release.
+        _fd: Option<std::os::fd::OwnedFd>,
+    }
+
+    struct ClipboardSource {
+        proxy: wl_data_source::WlDataSource,
+        text: String,
+    }
+    struct ClipboardOffer {
+        proxy: wl_data_offer::WlDataOffer,
+        mime_types: Vec<String>,
     }
 
     /// The broker's surface id, carried as a toplevel's user data so events can
@@ -118,7 +141,8 @@ mod imp {
         id: u32,
         width: u32,
         height: u32,
-        xdg_surface: xdg_surface::XdgSurface,
+        xdg_surface: Option<xdg_surface::XdgSurface>,
+        shell_surface: Option<wl_shell_surface::WlShellSurface>,
         wl_surface: wl_surface::WlSurface,
         /// Read through the region's fd on `finalize_surface`.
         region: AshmemRegion,
@@ -155,6 +179,10 @@ mod imp {
         pub compositor: Option<wl_compositor::WlCompositor>,
         pub shm: Option<wl_shm::WlShm>,
         pub wm_base: Option<xdg_wm_base::XdgWmBase>,
+        pub shell: Option<wl_shell::WlShell>,
+        surface_extension: Option<qt_surface_extension::QtSurfaceExtension>,
+        maliit: Option<crate::ime::Maliit>,
+        ime_surface: Option<u32>,
         viewporter: Option<wp_viewporter::WpViewporter>,
         cursor_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
         cursor: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
@@ -203,14 +231,27 @@ mod imp {
         toplevels: HashMap<u32, xdg_toplevel::XdgToplevel>,
         /// Decoration proxies, kept alive for the surface's lifetime.
         decorations: HashMap<u32, zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+        extended_surfaces: HashMap<u32, qt_extended_surface::QtExtendedSurface>,
         /// Frames presented per surface, for the FPS meter:
         /// `(frames since the last update, when that was)`.
         fps: HashMap<u32, (u32, std::time::Instant)>,
+        loading_clock: Option<std::time::Instant>,
+        loading_phase: u8,
         /// Ids of surfaces the compositor asked us to close.
         pub close_requests: Vec<u32>,
         /// The seat, once the compositor advertises one.
         pub seat: Option<wl_seat::WlSeat>,
+        data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
+        data_device: Option<wl_data_device::WlDataDevice>,
+        clipboard_sources: HashMap<wayland_client::backend::ObjectId, ClipboardSource>,
+        clipboard_offers: HashMap<wayland_client::backend::ObjectId, ClipboardOffer>,
+        clipboard_offer: Option<wayland_client::backend::ObjectId>,
+        clipboard_contents: Option<String>,
+        clipboard_read_cache: Option<String>,
+        clipboard_selection_serial: Option<u32>,
         pub pointer: Option<wl_pointer::WlPointer>,
+        pub touch: Option<wl_touch::WlTouch>,
+        touch_points: HashMap<i32, u32>,
         pub keyboard: Option<wl_keyboard::WlKeyboard>,
         /// Surface under the pointer, and the last position in surface pixels.
         pointer_focus: Option<u32>,
@@ -477,6 +518,111 @@ mod imp {
             true
         }
 
+        fn pump_maliit(&mut self) {
+            use pengudroid_proto::InputKind;
+            let Some(maliit) = self.maliit.as_mut() else { return };
+            let events = maliit.drain_events();
+            let Some(surface) = self.ime_surface else { return };
+            for event in events {
+                match event {
+                    crate::ime::ImeEvent::Commit(text) => {
+                        self.input.push((surface, InputKind::CommitText { text }));
+                    }
+                    crate::ime::ImeEvent::Preedit(text) => {
+                        self.input.push((surface, InputKind::PreeditText { text }));
+                    }
+                    crate::ime::ImeEvent::FinishComposing => {
+                        self.input.push((surface, InputKind::FinishComposing));
+                    }
+                    crate::ime::ImeEvent::Key { key, text } => {
+                        let clipboard = match key as u32 {
+                            0x010000cf => Some(0), // Qt::Key_Copy
+                            0x010000d0 => Some(1), // Qt::Key_Cut
+                            0x010000e2 => Some(2), // Qt::Key_Paste
+                            _ => None,
+                        };
+                        if let Some(action) = clipboard {
+                            self.input.push((surface, InputKind::ClipboardAction { action }));
+                            continue;
+                        }
+                        // Special keys take precedence even when Qt also
+                        // supplies a control character as text (e.g. "\b").
+                        let linux = match key as u32 {
+                            0x01000000 => Some(1),   // Escape
+                            0x01000001 => Some(15),  // Tab
+                            0x01000003 => Some(14),  // Backspace
+                            0x01000004 | 0x01000005 => Some(28), // Return/Enter
+                            0x01000007 => Some(111), // Delete
+                            0x01000012 => Some(105), // Left
+                            0x01000013 => Some(103), // Up
+                            0x01000014 => Some(106), // Right
+                            0x01000015 => Some(108), // Down
+                            _ => None,
+                        };
+                        if let Some(keycode) = linux {
+                            self.input.push((surface, InputKind::Key { keycode, pressed: true }));
+                            self.input.push((surface, InputKind::Key { keycode, pressed: false }));
+                        } else if !text.is_empty() {
+                            self.input.push((surface, InputKind::CommitText { text }));
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Animate a small twelve-dot spinner in early, launcher-created
+        /// surfaces. Only the dots are repainted; the gradient was drawn once
+        /// when the surface was configured.
+        fn tick_loading(&mut self) {
+            let now = std::time::Instant::now();
+            if self.loading_clock.is_some_and(|last| now.duration_since(last).as_millis() < 90) {
+                return;
+            }
+            self.loading_clock = Some(now);
+            self.loading_phase = self.loading_phase.wrapping_add(1);
+            let phase = self.loading_phase;
+            let ids: Vec<u32> = self.surfaces.iter()
+                .filter_map(|(id, s)| (s.loading && s.configured && !s.closed).then_some(*id))
+                .collect();
+            for id in ids {
+                let Some(surface) = self.surfaces.get_mut(&id) else { continue };
+                let (width, height, stride) = (surface.width as i32, surface.height as i32, (surface.width * 4) as i32);
+                let (cx, cy) = (width / 2, height / 2);
+                if let Ok(mut map) = surface.region.map_mut() {
+                    let bytes = map.as_mut_slice();
+                    for dot in 0..12i32 {
+                        let angle = -std::f32::consts::FRAC_PI_2
+                            + dot as f32 * std::f32::consts::TAU / 12.0;
+                        let dx = (angle.cos() * 64.0) as i32;
+                        let dy = (angle.sin() * 64.0) as i32;
+                        let age = (dot - phase as i32).rem_euclid(12) as u32;
+                        let shade = 90 + (11 - age).min(11) * 12;
+                        for y in (cy + dy - 9)..(cy + dy + 9) {
+                            for x in (cx + dx - 9)..(cx + dx + 9) {
+                                let rx = x - (cx + dx);
+                                let ry = y - (cy + dy);
+                                if rx * rx + ry * ry > 81 || x < 0 || y < 0 || x >= width || y >= height {
+                                    continue;
+                                }
+                                let offset = (y * stride + x * 4) as usize;
+                                if offset + 3 < bytes.len() {
+                                    bytes[offset] = shade as u8;
+                                    bytes[offset + 1] = (shade / 2 + 50) as u8;
+                                    bytes[offset + 2] = 255;
+                                    bytes[offset + 3] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+                surface.wl_surface.attach(Some(&surface.buffer), 0, 0);
+                let ox = (cx - 80).max(0);
+                let oy = (cy - 80).max(0);
+                surface.wl_surface.damage(ox, oy, (width - ox).min(160), (height - oy).min(160));
+                surface.wl_surface.commit();
+            }
+        }
+
         /// Build the `wl_shm` buffer for a pending surface once the compositor
         /// has configured it.
         ///
@@ -484,8 +630,8 @@ mod imp {
         /// also maps. Holding it in a `foreign` slot keeps it alive even after
         /// the guest (and this process's own handle) goes away, so the memfd
         /// itself is not released until the compositor has the newest frame.
-        fn finalize_surface(&mut self, xdg: &xdg_surface::XdgSurface, qh: &QueueHandle<State>) {
-            let Some(idx) = self.pending.iter().position(|p| p.xdg_surface.id() == xdg.id()) else {
+        fn finalize_surface(&mut self, id: u32, qh: &QueueHandle<State>) {
+            let Some(idx) = self.pending.iter().position(|p| p.id == id) else {
                 return;
             };
             let p = self.pending.remove(idx);
@@ -534,15 +680,18 @@ mod imp {
 
             p.wl_surface.attach(Some(&buffer), 0, 0);
             p.wl_surface.damage(0, 0, p.width as i32, p.height as i32);
-            p.xdg_surface.set_window_geometry(0, 0, p.width as i32, p.height as i32);
+            if let Some(xdg) = p.xdg_surface.as_ref() {
+                xdg.set_window_geometry(0, 0, p.width as i32, p.height as i32);
+            }
             p.wl_surface.commit();
 
             self.surfaces.insert(
                 p.id,
                 Surface {
                     wl_surface: p.wl_surface.clone(),
-                    xdg_surface: Some(p.xdg_surface),
+                    xdg_surface: p.xdg_surface,
                     xdg_toplevel: self.toplevels.remove(&p.id),
+                    shell_surface: p.shell_surface,
                     subsurface: None,
                     parent_id: None,
                     buffer,
@@ -553,6 +702,7 @@ mod imp {
                     height: p.height,
                     configured: true,
                     closed: false,
+                    loading: true,
                     fps_meter: false,
                     title: p.title,
                     display_width: p.width,
@@ -579,6 +729,7 @@ mod imp {
         /// do not leak and its id is not reused while half-alive.
         fn abandon_pending(&mut self, id: u32) {
             self.state.frames.remove(&id);
+            self.state.extended_surfaces.remove(&id);
             self.state.client_decorated.remove(&id);
             self.state.configured.remove(&id);
             self.state.wm_capabilities.remove(&id);
@@ -586,7 +737,9 @@ mod imp {
             if let Some(t) = self.state.toplevels.remove(&id) { t.destroy(); }
             if let Some(pos) = self.state.pending.iter().position(|p| p.id == id) {
                 let p = self.state.pending.remove(pos);
-                p.xdg_surface.destroy();
+                if let Some(xdg) = p.xdg_surface { xdg.destroy(); }
+                // wl_shell_surface has no destroy request; dropping the proxy
+                // together with wl_surface releases the legacy role.
                 p.wl_surface.destroy();
             }
             let _ = self.conn.flush();
@@ -614,6 +767,14 @@ mod imp {
             state.compositor = globals.bind(&qh, 1..=6, ()).ok();
             state.shm = globals.bind(&qh, 1..=1, ()).ok();
             state.wm_base = globals.bind(&qh, 1..=6, ()).ok();
+            // Lipstick on Aurora still exposes the original wl_shell rather
+            // than xdg-shell. It needs no initial configure roundtrip.
+            state.shell = globals.bind(&qh, 1..=1, ()).ok();
+            // Optional Lipstick integration; wl_shell/xdg remains the role.
+            state.surface_extension = globals.bind(&qh, 1..=1, ()).ok();
+            if state.surface_extension.is_some() {
+                crate::info!("qt_surface_extension enabled");
+            }
             state.decoration = globals.bind(&qh, 1..=1, ()).ok();
             if state.decoration.is_some() {
                 crate::info!("server-side decorations available (xdg-decoration)");
@@ -636,6 +797,13 @@ mod imp {
             state.frame_shm = state.shm.clone().map(Shm::from);
             state.output_manager = globals.bind(&qh, 1..=3, ()).ok();
             globals.contents().with_list(|list| {
+                for name in ["wl_drm", "zwp_linux_dmabuf_v1", "qt_surface_extension"] {
+                    if let Some(global) = list.iter().find(|global| global.interface == name) {
+                        crate::info!("Wayland global {name} v{}", global.version);
+                    }
+                }
+            });
+            globals.contents().with_list(|list| {
                 for global in list.iter().filter(|global| global.interface == "wl_output") {
                     let output: wl_output::WlOutput = globals.registry().bind(global.name, global.version.min(4), &qh, global.name);
                     let logical = state.output_manager.as_ref().map(|manager| manager.get_xdg_output(&output, &qh, global.name));
@@ -646,16 +814,23 @@ mod imp {
             // Input: the seat gives us pointer and keyboard events, which are
             // forwarded to whichever guest owns the surface under the cursor.
             state.seat = globals.bind(&qh, 1..=7, ()).ok();
+            state.data_device_manager = globals.bind(&qh, 1..=1, ()).ok();
+            if let (Some(manager), Some(seat)) = (state.data_device_manager.as_ref(), state.seat.as_ref()) {
+                state.data_device = Some(manager.get_data_device(seat, &qh, ()));
+                crate::info!("Wayland clipboard data-device enabled");
+            }
             if queue.roundtrip(&mut state).is_err() {
                 crate::warn!("Wayland roundtrip failed");
                 return None;
             }
-            if state.compositor.is_none() || state.shm.is_none() || state.wm_base.is_none() {
+            if state.compositor.is_none() || state.shm.is_none()
+                || (state.wm_base.is_none() && state.shell.is_none()) {
                 crate::warn!(
-                    "Wayland missing globals (compositor={}, shm={}, xdg_wm_base={})",
+                    "Wayland missing globals (compositor={}, shm={}, xdg_wm_base={}, wl_shell={})",
                     state.compositor.is_some(),
                     state.shm.is_some(),
-                    state.wm_base.is_some()
+                    state.wm_base.is_some(),
+                    state.shell.is_some()
                 );
                 return None;
             }
@@ -668,7 +843,9 @@ mod imp {
         /// Called from the daemon's accept loop; the events are then pushed to
         /// the connection that subscribed for the surface.
         pub fn poll_input(&mut self) -> Vec<(u32, pengudroid_proto::InputKind)> {
+            self.state.tick_loading();
             self.drain_wayland();
+            self.state.pump_maliit();
             std::mem::take(&mut self.state.input)
         }
 
@@ -743,7 +920,9 @@ mod imp {
             };
 
             let compositor = self.state.compositor.clone()?;
-            let wm_base = self.state.wm_base.clone()?;
+            let wm_base = self.state.wm_base.clone();
+            let shell = self.state.shell.clone();
+            if wm_base.is_none() && shell.is_none() { return None; }
             let qh = self.queue.handle();
 
             let id = self.state.alloc_id();
@@ -751,39 +930,77 @@ mod imp {
                 Some(compositor) => compositor.create_surface(&qh),
                 None => compositor.create_surface(&qh, ()),
             };
-            let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
-            let xdg_toplevel = xdg_surface.get_toplevel(&qh, SurfaceId(id));
-            xdg_toplevel.set_title(title.to_string());
-            // Prefer server-side framing where it is offered, and use a host
-            // client-side frame when the compositor declines or lacks it.
-            if let Some(manager) = self.state.decoration.clone() {
-                let decoration = manager.get_toplevel_decoration(&xdg_toplevel, &qh, SurfaceId(id));
-                decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
-                self.state.decorations.insert(id, decoration);
-            } else {
-                self.state.client_decorated.insert(id);
+            let mut pending_xdg = None;
+            let mut pending_shell = None;
+            if let Some(wm_base) = wm_base {
+                let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
+                let xdg_toplevel = xdg_surface.get_toplevel(&qh, SurfaceId(id));
+                xdg_toplevel.set_title(title.to_string());
+                // Prefer server-side framing where it is offered, and use a host
+                // client-side frame when the compositor declines or lacks it.
+                if let Some(manager) = self.state.decoration.clone() {
+                    let decoration = manager.get_toplevel_decoration(&xdg_toplevel, &qh, SurfaceId(id));
+                    decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+                    self.state.decorations.insert(id, decoration);
+                } else {
+                    self.state.client_decorated.insert(id);
+                }
+                // A viewport can scale existing guest buffers during interactive
+                // resize. Without it, do not advertise unsupported resizing.
+                if self.state.viewporter.is_none() {
+                    xdg_toplevel.set_min_size(width as i32, height as i32);
+                    xdg_toplevel.set_max_size(width as i32, height as i32);
+                } else { xdg_toplevel.set_min_size(160, 120); }
+                self.state.toplevels.insert(id, xdg_toplevel);
+                pending_xdg = Some(xdg_surface);
+            } else if let Some(shell) = shell {
+                let shell_surface = shell.get_shell_surface(&wl_surface, &qh, SurfaceId(id));
+                shell_surface.set_toplevel();
+                shell_surface.set_title(title.to_string());
+                shell_surface.set_class("io.github.denizomer10.PenguDroid".to_string());
+                pending_shell = Some(shell_surface);
             }
-            // A viewport can scale existing guest buffers during interactive
-            // resize. Without it, do not advertise unsupported resizing.
-            if self.state.viewporter.is_none() {
-                xdg_toplevel.set_min_size(width as i32, height as i32);
-                xdg_toplevel.set_max_size(width as i32, height as i32);
-            } else { xdg_toplevel.set_min_size(160, 120); }
+            let legacy_shell = pending_shell.is_some();
+            if let Some(extension) = self.state.surface_extension.as_ref() {
+                let extended = extension.get_extended_surface(&wl_surface, &qh, SurfaceId(id));
+                extended.set_content_orientation_mask(1 | 2 | 4 | 8);
+                extended.set_window_flags(0);
+                extended.update_generic_property(
+                    "BACKGROUND_VISIBLE".to_string(),
+                    crate::qt_extended_surface::qvariant_bool(true),
+                );
+                extended.update_generic_property(
+                    "WINDOW_OPACITY".to_string(),
+                    crate::qt_extended_surface::qvariant_double(1.0),
+                );
+                extended.update_generic_property(
+                    "WINID".to_string(),
+                    crate::qt_extended_surface::qvariant_u64(wl_surface.id().protocol_id() as u64),
+                );
+                extended.update_generic_property(
+                    "STATUSBAR_VISIBLE".to_string(),
+                    crate::qt_extended_surface::qvariant_bool(true),
+                );
+                self.state.extended_surfaces.insert(id, extended);
+                crate::info!("surface {id} has qt_extended_surface");
+            }
             wl_surface.commit();
 
             self.state.pending.push(Pending {
                 id,
                 width,
                 height,
-                xdg_surface: xdg_surface.clone(),
+                xdg_surface: pending_xdg,
+                shell_surface: pending_shell,
                 wl_surface,
                 region,
                 stride,
                 title: title.to_owned(),
             });
-            // Stash the toplevel proxy so `finalize_surface` can complete the
-            // Surface without a second lookup path.
-            self.state.toplevels.insert(id, xdg_toplevel);
+            // wl_shell has no initial configure handshake: attach immediately.
+            if legacy_shell {
+                self.state.finalize_surface(id, &qh);
+            }
 
             // Drive the configure → ack → attach → commit cycle synchronously.
             if let Err(e) = self.queue.roundtrip(&mut self.state) {
@@ -815,6 +1032,129 @@ mod imp {
             Some(info)
         }
 
+        pub fn clipboard_set(&mut self, text: String) -> Result<(), String> {
+            if text.len() > 16 * 1024 * 1024 {
+                return Err("clipboard text exceeds 16 MiB".into());
+            }
+            let serial = self.state.clipboard_selection_serial
+                .ok_or("clipboard copy has no touch/pointer/keyboard selection serial")?;
+            let manager = self.state.data_device_manager.as_ref()
+                .ok_or("compositor has no wl_data_device_manager")?;
+            let data_device = self.state.data_device.as_ref().ok_or("no clipboard data device")?;
+            let qh = self.queue.handle();
+            let source = manager.create_data_source(&qh, ());
+            for mime in ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"] {
+                source.offer(mime.to_string());
+            }
+            source.offer(format!("pid/{}", std::process::id()));
+            self.state.clipboard_contents = Some(text.clone());
+            self.state.clipboard_read_cache = Some(text.clone());
+            self.state.clipboard_sources.insert(source.id(), ClipboardSource {
+                proxy: source.clone(), text,
+            });
+            data_device.set_selection(Some(&source), serial);
+            self.conn.flush().map_err(|e| e.to_string())?;
+            crate::info!("clipboard source selected ({} MIME entries)", 4);
+            Ok(())
+        }
+
+        pub fn clipboard_clear(&mut self) -> Result<(), String> {
+            let serial = self.state.clipboard_selection_serial
+                .ok_or("clipboard clear has no selection serial")?;
+            let data_device = self.state.data_device.as_ref().ok_or("no clipboard data device")?;
+            self.state.clipboard_contents = None;
+            self.state.clipboard_read_cache = None;
+            data_device.set_selection(None, serial);
+            self.conn.flush().map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        pub fn clipboard_read(&mut self) -> Result<String, String> {
+            use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+            self.drain_wayland();
+            if let Some(cached) = self.state.clipboard_read_cache.as_ref() {
+                return Ok(cached.clone());
+            }
+            let Some(offer_id) = self.state.clipboard_offer.clone() else {
+                return self.state.clipboard_contents.clone().ok_or_else(|| "clipboard is empty".to_string());
+            };
+            let offer = self.state.clipboard_offers.get(&offer_id).ok_or("clipboard offer disappeared")?;
+            let own_mime = format!("pid/{}", std::process::id());
+            if offer.mime_types.iter().any(|mime| mime == &own_mime) {
+                return self.state.clipboard_contents.clone().ok_or_else(|| "own clipboard is empty".to_string());
+            }
+            let mime = ["text/plain", "text/plain;charset=utf-8", "UTF8_STRING"]
+                .iter().find(|mime| offer.mime_types.iter().any(|offered| offered == *mime))
+                .ok_or("clipboard offer has no supported text MIME")?.to_string();
+            let mut fds = [0i32; 2];
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(format!("clipboard pipe: {}", std::io::Error::last_os_error()));
+            }
+            let (read_fd, write_fd) = unsafe {
+                (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1]))
+            };
+            offer.proxy.receive(mime, write_fd.as_fd());
+            self.conn.flush().map_err(|e| e.to_string())?;
+            // receive() owns the compositor-side duplicate; our write end must
+            // close now so the reader can observe EOF.
+            unsafe {
+                let flags = libc::fcntl(read_fd.as_raw_fd(), libc::F_GETFL);
+                libc::fcntl(read_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            let started = std::time::Instant::now();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 8192];
+                let count = unsafe {
+                    libc::read(read_fd.as_raw_fd(), chunk.as_mut_ptr() as *mut c_void, chunk.len())
+                };
+                if count > 0 {
+                    bytes.extend_from_slice(&chunk[..count as usize]);
+                    if bytes.len() > 16 * 1024 * 1024 {
+                        return Err("clipboard text exceeds 16 MiB".into());
+                    }
+                    continue;
+                }
+                if count == 0 { break; }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(format!("clipboard read: {error}"));
+                }
+                if started.elapsed() >= std::time::Duration::from_millis(500) {
+                    return Err("clipboard read timed out".into());
+                }
+                let mut poll = libc::pollfd { fd: read_fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                unsafe { libc::poll(&mut poll, 1, 20) };
+            }
+            let text = String::from_utf8(bytes).map_err(|_| "clipboard is not valid UTF-8".to_string())?
+                .replace("\r\n", "\n");
+            self.state.clipboard_read_cache = Some(text.clone());
+            Ok(text)
+        }
+
+        /// Show/hide the system input method only when Android's focused View
+        /// changes whether it accepts text. The P2P connection is lazy and
+        /// persistent, not recreated for redraws or key events.
+        pub fn set_ime_state(&mut self, id: u32, visible: bool) -> Result<(), String> {
+            if !self.state.surfaces.contains_key(&id) {
+                return Err(format!("IME request for unknown surface {id}"));
+            }
+            if !visible && self.state.maliit.is_none() {
+                return Ok(());
+            }
+            if self.state.maliit.is_none() {
+                self.state.maliit = Some(crate::ime::Maliit::connect()?);
+            }
+            let result = self.state.maliit.as_mut().unwrap().set_visible(visible);
+            if result.is_ok() {
+                self.state.ime_surface = visible.then_some(id);
+            }
+            if result.is_ok() {
+                crate::info!("surface {id} IME visible={visible}");
+            }
+            result
+        }
+
         /// Re-commit a surface so pixels the guest wrote into the shared
         /// buffer become visible. Pixel contents are owned by the guest; the
         /// daemon only drives the Wayland commit.
@@ -823,6 +1163,7 @@ mod imp {
             // surface (or asked to close it) since the guest's last frame, and a
             // request to a dead object is a protocol error.
             self.poll();
+            if let Some(s) = self.state.surfaces.get_mut(&id) { s.loading = false; }
             let Some(s) = self.state.surfaces.get(&id) else { return false };
             if s.closed || s.width == 0 || s.height == 0 {
                 return false;
@@ -903,6 +1244,7 @@ mod imp {
                     wl_surface: wl_surface.clone(),
                     xdg_surface: None,
                     xdg_toplevel: None,
+                    shell_surface: None,
                     subsurface: Some(subsurface),
                     parent_id: Some(parent),
                     buffer,
@@ -913,6 +1255,7 @@ mod imp {
                     height: height.max(1),
                     configured: true,
                     closed: false,
+                    loading: false,
                     fps_meter: false,
                     title: String::new(),
                     display_width: width.max(1),
@@ -1094,6 +1437,14 @@ mod imp {
             self.state.wm_capabilities.remove(&id);
             if self.state.frame_focus.as_ref().is_some_and(|(owner, _)| *owner == id) { self.state.frame_focus = None; }
             if let Some(decoration) = self.state.decorations.remove(&id) { decoration.destroy(); }
+            // Extended surface belongs to this wl_surface; drop it first.
+            self.state.extended_surfaces.remove(&id);
+            if let Some(maliit) = self.state.maliit.as_mut() {
+                let _ = maliit.set_visible(false);
+            }
+            if self.state.ime_surface == Some(id) {
+                self.state.ime_surface = None;
+            }
             let Some(surface) = self.state.surfaces.remove(&id) else { return false };
             if let Some(t) = surface.xdg_toplevel {
                 t.destroy();
@@ -1104,9 +1455,10 @@ mod imp {
             if let Some(sub) = surface.subsurface {
                 sub.destroy();
             }
-            for buffer in surface.pending_frames {
+            for frame in surface.pending_frames {
                 // A leased decode surface cannot be recycled until the real
                 // compositor release, even after its wl_surface is destroyed.
+                let buffer = frame.buffer;
                 let leased = buffer.data::<FrameBuffer>().is_some_and(|data| data.released.is_some());
                 if buffer.is_alive() && !leased { buffer.destroy(); }
             }
@@ -1242,8 +1594,82 @@ mod imp {
         fn frame_slot_available(&mut self, id: u32) -> Result<bool, String> {
             self.drain_wayland();
             let surface = self.state.surfaces.get_mut(&id).ok_or_else(|| format!("unknown surface {id}"))?;
-            surface.pending_frames.retain(|buffer| buffer.is_alive());
+            surface.pending_frames.retain(|frame| frame.buffer.is_alive());
             Ok(surface.pending_frames.len() < 3)
+        }
+
+        fn profile_native_import(duration: std::time::Duration) {
+            static PROFILE: std::sync::Mutex<(u32, Option<std::time::Instant>, std::time::Duration)> =
+                std::sync::Mutex::new((0, None, std::time::Duration::ZERO));
+            let mut profile = PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+            profile.0 += 1;
+            profile.2 += duration;
+            let elapsed = profile.1.map(|since| since.elapsed()).unwrap_or_default();
+            if profile.1.is_none() || elapsed >= std::time::Duration::from_secs(1) {
+                let count = profile.0.max(1) as f64;
+                let fps = if elapsed.is_zero() { 0.0 } else { profile.0 as f64 / elapsed.as_secs_f64() };
+                crate::info!(
+                    "native wl_shm import: fps={fps:.1} pool+buffer+commit={:.2}ms",
+                    profile.2.as_secs_f64() * 1000.0 / count,
+                );
+                profile.0 = 0;
+                profile.2 = std::time::Duration::ZERO;
+                profile.1 = Some(std::time::Instant::now());
+            }
+        }
+
+        /// Import a full RGBA guest memfd without another CPU snapshot. The fd
+        /// remains owned by PendingFrame until Lipstick releases the buffer.
+        fn present_shm_direct(
+            &mut self,
+            id: u32,
+            fd: std::os::fd::OwnedFd,
+            width: u32,
+            height: u32,
+            stride: u32,
+            native_gpu_buffer: bool,
+        ) -> Result<(), String> {
+            use std::os::fd::AsRawFd;
+            let profile_started = std::time::Instant::now();
+            let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+            if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+                return Err(format!("PresentShm fstat: {}", std::io::Error::last_os_error()));
+            }
+            let required = stride as i64 * height as i64;
+            // dma-buf commonly reports size 0 through fstat. wl_shm still
+            // needs an explicit mapping size, which is known from the layout.
+            let pool_size = if stat.st_size == 0 { required } else { stat.st_size };
+            if pool_size < required {
+                return Err(format!("PresentShm: fd is {} bytes, need {required}", stat.st_size));
+            }
+            let shm = self.state.shm.as_ref().ok_or("no wl_shm")?;
+            let qh = self.queue.handle();
+            let pool = shm.create_pool(fd.as_fd(), pool_size as i32, &qh, ());
+            let buffer = pool.create_buffer(
+                0, width as i32, height as i32, stride as i32,
+                wl_shm::Format::Xrgb8888,
+                &qh, FrameBuffer::default(),
+            );
+            pool.destroy();
+            let surface = self.state.surfaces.get_mut(&id).ok_or("surface disappeared")?;
+            surface.loading = false;
+            surface.wl_surface.set_buffer_transform(
+                if native_gpu_buffer && surface.subsurface.is_none() {
+                    wl_output::Transform::Flipped180
+                } else {
+                    wl_output::Transform::Normal
+                },
+            );
+            surface.wl_surface.attach(Some(&buffer), 0, 0);
+            surface.wl_surface.damage(0, 0, surface.display_width as i32, surface.display_height as i32);
+            surface.wl_surface.commit();
+            surface.pending_frames.push(PendingFrame { buffer, _fd: Some(fd) });
+            self.conn.flush().map_err(|e| e.to_string())?;
+            self.record_frame(id);
+            if native_gpu_buffer {
+                Self::profile_native_import(profile_started.elapsed());
+            }
+            Ok(())
         }
 
         /// Snapshot decoder-owned CPU memory and submit it through wl_shm.
@@ -1252,6 +1678,23 @@ mod imp {
             width: u32, height: u32, stride: u32, format: u32, crop: BufferCrop) -> Result<(), String> {
             let source_size = crop.dimensions(width, height)?;
             if !self.frame_slot_available(id)? { return Ok(()); }
+            let native_gpu_buffer = format & abi::NATIVE_FD_FLAG != 0;
+            let direct = format & !abi::NATIVE_FD_FLAG == abi::ANDROID_RGBA_8888
+                && crop == BufferCrop::full(width as i32, height as i32)
+                && stride >= width * 4
+                && self.state.surfaces.get(&id).is_some_and(|surface|
+                    surface.subsurface.is_none()
+                        || surface.viewport.is_some()
+                        || (width, height) == (surface.width, surface.height));
+            static LOGGED_SHM_INPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED_SHM_INPUT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::info!(
+                    "SHM input {width}x{height} stride={stride} format={format:#x} crop={crop:?} direct={direct}"
+                );
+            }
+            if direct {
+                return self.present_shm_direct(id, fd, width, height, stride, native_gpu_buffer);
+            }
             let pixels = crate::software::snapshot(fd, width, height, stride, format, crop)?;
             let surface = self.state.surfaces.get(&id).unwrap();
             // wp_viewporter scales on the compositor/GPU. Only the legacy
@@ -1284,11 +1727,12 @@ mod imp {
                 (width * 4) as i32, wl_shm::Format::Xrgb8888, &qh, FrameBuffer::default());
             pool.destroy();
             let s = self.state.surfaces.get_mut(&id).unwrap();
+            s.loading = false;
             s.wl_surface.set_buffer_transform(wl_output::Transform::Normal);
             s.wl_surface.attach(Some(&buffer), 0, 0);
             s.wl_surface.damage(0, 0, s.display_width as i32, s.display_height as i32);
             s.wl_surface.commit();
-            s.pending_frames.push(buffer);
+            s.pending_frames.push(PendingFrame { buffer, _fd: None });
             // The pool request sends its own fd. Wayland retains the snapshot
             // independently of the Android buffer, which may now be recycled.
             self.conn.flush().map_err(|e| e.to_string())?;
@@ -1324,7 +1768,7 @@ mod imp {
             surface.wl_surface.attach(Some(&buffer), 0, 0);
             surface.wl_surface.damage(0, 0, surface.display_width as i32, surface.display_height as i32);
             surface.wl_surface.commit();
-            surface.pending_frames.push(buffer);
+            surface.pending_frames.push(PendingFrame { buffer, _fd: None });
             self.conn.flush().map_err(|e| e.to_string())?;
             self.record_frame(id);
             Ok(Some(released))
@@ -1348,6 +1792,13 @@ mod imp {
             top_down: bool,
         ) -> Result<(), String> {
             if !self.frame_slot_available(id)? { return Ok(()); }
+            let advertised = self.state.dmabuf_supported.contains(&(fourcc, modifier));
+            if !advertised {
+                crate::debug!(
+                    "dma-buf {fourcc:#x}/{modifier:#x} was not in the compositor list ({} events); trying import anyway",
+                    self.state.dmabuf_formats,
+                );
+            }
             let dmabuf = self
                 .state
                 .dmabuf
@@ -1357,6 +1808,13 @@ mod imp {
             let Some(s) = self.state.surfaces.get_mut(&id) else {
                 return Err(format!("no such surface {id}"));
             };
+            static LOGGED_DMABUF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED_DMABUF.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::info!(
+                    "first dma-buf present surface={id} {width}x{height} stride={stride} fourcc={fourcc:#x} modifier={modifier:#x}"
+                );
+            }
+            s.loading = false;
             let params = dmabuf.create_params(&qh, ());
             params.add(
                 fd.as_fd(),
@@ -1402,7 +1860,7 @@ mod imp {
             s.wl_surface.attach(Some(&buffer), 0, 0);
             s.wl_surface.damage(0, 0, s.display_width as i32, s.display_height as i32);
             s.wl_surface.commit();
-            s.pending_frames.push(buffer);
+            s.pending_frames.push(PendingFrame { buffer, _fd: None });
             s.dmabuf_fd = Some(fd);
             let _ = self.conn.flush();
 
@@ -1588,6 +2046,10 @@ mod imp {
                     state.pointer = Some(pointer);
                     crate::info!("seat: pointer available");
                 }
+                if has(Capability::Touch) && state.touch.is_none() {
+                    state.touch = Some(seat.get_touch(qh, ()));
+                    crate::info!("seat: touch available");
+                }
                 if has(Capability::Keyboard) && state.keyboard.is_none() {
                     state.keyboard = Some(seat.get_keyboard(qh, ()));
                     crate::info!("seat: keyboard available");
@@ -1620,6 +2082,187 @@ mod imp {
                         pengudroid_proto::InputKind::PointerRelative { dx: dx as f32, dy: dy as f32 },
                     ));
                 }
+            }
+        }
+    }
+
+    ignore_events!(wl_data_device_manager::WlDataDeviceManager, ());
+
+    impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
+        fn event(
+            state: &mut Self,
+            _: &wl_data_device::WlDataDevice,
+            event: wl_data_device::Event,
+            _: &(), _: &Connection, _: &QueueHandle<Self>,
+        ) {
+            match event {
+                wl_data_device::Event::DataOffer { id } => {
+                    state.clipboard_offers.insert(id.id(), ClipboardOffer {
+                        proxy: id,
+                        mime_types: Vec::new(),
+                    });
+                }
+                wl_data_device::Event::Selection { id } => {
+                    state.clipboard_offer = id.map(|offer| offer.id());
+                    state.clipboard_read_cache = None;
+                }
+                _ => {}
+            }
+        }
+
+        wayland_client::event_created_child!(State, wl_data_device::WlDataDevice, [
+            wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ())
+        ]);
+    }
+
+    impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
+        fn event(
+            state: &mut Self,
+            proxy: &wl_data_offer::WlDataOffer,
+            event: wl_data_offer::Event,
+            _: &(), _: &Connection, _: &QueueHandle<Self>,
+        ) {
+            if let wl_data_offer::Event::Offer { mime_type } = event {
+                if let Some(offer) = state.clipboard_offers.get_mut(&proxy.id()) {
+                    offer.mime_types.push(mime_type);
+                }
+            }
+        }
+    }
+
+    impl Dispatch<wl_data_source::WlDataSource, ()> for State {
+        fn event(
+            state: &mut Self,
+            proxy: &wl_data_source::WlDataSource,
+            event: wl_data_source::Event,
+            _: &(), _: &Connection, _: &QueueHandle<Self>,
+        ) {
+            match event {
+                wl_data_source::Event::Send { mime_type: _, fd } => {
+                    use std::os::fd::AsRawFd;
+                    let Some(source) = state.clipboard_sources.get(&proxy.id()) else { return };
+                    let bytes = source.text.as_bytes();
+                    let started = std::time::Instant::now();
+                    let mut written = 0usize;
+                    while written < bytes.len() {
+                        let result = unsafe {
+                            libc::write(fd.as_raw_fd(), bytes[written..].as_ptr() as *const c_void,
+                                bytes.len() - written)
+                        };
+                        if result > 0 { written += result as usize; continue; }
+                        if result == 0 { break; }
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::WouldBlock { break; }
+                        if started.elapsed() >= std::time::Duration::from_millis(500) { break; }
+                        let mut poll = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+                        unsafe { libc::poll(&mut poll, 1, 20) };
+                    }
+                    crate::debug!("clipboard source sent {} bytes", written);
+                }
+                wl_data_source::Event::Cancelled => {
+                    if let Some(source) = state.clipboard_sources.remove(&proxy.id()) {
+                        source.proxy.destroy();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    ignore_events!(qt_surface_extension::QtSurfaceExtension, ());
+
+    impl Dispatch<qt_extended_surface::QtExtendedSurface, SurfaceId> for State {
+        fn event(
+            state: &mut Self,
+            _: &qt_extended_surface::QtExtendedSurface,
+            event: qt_extended_surface::Event,
+            id: &SurfaceId,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                qt_extended_surface::Event::Close => {
+                    crate::info!("qt_extended_surface close for surface {}", id.0);
+                    state.request_close(id.0);
+                }
+                qt_extended_surface::Event::OnscreenVisibility { visible } => {
+                    crate::info!(
+                        "surface {} onscreen visibility={}", id.0, visible != 0,
+                    );
+                    if visible != 0 {
+                        if let Some(extended) = state.extended_surfaces.get(&id.0) {
+                            extended.update_generic_property(
+                                "STATUSBAR_VISIBLE".to_string(),
+                                crate::qt_extended_surface::qvariant_bool(true),
+                            );
+                        }
+                    }
+                }
+                qt_extended_surface::Event::SetGenericProperty { name, value } => {
+                    crate::debug!(
+                        "surface {} generic property {} ({} bytes)",
+                        id.0, name, value.len(),
+                    );
+                }
+            }
+        }
+    }
+
+    impl Dispatch<wl_touch::WlTouch, ()> for State {
+        fn event(
+            state: &mut Self,
+            _: &wl_touch::WlTouch,
+            event: wl_touch::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            use pengudroid_proto::InputKind;
+            match event {
+                wl_touch::Event::Down { surface, x, y, id, serial, .. } => {
+                    state.clipboard_selection_serial = Some(serial);
+                    let Some(surface_id) = state.surface_id_of(&surface) else { return };
+                    crate::info!("touch down id={id} surface={surface_id} at {x:.0},{y:.0}");
+                    state.touch_points.insert(id, surface_id);
+                    state.pointer_focus = Some(surface_id);
+                    state.pointer_pos = (x, y);
+                    let (gx, gy) = state.guest_coordinates(surface_id, x, y);
+                    state.push_input(InputKind::PointerEnter { x: gx, y: gy });
+                    state.push_input(InputKind::PointerMotion { x: gx, y: gy });
+                    state.push_input(InputKind::PointerButton { button: 0x110, pressed: true });
+                }
+                wl_touch::Event::Motion { x, y, id, .. } => {
+                    let Some(surface_id) = state.touch_points.get(&id).copied() else { return };
+                    state.pointer_focus = Some(surface_id);
+                    state.pointer_pos = (x, y);
+                    let (gx, gy) = state.guest_coordinates(surface_id, x, y);
+                    state.push_input(InputKind::PointerMotion { x: gx, y: gy });
+                }
+                wl_touch::Event::Up { id, .. } => {
+                    let Some(surface_id) = state.touch_points.remove(&id) else { return };
+                    crate::info!("touch up id={id} surface={surface_id}");
+                    state.pointer_focus = Some(surface_id);
+                    let (x, y) = state.pointer_pos;
+                    let (gx, gy) = state.guest_coordinates(surface_id, x, y);
+                    state.push_input(InputKind::PointerMotion { x: gx, y: gy });
+                    state.push_input(InputKind::PointerButton { button: 0x110, pressed: false });
+                    if state.touch_points.is_empty() {
+                        state.push_input(InputKind::PointerLeave);
+                        state.pointer_focus = None;
+                    }
+                }
+                wl_touch::Event::Cancel { .. } => {
+                    let ids: Vec<i32> = state.touch_points.keys().copied().collect();
+                    for id in ids {
+                        if let Some(surface_id) = state.touch_points.remove(&id) {
+                            state.pointer_focus = Some(surface_id);
+                            state.push_input(InputKind::PointerButton { button: 0x110, pressed: false });
+                        }
+                    }
+                    state.push_input(InputKind::PointerLeave);
+                    state.pointer_focus = None;
+                }
+                _ => {}
             }
         }
     }
@@ -1672,6 +2315,7 @@ mod imp {
                     use wayland_client::protocol::wl_pointer::ButtonState;
                     use wayland_client::WEnum;
                     let pressed = matches!(button_state, WEnum::Value(ButtonState::Pressed));
+                    if pressed { state.clipboard_selection_serial = Some(serial); }
                     if state.frame_button(button, pressed, time, serial) { return; }
                     state.push_input(InputKind::PointerButton { button, pressed });
                 }
@@ -1735,8 +2379,9 @@ mod imp {
                     }
                 }
                 wl_keyboard::Event::Leave { .. } => state.release_keyboard(),
-                wl_keyboard::Event::Key { key, state: key_state, .. } => {
+                wl_keyboard::Event::Key { key, state: key_state, serial, .. } => {
                     let pressed = matches!(key_state, WEnum::Value(KeyState::Pressed));
+                    if pressed { state.clipboard_selection_serial = Some(serial); }
                     state.keyboard_key(key, pressed);
                 }
                 wl_keyboard::Event::Keymap { format, fd, size } => {
@@ -1755,6 +2400,37 @@ mod imp {
                         let _ = std::fs::remove_file(&path);
                         crate::info!("keyboard layout unavailable; guests use a US key map");
                     }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<wl_shell::WlShell, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &wl_shell::WlShell,
+            _: wl_shell::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {}
+    }
+
+    impl Dispatch<wl_shell_surface::WlShellSurface, SurfaceId> for State {
+        fn event(
+            state: &mut Self,
+            proxy: &wl_shell_surface::WlShellSurface,
+            event: wl_shell_surface::Event,
+            _: &SurfaceId,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            let Some(id) = proxy.data::<SurfaceId>().map(|data| data.0) else { return };
+            match event {
+                wl_shell_surface::Event::Ping { serial } => proxy.pong(serial),
+                wl_shell_surface::Event::Configure { width, height, .. } => {
+                    state.configured.insert(id, (width, height, WindowState::empty()));
                 }
                 _ => {}
             }
@@ -1788,7 +2464,11 @@ mod imp {
         ) {
             if let xdg_surface::Event::Configure { serial } = event {
                 proxy.ack_configure(serial);
-                state.finalize_surface(proxy, qh);
+                if let Some(id) = state.pending.iter().find_map(|p| {
+                    (p.xdg_surface.as_ref() == Some(proxy)).then_some(p.id)
+                }) {
+                    state.finalize_surface(id, qh);
+                }
                 if let Some(id) = state.surfaces.iter().find_map(|(id, s)|
                     (s.xdg_surface.as_ref() == Some(proxy)).then_some(*id)) {
                     state.configure_window(id, qh);
@@ -1937,7 +2617,7 @@ mod imp {
             assert_eq!(surface.buffer.id(), original, "fallback buffer remains owned separately");
             // At most the currently attached buffer may still be retained once
             // the compositor has processed and released superseded commits.
-            assert!(surface.pending_frames.iter().filter(|b| b.is_alive()).count() <= 1);
+            assert!(surface.pending_frames.iter().filter(|frame| frame.buffer.is_alive()).count() <= 1);
             graphics.destroy_surface(id);
             graphics.queue.roundtrip(&mut graphics.state).unwrap();
         }

@@ -17,9 +17,14 @@ pengudroid-socket.workspace = true
 pengudroid-elf.workspace = true
 pengudroid-hostgpu.workspace = true
 pengudroid-nativebridge.workspace = true
+pengudroid-daemon.workspace = true
 libc.workspace = true
 miniz_oxide.workspace = true
 roxmltree = "0.21.2"
+
+[lib]
+name = "pengudroid_cli"
+path = "src/lib.rs"
 
 [dev-dependencies]
 pengudroid-proto.workspace = true

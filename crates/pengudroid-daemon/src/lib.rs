@@ -20,13 +20,18 @@ pub mod ashmem;
 pub mod audio;
 pub mod binder;
 pub mod graphics;
+#[cfg(feature = "wayland")]
+pub mod ime;
 pub mod log;
 pub mod parcel;
 pub mod props;
+pub mod qt_extended_surface;
 pub mod server;
 pub mod services;
 pub mod stubs;
 mod software;
 mod lifecycle;
+mod entry;
 
 pub use server::Daemon;
+pub use entry::real_main;

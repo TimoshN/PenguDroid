@@ -304,7 +304,7 @@ pub fn assess(facts: &Facts) -> Vec<Requirement> {
     let translated = !facts.libs.is_empty() && !facts.host_abi;
 
     if translated {
-        out.push(if facts.abi == "arm64-v8a" {
+        out.push(if cfg!(target_arch = "x86_64") && facts.abi == "arm64-v8a" {
             requirement(
                 "ARM64 code on x86_64",
                 Status::Partial,
@@ -312,10 +312,18 @@ pub fn assess(facts: &Facts) -> Vec<Requirement> {
                  with tools/build-nativebridge.py and set PENGUDROID_NATIVE_BRIDGE_LIB",
             )
         } else {
+            let note = if cfg!(target_arch = "x86_64") {
+                "only an ARM64 guest runtime is built; 32-bit ARM is not translated".to_string()
+            } else {
+                format!(
+                    "this host runs {} native libraries directly; no {} translator is available",
+                    crate::nativelib::host_abi(), facts.abi,
+                )
+            };
             requirement(
-                &format!("{} code on x86_64", facts.abi),
+                &format!("{} code on {}", facts.abi, std::env::consts::ARCH),
                 Status::Missing,
-                "only an ARM64 guest runtime is built; 32-bit ARM is not translated",
+                &note,
             )
         });
     }
@@ -446,6 +454,7 @@ mod tests {
 
     /// The shape of an ARM64 Unity game with a web login: the report must name
     /// each blocker rather than a blanket "cannot run".
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn arm64_unity_game_lists_its_real_blockers() {
         let facts = Facts {
@@ -465,6 +474,22 @@ mod tests {
             names(&reqs, Status::Partial),
             vec!["ARM64 code on x86_64", "Unity player under translation", "Keyboard and mouse controls"]
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn arm64_host_does_not_request_the_x86_translator() {
+        let facts = Facts {
+            abi: "arm64-v8a".into(),
+            host_abi: true,
+            libs: vec!["libunity.so".into(), "libil2cpp.so".into()],
+            system_libs: vec!["libEGL.so", "libvulkan.so"],
+            ..Default::default()
+        };
+        let reqs = assess(&facts);
+        assert!(names(&reqs, Status::Missing).is_empty());
+        assert_eq!(names(&reqs, Status::Ready), vec!["libvulkan.so"]);
+        assert!(reqs.iter().all(|r| !r.name.contains("translation")));
     }
 
     #[test]
@@ -488,7 +513,8 @@ mod tests {
             libs: vec!["libmain.so".into()],
             ..Default::default()
         };
-        assert_eq!(names(&assess(&facts), Status::Missing), vec!["armeabi-v7a code on x86_64"]);
+        let expected = format!("armeabi-v7a code on {}", std::env::consts::ARCH);
+        assert_eq!(names(&assess(&facts), Status::Missing), vec![expected.as_str()]);
     }
 
     #[test]

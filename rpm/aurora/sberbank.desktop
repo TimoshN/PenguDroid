@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+X-Nemo-Application-Type=silica-qt5
+Name=Sberbank
+Name[ru]=СберБанк
+GenericName=Android banking application
+GenericName[ru]=Android-банк
+Comment=Sberbank Online through PenguDroid
+Comment[ru]=СберБанк Онлайн через PenguDroid
+Exec=io.github.denizomer10.Sberbank --cli launch SberbankOnline.apk --backend art --width 1080 --height 2460 --log Sberbank.launch.log
+Icon=io.github.denizomer10.Sberbank
+Terminal=false
+Categories=Finance;Utility;
+X-Nemo-Single-Instance=yes
+
+[X-Application]
+Permissions=Internet;Audio;Downloads;Documents
+OrganizationName=io.github.denizomer10
+ApplicationName=Sberbank
+
+[X-Aurora-Application]
+Orientation=Portrait
+IconMode=Scale

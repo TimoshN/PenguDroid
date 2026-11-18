@@ -23,10 +23,13 @@ pengudroid-hostgpu.workspace = true
 libc.workspace = true
 wayland-client = { workspace = true, optional = true }
 wayland-protocols = { workspace = true, optional = true }
+wayland-scanner = { version = "0.31.7", optional = true }
+wayland-backend = { version = "0.3", optional = true }
+zbus = { version = "5.19", features = ["p2p"], optional = true }
 
 smithay-client-toolkit = { version = "0.19.2", default-features = false, optional = true }
 sctk-adwaita = { version = "0.10.1", optional = true }
 
 [features]
 default = ["wayland"]
-wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:smithay-client-toolkit", "dep:sctk-adwaita"]
+wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-scanner", "dep:wayland-backend", "dep:zbus", "dep:smithay-client-toolkit", "dep:sctk-adwaita"]

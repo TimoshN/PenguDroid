@@ -85,7 +85,9 @@ class GuestPreparationTests(unittest.TestCase):
         self.retained = self.work / "retained"
         self.kwargs = {"sysroot": self.sysroot, "vdso_source": self.source,
                        "compiler": self.compiler, "retained": self.retained}
-        self.run = self.enterContext(mock.patch.object(guest.subprocess, "run", side_effect=self.fake_compiler))
+        run_patch = mock.patch.object(guest.subprocess, "run", side_effect=self.fake_compiler)
+        self.run = run_patch.start()
+        self.addCleanup(run_patch.stop)
         self.baseline = snapshot(self.sysroot)
 
     @staticmethod

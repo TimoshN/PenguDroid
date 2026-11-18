@@ -27,6 +27,15 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// Build a daemon command, selecting the hidden entry point of a multi-call build.
+pub fn daemon_command(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    if option_env!("PENGUDROID_AURORA_UNIFIED").is_some() {
+        command.arg("__daemon");
+    }
+    command
+}
+
 /// Ensure a daemon is listening on `socket`, starting one if needed.
 pub fn ensure_daemon(socket: &Path) -> Result<(), String> {
     if is_daemon_up(socket) {
@@ -37,12 +46,10 @@ pub fn ensure_daemon(socket: &Path) -> Result<(), String> {
     // bind (sandboxed or read-only runtime dir) is explained where the user is
     // looking; `--daemonize` redirects its own stdio to /dev/null afterwards.
     let bin_arg = bin.display().to_string();
-    let socket_arg = socket.display().to_string();
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg("exec \"$0\" --socket \"$1\" --daemonize")
-        .arg(&bin_arg)
-        .arg(&socket_arg)
+    let mut child = daemon_command(&bin)
+        .arg("--socket")
+        .arg(socket)
+        .arg("--daemonize")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -80,6 +87,9 @@ fn is_daemon_up(socket: &Path) -> bool {
 pub fn find_daemon_binary() -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("PENGUDROID_DAEMON") {
         return Ok(PathBuf::from(p));
+    }
+    if option_env!("PENGUDROID_AURORA_UNIFIED").is_some() {
+        return std::env::current_exe().map_err(|e| format!("cannot find unified daemon executable: {e}"));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

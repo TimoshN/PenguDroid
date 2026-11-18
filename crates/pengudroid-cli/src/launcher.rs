@@ -4,7 +4,7 @@
 //! state and its environment overrides, exactly like Proton's `compatdata`.
 //! Launching picks the best backend for the APK:
 //!
-//! * **native** — an x86_64 `NativeActivity` app. Its own `libmain.so` runs on
+//! * **native** — a host-ABI `NativeActivity` app. Its own `libmain.so` runs on
 //!   the host GPU through the shim, no Java runtime involved.
 //! * **art** — a Java application. ART is started from an extracted Android
 //!   system tree and the APK's DEX files are put on the system class path.
@@ -41,7 +41,7 @@ pub struct Plan {
 
 /// Decide which backend can actually run `apk`.
 ///
-/// `native` wins whenever the APK ships an x86_64 `NativeActivity` payload,
+/// `native` wins whenever the APK ships a host-ABI `NativeActivity` payload,
 /// because that path needs no Java runtime at all. Otherwise the presence of
 /// `classes.dex` means ART is the only option.
 pub fn plan(apk_path: &str) -> Result<(ApkInfo, Plan), String> {
@@ -51,22 +51,24 @@ pub fn plan(apk_path: &str) -> Result<(ApkInfo, Plan), String> {
     }
     let info = apk::read_apk(apk_path)?;
     let entries = apk::apk_entries(apk_path).unwrap_or_default();
-    let has_x86_64_lib = entries
+    let host_abi = crate::nativelib::host_abi();
+    let native_prefix = format!("lib/{host_abi}/");
+    let has_host_lib = entries
         .iter()
-        .any(|e| e.starts_with("lib/x86_64/") && e.ends_with(".so"));
+        .any(|e| e.starts_with(&native_prefix) && e.ends_with(".so"));
     let has_dex = entries
         .iter()
         .any(|e| e.ends_with(".dex") || e == "classes.dex");
     let has_native_activity = entries
         .iter()
-        .any(|e| e.starts_with("lib/x86_64/") && e.ends_with("libmain.so"));
+        .any(|e| e.starts_with(&native_prefix) && e.ends_with("libmain.so"));
 
     if has_native_activity {
         Ok((
             info,
             Plan {
                 backend: Backend::Native,
-                reason: "x86_64 NativeActivity payload (libmain.so)".into(),
+                reason: format!("{host_abi} NativeActivity payload (libmain.so)"),
             },
         ))
     } else if has_dex {
@@ -78,8 +80,8 @@ pub fn plan(apk_path: &str) -> Result<(ApkInfo, Plan), String> {
             info,
             Plan {
                 backend: Backend::Art,
-                reason: if has_x86_64_lib {
-                    "x86_64 libraries but no NativeActivity entry point".into()
+                reason: if has_host_lib {
+                    format!("{host_abi} libraries but no NativeActivity entry point")
                 } else {
                     "DEX only, needs the Android runtime".into()
                 },
@@ -87,7 +89,7 @@ pub fn plan(apk_path: &str) -> Result<(ApkInfo, Plan), String> {
         ))
     } else {
         Err(format!(
-            "{apk_path} has neither an x86_64 native payload nor classes.dex"
+            "{apk_path} has neither a {host_abi} native payload nor classes.dex"
         ))
     }
 }
@@ -321,6 +323,7 @@ pub fn launch(args: &[String]) -> i32 {
     let mut height: Option<u32> = None;
     let mut density: Option<i32> = None;
     let mut app_args: Vec<String> = Vec::new();
+    let mut log_arg: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -342,6 +345,7 @@ pub fn launch(args: &[String]) -> i32 {
                     return 2;
                 }
             },
+            "--log" => log_arg = it.next().cloned(),
             "--density" => match it.next().and_then(|v| v.parse().ok()) {
                 Some(v) => density = Some(v),
                 None => {
@@ -360,7 +364,14 @@ pub fn launch(args: &[String]) -> i32 {
             other => apk_path = Some(other.to_string()),
         }
     }
-    let Some(apk_path) = apk_path else {
+    if let Some(path) = log_arg {
+        if let Err(error) = enable_launch_log(&path) {
+            eprintln!("pengudroid launch: cannot open launch log {path}: {error}");
+            return 1;
+        }
+    }
+    configure_aurora_user_dirs();
+    let Some(apk_path) = apk_path.map(expand_user_path).map(resolve_package_apk_path) else {
         eprintln!(
             "usage: pengudroid launch <app.apk> [--backend auto|native|art] [--prefix DIR] \
              [--sysroot DIR] [--width PX] [--height PX] [--density DPI] [-- ARGS]"
@@ -475,6 +486,18 @@ pub fn launch(args: &[String]) -> i32 {
         return 1;
     }
 
+    let _launch_lock = match acquire_launch_lock(&info.package) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!("pengudroid launch: {} is already running", info.package);
+            return 0;
+        }
+        Err(error) => {
+            eprintln!("pengudroid launch: cannot create instance lock: {error}");
+            return 1;
+        }
+    };
+
     match backend {
         Backend::Native => {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
@@ -506,6 +529,7 @@ pub fn launch(args: &[String]) -> i32 {
                 eprintln!("pengudroid launch: {error}");
                 return 1;
             }
+            let mut surface_size = (width.unwrap_or(720), height.unwrap_or(1280));
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
             cmd.arg("art-test")
                 .arg("--sysroot")
@@ -578,9 +602,28 @@ pub fn launch(args: &[String]) -> i32 {
                         "portrait default"
                     }
                 );
+                surface_size = (
+                    width.unwrap_or(geometry.width.max(1) as u32),
+                    height.unwrap_or(geometry.height.max(1) as u32),
+                );
                 cmd.env(crate::display::SURFACE_W_ENV, geometry.width.to_string());
                 cmd.env(crate::display::SURFACE_H_ENV, geometry.height.to_string());
             }
+            // Show a host window immediately instead of leaving Lipstick's
+            // splash up while ART interprets the application startup code.
+            // The guest later attaches to this id and presents into it.
+            let _loading_surface = match precreate_loading_surface(
+                surface_size.0, surface_size.1, &info.package,
+            ) {
+                Ok((client, id)) => {
+                    cmd.env("PENGUDROID_SURFACE_ID", id.to_string());
+                    Some(client)
+                }
+                Err(error) => {
+                    eprintln!("pengudroid launch: loading surface unavailable: {error}");
+                    None
+                }
+            };
             if let Some(activity) = &activity {
                 cmd.arg("--bind-app");
                 cmd.env("PENGUDROID_LAUNCH_ACTIVITY", activity);
@@ -619,12 +662,19 @@ pub fn launch(args: &[String]) -> i32 {
             // `PENGUDROID_NATIVE_BRIDGE_LIB` OR automatically when launching an
             // ARM64-only app (`arm64-v8a` without `x86_64`) and an installed
             // bridge tree (next to the exe or in the AppImage cache) is found.
-            let arm64_only = is_arm64_only_payload(
+            // Native ARM64 payloads need no translation on an AArch64 host.
+            // Berberis in this tree is strictly an ARM64-to-x86_64 bridge.
+            let needs_arm64_bridge = cfg!(target_arch = "x86_64") && is_arm64_only_payload(
                 bundle_selected_abi.as_deref(),
                 &app_path,
                 &split_paths,
             );
             let explicit_bridge = std::env::var("PENGUDROID_NATIVE_BRIDGE_LIB").ok();
+            #[cfg(not(target_arch = "x86_64"))]
+            if explicit_bridge.is_some() {
+                eprintln!("pengudroid launch: the bundled Berberis bridge is only supported on x86_64 hosts");
+                return 1;
+            }
             let bridge_setup = if let Some(explicit) = explicit_bridge {
                 let path = PathBuf::from(&explicit);
                 let dir = if path.is_dir() {
@@ -636,7 +686,7 @@ pub fn launch(args: &[String]) -> i32 {
                     .map(PathBuf::from)
                     .or_else(|| guest_root_for_bridge(&dir));
                 Some((path, dir, guest))
-            } else if arm64_only {
+            } else if needs_arm64_bridge {
                 find_arm64_bridge_dir().map(|(dir, guest)| (dir.clone(), dir, guest))
             } else {
                 None
@@ -676,7 +726,7 @@ pub fn launch(args: &[String]) -> i32 {
                     }
                 }
                 println!("  bridge  : arm64 ({})", bridge_dir.display());
-            } else if arm64_only {
+            } else if needs_arm64_bridge {
                 eprintln!(
                     "  warning : ARM64-only payload detected, but libberberis_arm64.so was not found \
                      (set PENGUDROID_NATIVE_BRIDGE_LIB)"
@@ -688,6 +738,7 @@ pub fn launch(args: &[String]) -> i32 {
             if !app_args.is_empty() {
                 cmd.arg("--").args(&app_args);
             }
+            apply_aurora_package_env(&mut cmd, &info.package);
             apply_env(&mut cmd, &env);
             if let Some(dir) = asset_root(&app_path, &prefix, &split_paths) {
                 cmd.current_dir(dir);
@@ -695,6 +746,190 @@ pub fn launch(args: &[String]) -> i32 {
             run_child(cmd)
         }
     }
+}
+
+/// Use package-owned executable libraries when running from an Aurora desktop
+/// launcher. Home and /tmp are noexec there, and the desktop session does not
+/// carry the environment used by interactive art-test debugging.
+/// Current APM package's data directory, derived from the resolved executable
+/// (/opt/app/<package>/<version>/bin/<executable>). This supports standalone
+/// Android application packages instead of assuming the MaxNext package.
+fn aurora_package_data_dir() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    // Inside Firejail current_exe may be /usr/bin/<package> even though APM
+    // stores its data below /opt/app. The executable name is the package name.
+    if let Some(package) = executable.file_name() {
+        let data = PathBuf::from("/opt/app").join(package).join("current/data");
+        if data.is_dir() { return Some(data); }
+    }
+    let executable = std::fs::canonicalize(&executable).unwrap_or(executable);
+    let bin = executable.parent()?;
+    if bin.file_name()? != "bin" { return None; }
+    let data = bin.parent()?.parent()?.join("data");
+    data.is_dir().then_some(data)
+}
+
+fn aurora_package_name() -> Option<String> {
+    // data -> version -> package
+    Some(aurora_package_data_dir()?.parent()?.parent()?.file_name()?
+        .to_string_lossy().into_owned())
+}
+
+fn aurora_application_name() -> Option<String> {
+    aurora_package_name()?.rsplit('.').next().map(str::to_owned)
+}
+
+fn apply_aurora_package_env(cmd: &mut std::process::Command, package: &str) {
+    if !cfg!(target_arch = "aarch64") {
+        return;
+    }
+    let Some(lib) = aurora_package_data_dir().map(|data| data.join("lib")) else { return };
+    if !lib.join("libart.so").is_file() {
+        return;
+    }
+    cmd.env("PENGUDROID_ART_LIBS", &lib);
+    if std::env::var_os("PENGUDROID_FORCE_SHM").is_none() {
+        cmd.env("PENGUDROID_FORCE_SHM", "1");
+    }
+    if std::env::var_os("PENGUDROID_FORCE_TRAVERSAL").is_none() {
+        cmd.env("PENGUDROID_FORCE_TRAVERSAL", "1");
+    }
+    if std::env::var_os("PENGUDROID_SUPPRESS_DESTRUCTORS").is_none() {
+        cmd.env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1");
+    }
+    if std::env::var_os("PENGUDROID_NO_CODEC2_SERVICE").is_none() {
+        cmd.env("PENGUDROID_NO_CODEC2_SERVICE", "1");
+    }
+    if std::env::var_os("PENGUDROID_STATUSBAR_HEIGHT").is_none() {
+        // Dialog-S/Lipstick: max(statusbar, cutout) from dconf = 132 px.
+        cmd.env("PENGUDROID_STATUSBAR_HEIGHT", "132");
+    }
+    let app_lib = lib.join(package);
+    if app_lib.is_dir() {
+        cmd.env("PENGUDROID_NATIVE_LIB_DIR", &app_lib);
+        cmd.env("PENGUDROID_NATIVE_LIB_DIRS", &app_lib);
+    }
+}
+
+/// Sailjail grants an application only its organization/application data and
+/// cache directories. Manual SSH launches historically used ~/.*/pengudroid,
+/// but those paths do not exist in the desktop sandbox's mount namespace.
+fn configure_aurora_user_dirs() {
+    let Some(package_data) = aurora_package_data_dir() else { return };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let Some(application) = aurora_application_name() else { return };
+    let data = home.join(format!(".local/share/io.github.denizomer10/{application}"));
+    let cache = home.join(format!(".cache/io.github.denizomer10/{application}"));
+    // Environment mutation is process-global. This happens on the launcher
+    // thread before any runtime, daemon or render thread has been created.
+    unsafe {
+        std::env::set_var("XDG_DATA_HOME", &data);
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+    }
+    let runtime = home.join("Documents/PenguDroid/runtime/android17-arm64");
+    eprintln!(
+        "pengudroid launch: sandbox paths documents={} runtime={} framework={} cache={}",
+        runtime.parent().is_some_and(|p| p.is_dir()), runtime.is_dir(),
+        runtime.join("system/framework/framework.jar").is_file(), cache.is_dir(),
+    );
+    if !runtime.join("system/framework/framework.jar").is_file() {
+        let archive = package_data.join("runtime/android17-arm64.tar.gz");
+        if archive.is_file() {
+            if let Some(parent) = runtime.parent() {
+                let _ = std::fs::create_dir_all(parent);
+                eprintln!("pengudroid launch: unpacking packaged Android runtime");
+                match std::process::Command::new("tar")
+                    .arg("-xzf").arg(&archive).arg("-C").arg(parent).status()
+                {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => eprintln!("pengudroid launch: runtime unpack failed: {status}"),
+                    Err(error) => eprintln!("pengudroid launch: cannot run tar: {error}"),
+                }
+            }
+        }
+    }
+    let private_runtime = cache.join("pengudroid/runtime/android17-arm64");
+    for candidate in [runtime, private_runtime] {
+        if candidate.is_dir() {
+            unsafe { std::env::set_var("PENGUDROID_ART_SYSROOT", candidate) };
+            break;
+        }
+    }
+}
+
+fn aurora_cache_dir() -> Option<PathBuf> {
+    aurora_package_data_dir()?;
+    let application = aurora_application_name()?;
+    // The application home cache is whitelisted in every Firejail instance
+    // and needs no privileged /srv/shared provisioning.
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(format!(".cache/io.github.denizomer10/{application}/cache"))
+    })
+}
+
+/// Capture both the launcher and its child in a persistent per-user log. A
+/// bare filename is placed in the usual cache directory, which is especially
+/// useful for desktop sandbox launches where stdout is not visible.
+fn enable_launch_log(path: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let path = expand_user_path(path.to_string());
+    let path = if path.contains('/') {
+        PathBuf::from(path)
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        if let Some(cache) = aurora_cache_dir() {
+            cache.join(path)
+        } else {
+            PathBuf::from(home).join(".cache/pengudroid").join(path)
+        }
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    unsafe { std::env::set_var("PENGUDROID_DAEMON_KEEP_LOG", "1") };
+    for fd in [1, 2] {
+        if unsafe { libc::dup2(file.as_raw_fd(), fd) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Expand a literal `$HOME/` or `~/` supplied by a desktop Exec entry. Desktop
+/// launchers do not run a shell, so the launcher itself performs this mapping.
+fn expand_user_path(path: String) -> String {
+    let suffix = path.strip_prefix("$HOME/").or_else(|| path.strip_prefix("~/"));
+    let Some(suffix) = suffix else { return path };
+    let Some(home) = std::env::var_os("HOME") else { return path };
+    PathBuf::from(home).join(suffix).display().to_string()
+}
+
+/// Resolve a bare APK filename from the package's own apps directory. This
+/// keeps desktop entries relocatable: `launch MaxNext.apk` needs neither a
+/// hardcoded home directory nor shell expansion. Explicit paths still win.
+fn resolve_package_apk_path(path: String) -> String {
+    if path.contains('/') || PathBuf::from(&path).is_file() {
+        return path;
+    }
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("PENGUDROID_APK_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Some(data) = aurora_package_data_dir() {
+        dirs.push(data.join("apps"));
+    }
+    if let Some(package) = aurora_package_name() {
+        dirs.push(PathBuf::from("/usr/share").join(package).join("apps"));
+    }
+    for dir in dirs {
+        let candidate = dir.join(&path);
+        if candidate.is_file() {
+            return candidate.display().to_string();
+        }
+    }
+    path
 }
 
 /// Highest SIMD ISA tier supported by the host CPU at runtime.
@@ -870,10 +1105,73 @@ fn asset_root(apk: &str, prefix: &Path, splits: &[String]) -> Option<PathBuf> {
     Some(root)
 }
 
+/// Create the visible loading window before starting ART. Keep the returned
+/// client alive until the guest exits: the daemon ties surface ownership to
+/// the creating process. The GL shim attaches through PENGUDROID_SURFACE_ID.
+fn precreate_loading_surface(
+    width: u32,
+    height: u32,
+    package: &str,
+) -> Result<(crate::client::Client, u32), String> {
+    use pengudroid_proto::{Message, Role};
+    let socket = pengudroid_proto::default_socket_path();
+    let client = crate::client::Client::connect_to(&socket)
+        .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
+    client.handshake(Role::Cli).map_err(|e| e.to_string())?;
+    let title = match package {
+        "ru.oneme.app" => "MaxNext".to_string(),
+        "ru.sberbankmobile" => "СберБанк".to_string(),
+        _ => format!("PenguDroid: {package}"),
+    };
+    let (reply, _fds) = client
+        .request(&Message::CreateSurface { width, height, title })
+        .map_err(|e| e.to_string())?;
+    match reply {
+        Message::SurfaceCreated { surface_id, .. } => Ok((client, surface_id)),
+        Message::Error { code, message } => Err(format!("daemon error {code}: {message}")),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+/// Keep one desktop launcher (and therefore one daemon/window) per Android
+/// package. Lipstick's single-instance hint is not sufficient for direct D-Bus
+/// or audb launches, so the lifetime of this open file follows `cmd.status()`.
+fn acquire_launch_lock(package: &str) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let socket = pengudroid_proto::default_socket_path();
+    let runtime_dir = socket.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let dir = match (std::env::var_os("HOME"), aurora_application_name()) {
+        (Some(home), Some(application)) if aurora_package_data_dir().is_some() => {
+            // Unlike /run/user, this whitelisted home directory is shared by
+            // all Firejail instances of the same standalone application.
+            PathBuf::from(home)
+                .join(format!(".cache/io.github.denizomer10/{application}/cache"))
+        }
+        _ => runtime_dir.to_path_buf(),
+    };
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true)
+        .open(dir.join(format!("launch-{package}.lock")))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
 fn run_child(mut cmd: std::process::Command) -> i32 {
     match cmd.status() {
         Ok(s) if s.success() => 0,
-        Ok(s) => s.code().unwrap_or(1),
+        Ok(s) => {
+            eprintln!("pengudroid launch: guest exited with {s}");
+            s.code().unwrap_or(1)
+        }
         Err(e) => {
             eprintln!("pengudroid launch: cannot start the guest: {e}");
             1

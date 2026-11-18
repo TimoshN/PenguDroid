@@ -12,8 +12,42 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Android runtime architecture supported by the host build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeArch {
+    X86_64,
+    Arm64,
+}
+
+impl RuntimeArch {
+    pub const fn cli_name(self) -> &'static str {
+        match self { Self::X86_64 => "x86_64", Self::Arm64 => "arm64" }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self { Self::X86_64 => "x86_64", Self::Arm64 => "ARM64" }
+    }
+
+    pub const fn boot_dir(self) -> &'static str {
+        match self { Self::X86_64 => "x86_64", Self::Arm64 => "arm64" }
+    }
+
+    pub const fn from_elf_machine(machine: u16) -> Option<Self> {
+        match machine { 62 => Some(Self::X86_64), 183 => Some(Self::Arm64), _ => None }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub const HOST_ARCH: RuntimeArch = RuntimeArch::X86_64;
+#[cfg(target_arch = "aarch64")]
+pub const HOST_ARCH: RuntimeArch = RuntimeArch::Arm64;
+
 /// Directory name of the prepared runtime inside the cache.
-pub const RUNTIME_DIR: &str = "android17-x86_64";
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub const RUNTIME_DIR: &str = match HOST_ARCH {
+    RuntimeArch::X86_64 => "android17-x86_64",
+    RuntimeArch::Arm64 => "android17-arm64",
+};
 /// Cache directory name this project owns.
 const CACHE_NAME: &str = "pengudroid";
 /// Relative location of the preparation tool inside a checkout.
@@ -22,7 +56,9 @@ const PREPARE_SCRIPT: &str = "tools/prepare-android17.py";
 /// Preserve the AppImage's private libc and dependency closure in helpers.
 pub fn host_library_path(paths: &str) -> String {
     match std::env::var("PENGUDROID_PORTABLE_LIBS") {
-        Ok(libs) if !libs.is_empty() => format!("{libs}:{paths}"),
+        // Bionic soname aliases (`libc.so`, `libm.so`, ...) in `paths` must
+        // win over both the portable runtime and the host's linker scripts.
+        Ok(libs) if !libs.is_empty() => format!("{paths}:{libs}"),
         _ => paths.to_string(),
     }
 }
@@ -57,7 +93,11 @@ pub fn locate() -> Option<PathBuf> {
         return Some(explicit);
     }
     if let Ok(cwd) = std::env::current_dir() {
-        if let Some(tree) = existing(cwd.join(".toolchain/sysroot-android17")) {
+        let checkout = match HOST_ARCH {
+            RuntimeArch::X86_64 => ".toolchain/sysroot-android17",
+            RuntimeArch::Arm64 => ".toolchain/sysroot-android17-arm64",
+        };
+        if let Some(tree) = existing(cwd.join(checkout)) {
             return Some(tree);
         }
     }
@@ -132,6 +172,8 @@ impl Provisioning {
         command
             .arg("-B")
             .arg(&self.script)
+            .arg("--arch")
+            .arg(HOST_ARCH.cli_name())
             .arg("--cache")
             .arg("--output")
             .arg(self.cache_root.join("runtime").join(RUNTIME_DIR));
@@ -252,12 +294,14 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            [
-                "-B",
-                "/checkout/tools/prepare-android17.py",
-                "--cache",
-                "--output",
-                "/cache/pengudroid/runtime/android17-x86_64",
+            vec![
+                "-B".into(),
+                "/checkout/tools/prepare-android17.py".into(),
+                "--arch".into(),
+                HOST_ARCH.cli_name().into(),
+                "--cache".into(),
+                "--output".into(),
+                format!("/cache/pengudroid/runtime/{RUNTIME_DIR}"),
             ]
         );
         let download = Provisioning { download: true, ..plan };

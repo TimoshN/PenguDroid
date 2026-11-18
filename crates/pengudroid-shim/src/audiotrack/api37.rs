@@ -77,7 +77,10 @@ impl Metadata {
 }
 
 pub(super) unsafe fn register(env: Env) -> i32 {
-    if env.is_null() || !cfg!(target_arch = "x86_64") { return -1; }
+    // The descriptors and JNI table are architecture-independent; the host
+    // sink performs no x86_64-specific calls. Keep the same registration gate
+    // on AArch64 instead of rejecting the whole ART launch before app startup.
+    if env.is_null() { return -1; }
     if jni::exception_check(env) { return -1; }
     let _install = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     READY.store(false, Ordering::Release);
