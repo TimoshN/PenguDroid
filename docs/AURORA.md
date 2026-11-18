@@ -232,9 +232,13 @@ On Hybris/AArch64 the GLES shim loads `libhybris-common.so.1` first and sets
 `ro.surface_flinger.use_context_priority=false` **before** loading host
 EGL/GLES. This is required because libEGL's initializer can query configstore
 immediately; setting the properties after `dlopen(libEGL)` was too late and
-caused `Process may not make oneway calls` on RenderThread. No manual `setprop`
-command is required after a reboot. The ordinary non-Hybris/QEMU path is
-unchanged. Launch the package normally:
+caused `Process may not make oneway calls` on RenderThread. The launcher also
+calls `/usr/bin/setprop` directly when that executable is visible (manual SSH
+launch). Sailjail's private-bin hides it from desktop launches, so cold-boot
+property provisioning inside the sandbox still needs hardening; the manual
+three-property command remains the verified recovery if they are empty after
+a reboot. The ordinary non-Hybris/QEMU path is unchanged. Launch the package
+normally:
 
 ```sh
 audb launch io.github.denizomer10.PenguDroid
@@ -434,13 +438,24 @@ and closed its window (`sberbank-login-tap.png`); this was not proven to be a
 button action. DEX analysis identifies the direct status-1 caller as
 `nl/r.uncaughtException`: the Crashlytics branch calls System.exit only when the
 default uncaught-exception handler is null. PenguDroid lacked RuntimeInit's
-normal handler, so the original Throwable was not printed. Opt-in
-`PENGUDROID_TRACE_EXIT=1` now installs RuntimeInit LoggingHandler/
-KillApplicationHandler and also traces the Java stack at ART's `_exit` boundary.
-The original Throwable has not recurred in subsequent runs, so the underlying
+normal handler, so the original Throwable was not printed. Experimental
+RuntimeInit/exit tracing was tried during diagnosis and subsequently rolled
+back. The original Throwable has not recurred in subsequent runs, so the underlying
 exception remains unknown. SQLCipher also logs a missing `nativeOpen` JNI
-method. 115 CLI tests, the fortified-fgets regression and `git diff --check`
-passed.
+method.
+
+A separate signed `io.github.denizomer10.Sberbank` RPM now contains its own
+executable, desktop entry, icons, original APK and prepared native libraries.
+The currently installed development variant excludes four
+`libcrashlytics*.so` files because their Bionic dependencies otherwise attempt
+executable mappings from the noexec Documents runtime. The APK itself remains
+unchanged; the full-native package is preserved separately under
+`target/aurora/sberbank-rpm/`. With the three Hybris display properties set,
+the clean standalone desktop launch renders the welcome/login screen through
+automatic gralloc and remains alive. Evidence:
+`target/aurora/sberbank-separate-clean-relaunch.png` and its `.log`. This is
+still a development bundle, not a claim of full banking compatibility. 115 CLI
+tests, the fortified-fgets regression and `git diff --check` passed.
 
 ## Runtime work still required
 

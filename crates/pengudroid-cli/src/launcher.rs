@@ -798,6 +798,9 @@ fn apply_aurora_package_env(
     cmd.env("PENGUDROID_ART_LIBS", &lib);
     let hybris = Path::new("/usr/lib/libhybris-common.so.1").is_file()
         && Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file();
+    if hybris {
+        configure_aurora_hybris_properties();
+    }
     let force_shm = overridden("PENGUDROID_FORCE_SHM")
         && !overridden("PENGUDROID_FORCE_DMABUF");
     if hybris && !force_shm && !overridden("PENGUDROID_FORCE_DMABUF") {
@@ -830,6 +833,34 @@ fn apply_aurora_package_env(
     if app_lib.is_dir() {
         cmd.env("PENGUDROID_NATIVE_LIB_DIR", &app_lib);
         cmd.env("PENGUDROID_NATIVE_LIB_DIRS", &app_lib);
+    }
+}
+
+/// Reset Hybris' optional display defaults before ART loads host EGL. The
+/// system setprop utility talks to the device property service directly; the
+/// gleshim performs the same setup in its isolated namespace as a fallback.
+fn configure_aurora_hybris_properties() {
+    for key in [
+        "ro.surface_flinger.has_wide_color_display",
+        "ro.surface_flinger.has_HDR_display",
+        "ro.surface_flinger.use_context_priority",
+    ] {
+        match std::process::Command::new("/usr/bin/setprop")
+            .arg(key)
+            .arg("false")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!(
+                "pengudroid launch: setprop {key} failed with {status}"
+            ),
+            Err(error) => eprintln!(
+                "pengudroid launch: cannot run setprop for {key}: {error}"
+            ),
+        }
     }
 }
 
