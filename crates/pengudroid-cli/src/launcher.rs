@@ -738,7 +738,7 @@ pub fn launch(args: &[String]) -> i32 {
             if !app_args.is_empty() {
                 cmd.arg("--").args(&app_args);
             }
-            apply_aurora_package_env(&mut cmd, &info.package);
+            apply_aurora_package_env(&mut cmd, &info.package, &env);
             apply_env(&mut cmd, &env);
             if let Some(dir) = asset_root(&app_path, &prefix, &split_paths) {
                 cmd.current_dir(dir);
@@ -779,7 +779,11 @@ fn aurora_application_name() -> Option<String> {
     aurora_package_name()?.rsplit('.').next().map(str::to_owned)
 }
 
-fn apply_aurora_package_env(cmd: &mut std::process::Command, package: &str) {
+fn apply_aurora_package_env(
+    cmd: &mut std::process::Command,
+    package: &str,
+    configured_env: &[(String, String)],
+) {
     if !cfg!(target_arch = "aarch64") {
         return;
     }
@@ -787,8 +791,26 @@ fn apply_aurora_package_env(cmd: &mut std::process::Command, package: &str) {
     if !lib.join("libart.so").is_file() {
         return;
     }
+    let overridden = |name: &str| {
+        std::env::var_os(name).is_some()
+            || configured_env.iter().any(|(key, _)| key == name)
+    };
     cmd.env("PENGUDROID_ART_LIBS", &lib);
-    if std::env::var_os("PENGUDROID_FORCE_SHM").is_none() {
+    let hybris = Path::new("/usr/lib/libhybris-common.so.1").is_file()
+        && Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file();
+    let force_shm = overridden("PENGUDROID_FORCE_SHM")
+        && !overridden("PENGUDROID_FORCE_DMABUF");
+    if hybris && !force_shm && !overridden("PENGUDROID_FORCE_DMABUF") {
+        // This Lipstick exposes neither linux-dmabuf nor wl_drm. Native gralloc
+        // with an fd-backed wl_shm pool avoids the costly glReadPixels path.
+        if !overridden("PENGUDROID_GRALLOC") {
+            cmd.env("PENGUDROID_GRALLOC", "1");
+        }
+        if !overridden("PENGUDROID_GRALLOC_SHM") {
+            cmd.env("PENGUDROID_GRALLOC_SHM", "1");
+        }
+    } else if !overridden("PENGUDROID_FORCE_SHM") {
+        // Preserve the verified fallback on other AArch64 package hosts.
         cmd.env("PENGUDROID_FORCE_SHM", "1");
     }
     if std::env::var_os("PENGUDROID_FORCE_TRAVERSAL").is_none() {

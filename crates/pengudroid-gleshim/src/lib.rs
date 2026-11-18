@@ -295,6 +295,11 @@ impl Host {
         let isolated = std::env::var_os("PENGUDROID_HOST_GL_NAMESPACE").is_some()
             || hybris_host();
         let mut namespace = libc::LM_ID_NEWLM;
+        // libEGL's static initializer may query configstore immediately. Set
+        // Hybris' SDR properties before that dlopen, not after it.
+        if isolated && hybris_host() {
+            configure_hybris_sdr_properties(&mut namespace);
+        }
         let egl_handle = open_first(
             &["libEGL.so.1", "libEGL.so", "libEGL_mesa.so.0"],
             isolated,
@@ -320,27 +325,6 @@ impl Host {
         )
         .ok_or_else(|| "could not dlopen libGLESv2.so.2".to_string())?;
 
-        if isolated {
-            // Android 10 libEGL queries HIDL configstore for these optional
-            // defaults. The hosted pipeline is 32-bit SDR; publishing that via
-            // Hybris' own property service avoids a second hwbinder runtime on
-            // the guest RenderThread.
-            type PropertySet = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
-            if let Some(set) = sym_ptr(egl_handle, "my_property_set").and_then(cast_fn) {
-                let set: PropertySet = set;
-                for key in [
-                    "ro.surface_flinger.has_wide_color_display",
-                    "ro.surface_flinger.has_HDR_display",
-                    "ro.surface_flinger.use_context_priority",
-                ] {
-                    let key = CString::new(key).unwrap();
-                    let value = c"false";
-                    // SAFETY: my_property_set is libhybris-common's ordinary
-                    // (key, value) property setter; both strings are valid.
-                    unsafe { set(key.as_ptr(), value.as_ptr()) };
-                }
-            }
-        }
         if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
             trace_mapped_gl();
         }
@@ -502,6 +486,55 @@ fn hybris_host() -> bool {
 fn host() -> Result<&'static Host, String> {
     HOST.get_or_init(Host::load).as_ref().map_err(Clone::clone)
 }
+
+/// Publish the hosted SDR configuration before loading Hybris EGL. Loading
+/// libhybris-common first also gives EGL/GLES the same isolated namespace.
+#[cfg(target_arch = "aarch64")]
+fn configure_hybris_sdr_properties(namespace: &mut libc::Lmid_t) {
+    let path = c"/usr/lib/libhybris-common.so.1";
+    // The handle deliberately remains open for the process lifetime, like the
+    // subsequent EGL/GLES handles.
+    let common = unsafe {
+        libc::dlmopen(
+            *namespace,
+            path.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL,
+        )
+    };
+    if common.is_null() {
+        return;
+    }
+    if unsafe {
+        libc::dlinfo(
+            common,
+            libc::RTLD_DI_LMID,
+            namespace as *mut libc::Lmid_t as *mut c_void,
+        )
+    } != 0 {
+        return;
+    }
+    type PropertySet = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
+    let Some(set) = sym_ptr(common, "my_property_set").and_then(cast_fn) else {
+        return;
+    };
+    let set: PropertySet = set;
+    for key in [
+        "ro.surface_flinger.has_wide_color_display",
+        "ro.surface_flinger.has_HDR_display",
+        "ro.surface_flinger.use_context_priority",
+    ] {
+        let key = CString::new(key).unwrap();
+        // SAFETY: my_property_set is libhybris-common's ordinary (key, value)
+        // setter; both strings are valid and remain alive for the call.
+        unsafe { set(key.as_ptr(), c"false".as_ptr()) };
+    }
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] configured Hybris SDR properties before host EGL");
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn configure_hybris_sdr_properties(_namespace: &mut libc::Lmid_t) {}
 
 fn open_first(names: &[&str], isolated: bool, namespace: libc::Lmid_t) -> Option<*mut c_void> {
     for name in names {

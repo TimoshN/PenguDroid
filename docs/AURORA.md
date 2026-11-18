@@ -226,12 +226,17 @@ existing `Documents` permission. Private prefixes use Aurora's
 `~/.cache/io.github.denizomer10/PenguDroid` directories. The launcher log is
 written to `/srv/shared/io.github.denizomer10/PenguDroid/cache/MaxNext.launch.log`.
 
-For the current Hybris test image, set the SDR properties again after a reboot:
+On Hybris/AArch64 the GLES shim loads `libhybris-common.so.1` first and sets
+`ro.surface_flinger.has_wide_color_display=false`,
+`ro.surface_flinger.has_HDR_display=false`, and
+`ro.surface_flinger.use_context_priority=false` **before** loading host
+EGL/GLES. This is required because libEGL's initializer can query configstore
+immediately; setting the properties after `dlopen(libEGL)` was too late and
+caused `Process may not make oneway calls` on RenderThread. No manual `setprop`
+command is required after a reboot. The ordinary non-Hybris/QEMU path is
+unchanged. Launch the package normally:
 
 ```sh
-audb shell 'setprop ro.surface_flinger.has_wide_color_display false; \
-  setprop ro.surface_flinger.has_HDR_display false; \
-  setprop ro.surface_flinger.use_context_priority false'
 audb launch io.github.denizomer10.PenguDroid
 ```
 
@@ -268,10 +273,16 @@ points after the MESA ones. This device's Mali/Hybris EGL advertises neither:
 `zwp_linux_dmabuf_v1` nor legacy `wl_drm`, so the usual dma-buf transport is
 unavailable on this device.
 
-A separate opt-in native path solves this without CPU readback. With
-`PENGUDROID_GRALLOC=1` and `PENGUDROID_GRALLOC_SHM=1`, gleshim allocates a linear
-BGRA Hybris gralloc buffer with SW_READ_OFTEN, wraps it as an EGLImage texture,
-and renders HWUI into its FBO. It selects the mmap-able native fd, converts the
+A separate native path solves this without CPU readback. The Aurora AArch64
+package launcher detects Hybris and enables `PENGUDROID_GRALLOC=1` and
+`PENGUDROID_GRALLOC_SHM=1` by default. An explicit `PENGUDROID_FORCE_SHM=1`
+selects the readback fallback instead, while `PENGUDROID_FORCE_DMABUF=1`
+preserves the ordinary dma-buf attempt. Manual non-package launches can still
+set the two gralloc variables themselves. QEMU and ordinary Linux behavior is
+unchanged.
+
+In this mode gleshim allocates a linear BGRA Hybris gralloc buffer with
+SW_READ_OFTEN, wraps it as an EGLImage texture, and renders HWUI into its FBO. It selects the mmap-able native fd, converts the
 gralloc stride from pixels to bytes, and presents that fd through `wl_shm`.
 Lipstick ignores wl_shell buffer transforms, so a second gralloc buffer and
 `glBlitFramebuffer` perform the Y-flip entirely on the GPU. The daemon imports
@@ -281,9 +292,13 @@ the fd directly as an `Xrgb8888` `wl_buffer` and retains it until release. No
 The audb-launched result has correct orientation and colours, reaches about
 42 FPS on the tested MAX login screen, and touch opens the country selector.
 Evidence: `target/aurora/maxnext-gralloc-flip.png` and
-`target/aurora/maxnext-gralloc-zerocopy-country.png`. Gralloc remains
-experimental and opt-in; the ordinary dma-buf path and readback fallback remain
-available. Full resolution and vsync are retained.
+`target/aurora/maxnext-gralloc-zerocopy-country.png`. The standalone desktop
+RPM was also launched without any manual graphics environment: it selected
+gralloc automatically, rendered the MAX login screen and sustained about
+32–34 FPS (`target/aurora/maxnext-default-gralloc.png` and
+`target/aurora/maxnext-default-gralloc.log`). Gralloc remains experimental and
+specific to the detected Hybris device path; ordinary dma-buf and explicit
+readback fallback remain available. Full resolution and vsync are retained.
 
 `PENGUDROID_PROFILE_GRALLOC=1` adds per-second timing. On the measured MAX
 login screen the sustained rate is 32–34 FPS: `glFinish` after HWUI takes about
