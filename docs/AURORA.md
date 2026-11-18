@@ -438,9 +438,10 @@ and closed its window (`sberbank-login-tap.png`); this was not proven to be a
 button action. DEX analysis identifies the direct status-1 caller as
 `nl/r.uncaughtException`: the Crashlytics branch calls System.exit only when the
 default uncaught-exception handler is null. PenguDroid lacked RuntimeInit's
-normal handler, so the original Throwable was not printed. Experimental
-RuntimeInit/exit tracing was tried during diagnosis and subsequently rolled
-back. The original Throwable has not recurred in subsequent runs, so the underlying
+normal handler, so the original Throwable was not printed. The opt-in
+`PENGUDROID_TRACE_EXIT=1` diagnostic installs RuntimeInit's logging/kill
+handler to expose early application exceptions. The original Throwable has
+not recurred in subsequent runs, so the underlying
 exception remains unknown. SQLCipher also logs a missing `nativeOpen` JNI
 method.
 
@@ -469,14 +470,27 @@ The APK remains unchanged.
 A separate signed `io.github.denizomer10.PsbMobile` development RPM contains
 its own executable, `ПСБ` desktop entry, the APK's original icon, the original
 APK and all 21 version-stripped ARM64 libraries. APM accepted and installed it
-on Dialog-S. The first desktop launch reaches application binding and provider
-initialization, then loads `libsupport.so` (CryptoPro
-`ChangeWorkDirectory_changeWD`) and dies with `SIGSEGV` at PC 0 in the host
-loader's finalization path. No Activity launch or rendered application UI has
-been verified yet. Evidence: `target/aurora/psbmobile-separate-first.log` and
-`target/aurora/psbmobile-separate-first.png`. This blocker is specific to the
-PSB native startup path, not evidence that the separate package installation
-failed.
+on Dialog-S. The first desktop launch reached application binding and provider
+initialization, then died at PC 0 while loading CryptoPro native code.
+`LD_DEBUG=files,reloc` isolated this to `libcspjni.so`: its 105-entry
+`DT_INIT_ARRAY` has 104 relocated constructors followed by one unrelocated null
+sentinel. Bionic skips that entry; glibc calls it. Native preprocessing now
+trims trailing unrelocated null init-array entries while preserving relocated
+zero entries. The device-verified `libcspjni.so` subsequently passed direct
+`dlopen`, and the full app loaded both `libsupport.so` and `libcspjni.so` and
+registered CryptoPro native methods. The ELF crate has regression coverage for
+both cases (12 tests).
+
+PenguDroid also now performs the normal
+`android.security.keystore2.AndroidKeyStoreProvider.install()` registration
+from Zygote's JCA warmup before application binding. This exposed the next,
+separate backend boundary: `IKeystoreSecurityLevel.asBinder()` is null because
+there is no hosted Android Keystore2 service. The current failure is therefore
+`Unable to create application AppContainer` in AndroidX security crypto, not
+the former native init-array crash. No Activity launch or rendered PSB UI has
+been verified yet. Evidence: `target/aurora/psbmobile-keystore.log`,
+`target/aurora/psbmobile-keystore.png`, and the earlier native diagnostics
+`target/aurora/psbmobile-lddebug.log`. The original APK remains unchanged.
 
 ## Runtime work still required
 

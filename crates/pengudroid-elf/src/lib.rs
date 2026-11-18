@@ -55,18 +55,26 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
 }
 
 fn rd_u16(d: &[u8], o: usize) -> Result<u16> {
-    let b = d.get(o..o + 2).ok_or_else(|| ElfError("truncated u16".into()))?;
+    let b = d
+        .get(o..o + 2)
+        .ok_or_else(|| ElfError("truncated u16".into()))?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn rd_u32(d: &[u8], o: usize) -> Result<u32> {
-    let b = d.get(o..o + 4).ok_or_else(|| ElfError("truncated u32".into()))?;
+    let b = d
+        .get(o..o + 4)
+        .ok_or_else(|| ElfError("truncated u32".into()))?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn rd_u64(d: &[u8], o: usize) -> Result<u64> {
-    let b = d.get(o..o + 8).ok_or_else(|| ElfError("truncated u64".into()))?;
-    Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    let b = d
+        .get(o..o + 8)
+        .ok_or_else(|| ElfError("truncated u64".into()))?;
+    Ok(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 /// Read a NUL-terminated string from a string table.
@@ -74,7 +82,11 @@ fn strz(d: &[u8], o: usize) -> Result<String> {
     if o >= d.len() {
         return err("string offset out of range");
     }
-    let end = d[o..].iter().position(|&b| b == 0).map(|p| o + p).unwrap_or(d.len());
+    let end = d[o..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|p| o + p)
+        .unwrap_or(d.len());
     Ok(String::from_utf8_lossy(&d[o..end]).into_owned())
 }
 
@@ -158,13 +170,19 @@ pub fn parse(d: &[u8]) -> Result<ElfInfo> {
         return err("no .dynsym section (stripped or not a dynamic object)");
     };
     let strtab_idx = dynsym.link as usize;
-    let strtab = sections.get(strtab_idx).ok_or_else(|| ElfError("bad .dynsym sh_link".into()))?;
+    let strtab = sections
+        .get(strtab_idx)
+        .ok_or_else(|| ElfError("bad .dynsym sh_link".into()))?;
 
     let sym_size = match class {
         Class::Elf64 => 24,
         Class::Elf32 => 16,
     };
-    let entsize = if dynsym.entsize == 0 { sym_size as u64 } else { dynsym.entsize };
+    let entsize = if dynsym.entsize == 0 {
+        sym_size as u64
+    } else {
+        dynsym.entsize
+    };
     let count = (dynsym.size / entsize) as usize;
     let str_base = strtab.offset as usize;
 
@@ -173,8 +191,16 @@ pub fn parse(d: &[u8]) -> Result<ElfInfo> {
     for i in 0..count {
         let sym = dynsym.offset as usize + i * entsize as usize;
         let (name_off, info, shndx) = match class {
-            Class::Elf64 => (rd_u32(d, sym)?, d.get(sym + 4).copied().unwrap_or(0), rd_u16(d, sym + 6)?),
-            Class::Elf32 => (rd_u32(d, sym)?, d.get(sym + 12).copied().unwrap_or(0), rd_u16(d, sym + 14)?),
+            Class::Elf64 => (
+                rd_u32(d, sym)?,
+                d.get(sym + 4).copied().unwrap_or(0),
+                rd_u16(d, sym + 6)?,
+            ),
+            Class::Elf32 => (
+                rd_u32(d, sym)?,
+                d.get(sym + 12).copied().unwrap_or(0),
+                rd_u16(d, sym + 14)?,
+            ),
         };
         if name_off == 0 {
             continue; // index 0 / anonymous
@@ -198,7 +224,12 @@ pub fn parse(d: &[u8]) -> Result<ElfInfo> {
     exports.sort();
     exports.dedup();
 
-    Ok(ElfInfo { class, machine, imports, exports })
+    Ok(ElfInfo {
+        class,
+        machine,
+        imports,
+        exports,
+    })
 }
 
 /// Parse an ELF file from disk.
@@ -424,9 +455,15 @@ pub fn unpack_android_relocations(d: &[u8]) -> Result<Option<Vec<u8>>> {
         let base = shoff + i * shentsize;
         let sh_type = rd_u32(d, base + 4)?;
         let (off, size) = if is64 {
-            (rd_u64(d, base + 24)? as usize, rd_u64(d, base + 32)? as usize)
+            (
+                rd_u64(d, base + 24)? as usize,
+                rd_u64(d, base + 32)? as usize,
+            )
         } else {
-            (rd_u32(d, base + 16)? as usize, rd_u32(d, base + 20)? as usize)
+            (
+                rd_u32(d, base + 16)? as usize,
+                rd_u32(d, base + 20)? as usize,
+            )
         };
         match sh_type {
             SHT_ANDROID_RELA => packed = Some((off, size, true)),
@@ -641,6 +678,241 @@ fn w_u64(d: &mut [u8], o: usize, v: u64) {
     d[o..o + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+#[derive(Clone, Copy)]
+struct LoadSegment {
+    offset: u64,
+    vaddr: u64,
+    filesz: u64,
+}
+
+fn segment_file_offset(
+    d: &[u8],
+    segments: &[LoadSegment],
+    address: u64,
+    length: u64,
+) -> Result<usize> {
+    for segment in segments {
+        let Some(relative) = address.checked_sub(segment.vaddr) else {
+            continue;
+        };
+        let Some(end) = relative.checked_add(length) else {
+            continue;
+        };
+        if end <= segment.filesz {
+            let offset = segment
+                .offset
+                .checked_add(relative)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| ElfError("ELF virtual address overflows file offset".into()))?;
+            let length = length as usize;
+            if offset.checked_add(length).is_some_and(|end| end <= d.len()) {
+                return Ok(offset);
+            }
+        }
+    }
+    err(format!(
+        "ELF virtual address {address:#x} is not file-backed"
+    ))
+}
+
+/// Bionic ignores null entries in DT_INIT_ARRAY. glibc calls every entry and
+/// therefore jumps to address zero for Android objects which use an
+/// unrelocated trailing null as a sentinel. Exclude only that trailing run;
+/// zero entries with a relocation are retained because their load-time value
+/// may be a real constructor.
+fn trim_null_init_array_sentinels(out: &mut [u8], is64: bool) -> Result<usize> {
+    let (phoff, phentsize, phnum) = if is64 {
+        (
+            rd_u64(out, 0x20)?,
+            rd_u16(out, 0x36)? as u64,
+            rd_u16(out, 0x38)? as u64,
+        )
+    } else {
+        (
+            rd_u32(out, 0x1c)? as u64,
+            rd_u16(out, 0x2a)? as u64,
+            rd_u16(out, 0x2c)? as u64,
+        )
+    };
+    if phoff == 0 || phnum == 0 {
+        return Ok(0);
+    }
+    let expected_phentsize = if is64 { 56 } else { 32 };
+    if phentsize < expected_phentsize {
+        return err("invalid ELF program-header entry size");
+    }
+    let mut segments = Vec::new();
+    let mut dynamic = None;
+    for index in 0..phnum {
+        let base = phoff
+            .checked_add(index * phentsize)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| ElfError("ELF program-header overflow".into()))?;
+        if rd_u32(out, base)? != 2 {
+            // PT_DYNAMIC
+            let (offset, vaddr, filesz) = if rd_u32(out, base)? == 1 {
+                // PT_LOAD
+                if is64 {
+                    (
+                        rd_u64(out, base + 8)?,
+                        rd_u64(out, base + 16)?,
+                        rd_u64(out, base + 32)?,
+                    )
+                } else {
+                    (
+                        rd_u32(out, base + 4)? as u64,
+                        rd_u32(out, base + 8)? as u64,
+                        rd_u32(out, base + 16)? as u64,
+                    )
+                }
+            } else {
+                continue;
+            };
+            segments.push(LoadSegment {
+                offset,
+                vaddr,
+                filesz,
+            });
+            continue;
+        }
+        dynamic = Some(if is64 {
+            (rd_u64(out, base + 8)?, rd_u64(out, base + 32)?)
+        } else {
+            (
+                rd_u32(out, base + 4)? as u64,
+                rd_u32(out, base + 16)? as u64,
+            )
+        });
+    }
+    let Some((dynamic_offset, dynamic_size)) = dynamic else {
+        return Ok(0);
+    };
+    let dynamic_offset =
+        usize::try_from(dynamic_offset).map_err(|_| ElfError("PT_DYNAMIC overflow".into()))?;
+    let dynamic_size =
+        usize::try_from(dynamic_size).map_err(|_| ElfError("PT_DYNAMIC size overflow".into()))?;
+    let entry_size = if is64 { 16 } else { 8 };
+    let mut array_address = None;
+    let mut array_size = None;
+    let mut array_size_value_offset = None;
+    let mut rela = None;
+    let mut rel = None;
+    for index in 0..(dynamic_size / entry_size) {
+        let base = dynamic_offset + index * entry_size;
+        let tag = if is64 {
+            rd_u64(out, base)?
+        } else {
+            rd_u32(out, base)? as u64
+        };
+        let (value, value_offset) = if is64 {
+            (rd_u64(out, base + 8)?, base + 8)
+        } else {
+            (rd_u32(out, base + 4)? as u64, base + 4)
+        };
+        match tag {
+            0 => break,                        // DT_NULL
+            7 => rela = Some((value, base)),   // DT_RELA
+            17 => rel = Some((value, base)),   // DT_REL
+            25 => array_address = Some(value), // DT_INIT_ARRAY
+            27 => {
+                // DT_INIT_ARRAYSZ
+                array_size = Some(value);
+                array_size_value_offset = Some(value_offset);
+            }
+            _ => {}
+        }
+    }
+    // Read the size/entry tags in a second pass, independent of tag order.
+    let dynamic_value = |wanted: u64| -> Result<Option<u64>> {
+        for index in 0..(dynamic_size / entry_size) {
+            let base = dynamic_offset + index * entry_size;
+            let tag = if is64 {
+                rd_u64(out, base)?
+            } else {
+                rd_u32(out, base)? as u64
+            };
+            if tag == 0 {
+                break;
+            }
+            if tag == wanted {
+                return Ok(Some(if is64 {
+                    rd_u64(out, base + 8)?
+                } else {
+                    rd_u32(out, base + 4)? as u64
+                }));
+            }
+        }
+        Ok(None)
+    };
+    let (Some(array_address), Some(mut size), Some(size_offset)) =
+        (array_address, array_size, array_size_value_offset)
+    else {
+        return Ok(0);
+    };
+    let word = if is64 { 8u64 } else { 4u64 };
+    let rela_size = dynamic_value(8)?.unwrap_or(0); // DT_RELASZ
+    let rela_ent = dynamic_value(9)?.unwrap_or(if is64 { 24 } else { 12 }); // DT_RELAENT
+    let rel_size = dynamic_value(18)?.unwrap_or(0); // DT_RELSZ
+    let rel_ent = dynamic_value(19)?.unwrap_or(if is64 { 16 } else { 8 }); // DT_RELENT
+    let has_relocation = |target: u64, out: &[u8]| -> Result<bool> {
+        for (table, bytes, ent, addend) in [
+            (rela, rela_size, rela_ent, true),
+            (rel, rel_size, rel_ent, false),
+        ] {
+            let Some((address, _)) = table else { continue };
+            if bytes == 0 {
+                continue;
+            }
+            let expected = match (is64, addend) {
+                (true, true) => 24,
+                (true, false) => 16,
+                (false, true) => 12,
+                (false, false) => 8,
+            };
+            if ent < expected {
+                return err("invalid ELF relocation entry size");
+            }
+            let table_offset = segment_file_offset(out, &segments, address, bytes)?;
+            for index in 0..(bytes / ent) as usize {
+                let entry = table_offset + index * ent as usize;
+                let offset = if is64 {
+                    rd_u64(out, entry)?
+                } else {
+                    rd_u32(out, entry)? as u64
+                };
+                if offset == target {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    };
+
+    let original = size;
+    while size >= word {
+        let target = array_address + size - word;
+        let file = segment_file_offset(out, &segments, target, word)?;
+        let value = if is64 {
+            rd_u64(out, file)?
+        } else {
+            rd_u32(out, file)? as u64
+        };
+        if value != 0 || has_relocation(target, out)? {
+            break;
+        }
+        size -= word;
+    }
+    let trimmed = ((original - size) / word) as usize;
+    if trimmed != 0 {
+        if is64 {
+            w_u64(out, size_offset, size);
+        } else {
+            w_u32(out, size_offset, size as u32);
+        }
+    }
+    Ok(trimmed)
+}
+
 /// Remove Android's coarse symbol versioning so glibc's dynamic linker will
 /// resolve a Bionic object's symbols.
 ///
@@ -712,9 +984,15 @@ pub fn strip_android_versions(d: &[u8]) -> Result<Vec<u8>> {
         let base = shoff + i * shentsize;
         let sh_type = rd_u32(d, base + 4)?;
         let (off, size) = if is64 {
-            (rd_u64(d, base + 24)? as usize, rd_u64(d, base + 32)? as usize)
+            (
+                rd_u64(d, base + 24)? as usize,
+                rd_u64(d, base + 32)? as usize,
+            )
         } else {
-            (rd_u32(d, base + 16)? as usize, rd_u32(d, base + 20)? as usize)
+            (
+                rd_u32(d, base + 16)? as usize,
+                rd_u32(d, base + 20)? as usize,
+            )
         };
         if sh_type == SHT_GNU_VERSYM {
             versym = Some((off, size));
@@ -742,6 +1020,7 @@ pub fn strip_android_versions(d: &[u8]) -> Result<Vec<u8>> {
         mark_verneed_weak(&mut out, off, size);
     }
 
+    trim_null_init_array_sentinels(&mut out, is64)?;
     Ok(out)
 }
 
@@ -757,8 +1036,10 @@ fn mark_verneed_weak(out: &mut [u8], off: usize, size: usize) {
     // A `Verneed` is 16 bytes; guard against a zero/looping `vn_next`.
     while vn + 16 <= end {
         let vn_cnt = u16::from_le_bytes([out[vn + 2], out[vn + 3]]) as usize;
-        let vn_aux = u32::from_le_bytes([out[vn + 8], out[vn + 9], out[vn + 10], out[vn + 11]]) as usize;
-        let vn_next = u32::from_le_bytes([out[vn + 12], out[vn + 13], out[vn + 14], out[vn + 15]]) as usize;
+        let vn_aux =
+            u32::from_le_bytes([out[vn + 8], out[vn + 9], out[vn + 10], out[vn + 11]]) as usize;
+        let vn_next =
+            u32::from_le_bytes([out[vn + 12], out[vn + 13], out[vn + 14], out[vn + 15]]) as usize;
 
         // Each `Vernaux` is 16 bytes; `vna_flags` is a u16 at +4.
         let mut va = vn + vn_aux;
@@ -769,7 +1050,9 @@ fn mark_verneed_weak(out: &mut [u8], off: usize, size: usize) {
             let flags = u16::from_le_bytes([out[va + 4], out[va + 5]]);
             let flags = flags | VER_FLG_WEAK;
             out[va + 4..va + 6].copy_from_slice(&flags.to_le_bytes());
-            let vna_next = u32::from_le_bytes([out[va + 12], out[va + 13], out[va + 14], out[va + 15]]) as usize;
+            let vna_next =
+                u32::from_le_bytes([out[va + 12], out[va + 13], out[va + 14], out[va + 15]])
+                    as usize;
             if vna_next == 0 {
                 break;
             }
@@ -800,7 +1083,10 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe");
         let info = read_file(exe.to_str().unwrap()).expect("parse test binary");
         assert_eq!(info.class, Class::Elf64);
-        assert!(!info.imports.is_empty(), "a linked ELF should import symbols");
+        assert!(
+            !info.imports.is_empty(),
+            "a linked ELF should import symbols"
+        );
         // Symbols must be clean, printable names.
         for s in info.imports.iter().chain(info.exports.iter()) {
             assert!(!s.contains('\0'));
@@ -814,7 +1100,10 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let info = read_file(exe.to_str().unwrap()).unwrap();
         let looks_libc = info.imports.iter().any(|s| {
-            s.starts_with("__libc") || s == "malloc" || s == "free" || s.starts_with("pthread_")
+            s.starts_with("__libc")
+                || s == "malloc"
+                || s == "free"
+                || s.starts_with("pthread_")
                 || s.starts_with("mem")
         });
         assert!(
@@ -900,5 +1189,61 @@ mod tests {
     #[test]
     fn unpack_rejects_non_elf() {
         assert!(unpack_android_relocations(&[0, 1, 2, 3]).is_err());
+    }
+
+    fn init_array_fixture(relocate_last: bool) -> Vec<u8> {
+        let mut elf = vec![0u8; 0x400];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        w_u64(&mut elf, 0x20, 0x40);
+        w_u16(&mut elf, 0x36, 56);
+        w_u16(&mut elf, 0x38, 2);
+        // One file-backed PT_LOAD and one PT_DYNAMIC.
+        w_u32(&mut elf, 0x40, 1);
+        w_u64(&mut elf, 0x40 + 8, 0);
+        w_u64(&mut elf, 0x40 + 16, 0);
+        w_u64(&mut elf, 0x40 + 32, 0x400);
+        w_u32(&mut elf, 0x78, 2);
+        w_u64(&mut elf, 0x78 + 8, 0x200);
+        w_u64(&mut elf, 0x78 + 16, 0x200);
+        w_u64(&mut elf, 0x78 + 32, 0x80);
+        for (index, tag, value) in [
+            (0, 25, 0x300),
+            (1, 27, 24),
+            (2, 7, 0x380),
+            (3, 8, if relocate_last { 72 } else { 48 }),
+            (4, 9, 24),
+        ] {
+            w_u64(&mut elf, 0x200 + index * 16, tag);
+            w_u64(&mut elf, 0x200 + index * 16 + 8, value);
+        }
+        // Raw pointers are zero and become valid only through RELATIVE relocs.
+        for (index, address, addend) in [(0, 0x300, 0x1234), (1, 0x308, 0x2345), (2, 0x310, 0x3456)]
+        {
+            if index == 2 && !relocate_last {
+                continue;
+            }
+            w_u64(&mut elf, 0x380 + index * 24, address);
+            w_u64(&mut elf, 0x380 + index * 24 + 8, 1027);
+            w_u64(&mut elf, 0x380 + index * 24 + 16, addend);
+        }
+        elf
+    }
+
+    #[test]
+    fn trailing_unrelocated_null_init_sentinel_is_excluded() {
+        let mut elf = init_array_fixture(false);
+        assert_eq!(trim_null_init_array_sentinels(&mut elf, true).unwrap(), 1);
+        assert_eq!(rd_u64(&elf, 0x218).unwrap(), 16);
+        // The relocated entries themselves remain untouched.
+        assert_eq!(&elf[0x300..0x318], &[0; 24]);
+    }
+
+    #[test]
+    fn relocated_zero_init_entry_is_not_mistaken_for_a_sentinel() {
+        let mut elf = init_array_fixture(true);
+        assert_eq!(trim_null_init_array_sentinels(&mut elf, true).unwrap(), 0);
+        assert_eq!(rd_u64(&elf, 0x218).unwrap(), 24);
     }
 }

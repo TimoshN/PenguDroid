@@ -1180,6 +1180,11 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     if !configure_protolog(env) {
         eprintln!("apphost: warning: could not select logcat-only ProtoLog");
     }
+    if install_android_keystore_provider(env).is_some() {
+        println!("apphost: AndroidKeyStoreProvider installed (Zygote JCA warmup equivalent)");
+    } else {
+        eprintln!("apphost: warning: AndroidKeyStoreProvider installation unavailable");
+    }
     println!("apphost: calling handleBindApplication for {}", spec.package);
     let ok = env.call_void(thread, handle, &[JValue { l: data }]);
     if ok {
@@ -3564,6 +3569,11 @@ pub fn prepare_main_thread(env: &JniEnv) -> bool {
     if !env.call_static_void(looper_class, prepare, &[]) {
         eprintln!("apphost: Looper.prepareMainLooper threw");
         return false;
+    }
+    if std::env::var_os("PENGUDROID_TRACE_EXIT").is_some()
+        && install_kill_application_handler(env).is_some()
+    {
+        println!("apphost: RuntimeInit.KillApplicationHandler installed for exit tracing");
     }
     println!("apphost: prepared the main Looper");
 
@@ -6787,6 +6797,38 @@ fn spawn_draw_monitor(env: &JniEnv) {
 }
 
 /// Give the calling thread a `Looper` if it has none.
+/// PenguDroid starts ART directly rather than forking a fully initialized
+/// Zygote. Preserve ZygoteInit.warmUpJcaProviders' provider registration so
+/// KeyStore.getInstance("AndroidKeyStore") uses Android's real implementation.
+fn install_android_keystore_provider(env: &JniEnv) -> Option<()> {
+    let provider = env.find_class("android/security/keystore2/AndroidKeyStoreProvider")?;
+    let install = env.static_method_id(provider, "install", "()V")?;
+    env.call_static_void(provider, install, &[]).then_some(())
+}
+
+/// Restore Android's normal final uncaught-exception handler for diagnostics.
+/// Without RuntimeInit the default is null, so an early provider exception can
+/// terminate the process without printing its original Throwable.
+fn install_kill_application_handler(env: &JniEnv) -> Option<()> {
+    let logging_class = env.find_class("com/android/internal/os/RuntimeInit$LoggingHandler")?;
+    let logging_ctor = env.method_id(logging_class, "<init>", "()V")?;
+    let logging = env.new_object(logging_class, logging_ctor, &[])?;
+    let kill_class = env.find_class("com/android/internal/os/RuntimeInit$KillApplicationHandler")?;
+    let kill_ctor = env.method_id(
+        kill_class,
+        "<init>",
+        "(Lcom/android/internal/os/RuntimeInit$LoggingHandler;)V",
+    )?;
+    let handler = env.new_object(kill_class, kill_ctor, &[JValue { l: logging }])?;
+    let thread = env.find_class("java/lang/Thread")?;
+    let set_default = env.static_method_id(
+        thread,
+        "setDefaultUncaughtExceptionHandler",
+        "(Ljava/lang/Thread$UncaughtExceptionHandler;)V",
+    )?;
+    env.call_static_void(thread, set_default, &[JValue { l: handler }]).then_some(())
+}
+
 fn ensure_looper(env: &JniEnv) {
     let Some(looper_class) = env.find_class("android/os/Looper") else {
         return;
