@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+X-Nemo-Application-Type=silica-qt5
+Name=PSB Mobile
+Name[ru]=ПСБ
+GenericName=Android banking application
+GenericName[ru]=Android-банк
+Comment=PSB Mobile through PenguDroid
+Comment[ru]=ПСБ через PenguDroid
+Exec=io.github.denizomer10.PsbMobile --cli launch psbmobile.apk --backend art --width 1080 --height 2460 --log PsbMobile.launch.log
+Icon=io.github.denizomer10.PsbMobile
+Terminal=false
+Categories=Finance;Utility;
+X-Nemo-Single-Instance=yes
+
+[X-Application]
+Permissions=Internet;Audio;Downloads;Documents
+OrganizationName=io.github.denizomer10
+ApplicationName=PsbMobile
+
+[X-Aurora-Application]
+Orientation=Portrait
+IconMode=Scale

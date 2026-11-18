@@ -457,6 +457,27 @@ automatic gralloc and remains alive. Evidence:
 still a development bundle, not a claim of full banking compatibility. 115 CLI
 tests, the fortified-fgets regression and `git diff --check` passed.
 
+## PSB Mobile device probe
+
+`~/psbmobile.apk` is PSB Mobile 3.110.0 (versionCode 623), package
+`logo.com.mbanking`, with launcher
+`psb.com.mbanking.common.preloader.PreLoaderActivity`, 18 DEX files and 21
+ARM64 libraries. Its original SHA-256 is
+`a8757ee624455dc970590aebc22deea84ab3ae23eeb7dcc129d4a279118b6d50`.
+The APK remains unchanged.
+
+A separate signed `io.github.denizomer10.PsbMobile` development RPM contains
+its own executable, `ПСБ` desktop entry, the APK's original icon, the original
+APK and all 21 version-stripped ARM64 libraries. APM accepted and installed it
+on Dialog-S. The first desktop launch reaches application binding and provider
+initialization, then loads `libsupport.so` (CryptoPro
+`ChangeWorkDirectory_changeWD`) and dies with `SIGSEGV` at PC 0 in the host
+loader's finalization path. No Activity launch or rendered application UI has
+been verified yet. Evidence: `target/aurora/psbmobile-separate-first.log` and
+`target/aurora/psbmobile-separate-first.png`. This blocker is specific to the
+PSB native startup path, not evidence that the separate package installation
+failed.
+
 ## Runtime work still required
 
 1. Run a native ARM64 `NativeActivity` fixture on the device as well; verify
