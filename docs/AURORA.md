@@ -212,14 +212,23 @@ and is not the regular distributable artifact.
 The desktop entry now executes the multi-call binary as:
 
 ```ini
-Exec=io.github.denizomer10.PenguDroid --cli launch MaxNext.apk --backend art --width 1080 --height 2460 --log MaxNext.launch.log
+Exec=io.github.denizomer10.MaxNext --cli launch MaxNext.apk --backend art --width 1080 --height 2460 --signature-apk /opt/app/io.github.denizomer10.MaxNext/current/data/apps/MaxOriginal.apk --log MaxNext.launch.log
 ```
 
 A bare APK name is resolved from the package's read-only
 `/opt/app/io.github.denizomer10.PenguDroid/current/data/apps/` directory. The
 combined development package supplies the DPS-patched `MaxNext.apk`, prepared
 ART libraries and MAX's processed ARM64 libraries; the original
-`~/max_app.apk` is not changed. Runtime files for this device test live in
+`~/max_app.apk` is not changed. PackageManager replies now contain the real
+certificate chain obtained through Android's ApkSignatureVerifier instead of an
+empty SigningInfo. Since the no-DPS ZIP rewrite removed the APK Signing Block,
+the development package also includes the untouched original as
+`MaxOriginal.apk` and uses `--signature-apk` solely as its certificate source.
+This fixed CallsSdkInitializer.initializeSessionSeed's GetArrayLength(null)
+abort: after pressing Continue the process remains alive. Server acceptance or
+completion of phone authentication is not implied. Evidence:
+`target/aurora/maxnext-signing-fixed.log` and
+`target/aurora/maxnext-signing-result.png`. Runtime files for this device test live in
 `~/Documents/PenguDroid/runtime/android17-arm64`, accessible through the
 existing `Documents` permission. Private prefixes use Aurora's
 `~/.local/share/io.github.denizomer10/PenguDroid` and

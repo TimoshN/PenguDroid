@@ -322,6 +322,7 @@ pub fn launch(args: &[String]) -> i32 {
     let mut width: Option<u32> = None;
     let mut height: Option<u32> = None;
     let mut density: Option<i32> = None;
+    let mut signature_apk: Option<String> = None;
     let mut app_args: Vec<String> = Vec::new();
     let mut log_arg: Option<String> = None;
     let mut it = args.iter();
@@ -346,6 +347,7 @@ pub fn launch(args: &[String]) -> i32 {
                 }
             },
             "--log" => log_arg = it.next().cloned(),
+            "--signature-apk" => signature_apk = it.next().cloned(),
             "--density" => match it.next().and_then(|v| v.parse().ok()) {
                 Some(v) => density = Some(v),
                 None => {
@@ -378,6 +380,11 @@ pub fn launch(args: &[String]) -> i32 {
         );
         return 2;
     };
+    if let Some(path) = signature_apk {
+        // SAFETY: launch option parsing is still single-threaded. The value is
+        // inherited by the ART helper and consumed before app binding.
+        unsafe { std::env::set_var("PENGUDROID_SIGNATURE_APK", expand_user_path(path)) };
+    }
 
     let (info, planned) = match plan(&apk_path) {
         Ok(v) => v,

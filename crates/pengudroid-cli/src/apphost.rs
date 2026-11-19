@@ -10164,6 +10164,119 @@ fn install_reply(data: &[u8], symbol: &str) {
     }
 }
 
+/// Verify the real signing certificate chain with Android's own APK verifier.
+/// No placeholder certificate is used when verification succeeds.
+fn parse_apk_signing(
+    env: &JniEnv,
+    apk: &Path,
+    target_sdk: i32,
+) -> Option<(JObject, JObject)> {
+    let input_class = env.find_class("android/content/pm/parsing/result/ParseTypeImpl")?;
+    let input = env.call_static_object(
+        input_class,
+        env.static_method_id(
+            input_class,
+            "forDefaultParsing",
+            "()Landroid/content/pm/parsing/result/ParseTypeImpl;",
+        )?,
+        &[],
+    )?;
+    let verifier = env.find_class("android/util/apk/ApkSignatureVerifier")?;
+    let minimum = env.call_static_int(
+        verifier,
+        env.static_method_id(
+            verifier,
+            "getMinimumSignatureSchemeVersionForTargetSdk",
+            "(I)I",
+        )?,
+        &[JValue { i: target_sdk }],
+    )?;
+    let mut result = env.call_static_object(
+        verifier,
+        env.static_method_id(
+            verifier,
+            "verify",
+            "(Landroid/content/pm/parsing/result/ParseInput;Ljava/lang/String;I)Landroid/content/pm/parsing/result/ParseResult;",
+        )?,
+        &[
+            JValue { l: input },
+            JValue { l: env.new_string(&apk.display().to_string()) },
+            JValue { i: minimum },
+        ],
+    )?;
+    let result_class = env.find_class("android/content/pm/parsing/result/ParseResult")?;
+    let is_error = env.method_id(result_class, "isError", "()Z")?;
+    let error_message = env.method_id(result_class, "getErrorMessage", "()Ljava/lang/String;")?;
+    let mut verified = true;
+    if env.call_boolean(result, is_error, &[])? {
+        let message = env.call_object(result, error_message, &[])?;
+        eprintln!("apphost: APK signature verification failed: {:?}", env.get_string(message));
+        // Diagnostic copies may intentionally modify DEX and therefore invalidate
+        // the original signature. Their embedded certificate is still real, but
+        // it is explicitly reported as unverified rather than presented as a
+        // successful integrity check. Unmodified production APKs never use this
+        // fallback.
+        result = env.call_static_object(
+            verifier,
+            env.static_method_id(
+                verifier,
+                "unsafeGetCertsWithoutVerification",
+                "(Landroid/content/pm/parsing/result/ParseInput;Ljava/lang/String;I)Landroid/content/pm/parsing/result/ParseResult;",
+            )?,
+            &[
+                JValue { l: input },
+                JValue { l: env.new_string(&apk.display().to_string()) },
+                JValue { i: minimum },
+            ],
+        )?;
+        if env.call_boolean(result, is_error, &[])? {
+            let message = env.call_object(result, error_message, &[])?;
+            eprintln!("apphost: cannot read embedded APK certificates: {:?}", env.get_string(message));
+            return None;
+        }
+        verified = false;
+    }
+    let details = env.call_object(
+        result,
+        env.method_id(result_class, "getResult", "()Ljava/lang/Object;")?,
+        &[],
+    )?;
+    let details_class = env.find_class("android/content/pm/SigningDetails")?;
+    let signatures = env.call_object(
+        details,
+        env.method_id(
+            details_class,
+            "getSignatures",
+            "()[Landroid/content/pm/Signature;",
+        )?,
+        &[],
+    )?;
+    if signatures.is_null() || env.array_length(signatures) == 0 {
+        return None;
+    }
+    let scheme = env.call_int(
+        details,
+        env.method_id(details_class, "getSignatureSchemeVersion", "()I")?,
+        &[],
+    )?;
+    let info_class = env.find_class("android/content/pm/SigningInfo")?;
+    let info = env.new_object(
+        info_class,
+        env.method_id(
+            info_class,
+            "<init>",
+            "(Landroid/content/pm/SigningDetails;)V",
+        )?,
+        &[JValue { l: details }],
+    )?;
+    println!(
+        "apphost: {} {} embedded APK signing certificate(s), scheme {scheme}",
+        if verified { "verified" } else { "using UNVERIFIED diagnostic" },
+        env.array_length(signatures)
+    );
+    Some((info, signatures))
+}
+
 /// Answer the `IPackageManager` queries `handleBindApplication` makes.
 ///
 /// `LoadedApk.initializeJavaContextClassLoader()` asks for the app's
@@ -10205,6 +10318,20 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, spec: &AppSp
     if let Some(id) = env.field_id(pi_class, "versionCode", "I") {
         env.set_int_field(pi, id, spec.version_code as i32);
     }
+    // A diagnostic APK may have its DEX changed after the vendor signed it.
+    // In that case an explicitly supplied original APK is the only acceptable
+    // source of the vendor certificate chain; never invent a replacement.
+    let signing_apk = std::env::var_os("PENGUDROID_SIGNATURE_APK")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| spec.apk.to_path_buf());
+    let (real_signing_info, real_signatures) = match parse_apk_signing(
+        env,
+        &signing_apk,
+        spec.target_sdk,
+    ) {
+        Some((info, signatures)) => (Some(info), Some(signatures)),
+        None => (None, None),
+    };
     // NewPipe's `PackageValidator` (the media3 `MediaBrowserServiceCompat`
     // caller check) reads `PackageInfo.signatures` for the `"android"` package
     // while its `PlayerService` is being created and throws "Platform signature
@@ -10212,7 +10339,15 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, spec: &AppSp
     // There is no signing certificate here, so install one fixed placeholder.
     // The validator only compares this signature with the caller's, and both
     // answers come from this same reply, so their SHA-256 hashes match.
-    if let Some(signature_class) = env.find_class("android/content/pm/Signature") {
+    if let Some(array) = real_signatures {
+        if let Some(id) = env.field_id(
+            pi_class,
+            "signatures",
+            "[Landroid/content/pm/Signature;",
+        ) {
+            env.set_object_field(pi, id, array);
+        }
+    } else if let Some(signature_class) = env.find_class("android/content/pm/Signature") {
         if let Some(signature_ctor) = env.method_id(signature_class, "<init>", "([B)V") {
             if let Some(bytes) = env.new_byte_array(32) {
                 let digest: Vec<u8> = (0u8..32).map(|b| b.wrapping_mul(7)).collect();
@@ -10236,11 +10371,13 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, spec: &AppSp
             }
         }
     }
-    // `PackageInfo.signingInfo` is null unless a package manager fills it in,
-    // and signature checks (`org.acra`, Play Integrity, ...) dereference it
-    // without a null check. A default `SigningInfo` reports "no signatures",
-    // which is the truthful answer for an APK we never verified.
-    if let Some((_, signing)) = new_instance(env, "android/content/pm/SigningInfo") {
+    // Publish the certificate chain verified from this APK. The default
+    // fallback is retained only for an unsigned/unparseable fixture.
+    if let Some(signing) = real_signing_info {
+        if let Some(id) = env.field_id(pi_class, "signingInfo", "Landroid/content/pm/SigningInfo;") {
+            env.set_object_field(pi, id, signing);
+        }
+    } else if let Some((_, signing)) = new_instance(env, "android/content/pm/SigningInfo") {
         if let Some(id) = env.field_id(pi_class, "signingInfo", "Landroid/content/pm/SigningInfo;") {
             env.set_object_field(pi, id, signing);
         }
