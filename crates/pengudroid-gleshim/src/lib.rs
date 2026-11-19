@@ -1909,6 +1909,23 @@ fn trace_touch_present(
     );
 }
 
+fn notify_frame_presented_vsync() {
+    if std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT").is_none() {
+        return;
+    }
+    static NOTIFY: OnceLock<usize> = OnceLock::new();
+    let address = *NOTIFY.get_or_init(|| unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            b"__pengudroid_vsync_frame_presented\0".as_ptr().cast(),
+        ) as usize
+    });
+    if address != 0 {
+        let notify: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
+        unsafe { notify() };
+    }
+}
+
 fn record_touch_debug(event: &pengudroid_proto::InputKind) {
     if std::env::var_os("PENGUDROID_TOUCH_DEBUG").is_none() {
         return;
@@ -4882,6 +4899,9 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
             if gralloc_presented { "gralloc-shm" } else { "gralloc-readback" },
             outcome == EGL_TRUE, finish_elapsed, flip_elapsed, present_elapsed,
         );
+        if outcome == EGL_TRUE {
+            notify_frame_presented_vsync();
+        }
         if std::env::var_os("PENGUDROID_PROFILE_GRALLOC").is_some() {
             profile_gralloc(
                 finish_elapsed, flip_elapsed, present_elapsed, pace_elapsed,
@@ -4897,6 +4917,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         return match present_shm(surface) {
             Ok(()) => {
                 pace_swap(surface as usize);
+                notify_frame_presented_vsync();
                 EGL_TRUE
             }
             Err(e) => {
@@ -4945,6 +4966,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
     ) {
         Ok(()) => {
             pace_swap(surface as usize);
+            notify_frame_presented_vsync();
             EGL_TRUE
         }
         Err(e) => {

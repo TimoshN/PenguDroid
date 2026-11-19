@@ -812,10 +812,14 @@ fn apply_aurora_package_env(
         && Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file();
     if hybris {
         configure_aurora_hybris_properties();
+        if !overridden("PENGUDROID_VSYNC_ON_PRESENT") {
+            // Apply backpressure at the real boundary: one successfully
+            // presented frame produces one following DisplayEvent. A
+            // free-running producer otherwise outpaces Compose and queues
+            // stale frame timelines seconds after the gesture.
+            cmd.env("PENGUDROID_VSYNC_ON_PRESENT", "1");
+        }
         if !overridden("PENGUDROID_VSYNC_INTERVAL_US") {
-            // This hosted gralloc/HWUI pipeline sustains about 30 FPS. A 60 Hz
-            // free-running vsync producer queues surplus DisplayEvents and
-            // Compose consumes stale frame timelines seconds after the gesture.
             cmd.env("PENGUDROID_VSYNC_INTERVAL_US", "33333");
         }
     }

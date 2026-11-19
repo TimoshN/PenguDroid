@@ -480,6 +480,20 @@ Evidence: `target/aurora/maxnext-vsync30.log`,
 `target/aurora/maxnext-vsync-auto.log`, and
 `target/aurora/maxnext-vsync-auto-after-swipes.png`.
 
+The fixed 30 Hz producer was then replaced by true present-driven
+backpressure. `eglSwapBuffers` calls
+`__pengudroid_vsync_frame_presented()` only after successful presentation;
+`PENGUDROID_VSYNC_ON_PRESENT=1` disables the free-running clock and emits one
+following DisplayEvent per presented frame. The initial forced traversal and
+requestNextVsync remain bootstrap paths. Aurora/Hybris enables this mode by
+default while retaining the 33333 us timeline interval and explicit overrides.
+The explicit test had 3741 present notifications and zero dispatcher warnings.
+The final automatic run had 3471 frames, zero dispatcher warnings, no crash,
+and changed-content probes at 293/266 ms after down. Unlike the old
+free-running modes, idle presentation no longer generates an independent vsync
+backlog. Evidence: `target/aurora/maxnext-vsync-present.log` and
+`target/aurora/maxnext-present-auto.log`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through

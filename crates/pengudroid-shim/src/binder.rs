@@ -2318,6 +2318,22 @@ fn send_vsync() -> Result<(), String> {
     Ok(())
 }
 
+/// Emit the next pulse only after the guest successfully presented a frame.
+/// This is a backpressure boundary: Compose can never accumulate a queue of
+/// free-running pulses faster than it produces real frames.
+#[no_mangle]
+pub extern "C" fn __pengudroid_vsync_frame_presented() {
+    if std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT").is_none() {
+        return;
+    }
+    if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
+        unsafe { diag("[binder]   <- frame presented\n") };
+    }
+    if let Err(error) = send_vsync() {
+        unsafe { diag(&format!("[binder] on-present vsync failed: {error}\n")) };
+    }
+}
+
 /// Start the configured-rate frame clock, once per process.
 ///
 /// A real compositor emits vsync continuously; the app's `Choreographer` only
@@ -3894,7 +3910,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             Some((recv, send)) => {
                 push_flat_fd(&mut parcel, &mut objects, recv);
                 push_flat_fd(&mut parcel, &mut objects, send);
-                start_frame_clock();
+                if std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT").is_none() {
+                    start_frame_clock();
+                }
                 if trace_enabled() {
                     diag(&format!("[binder]   -> BitTube fds {recv},{send}\n"));
                 }
