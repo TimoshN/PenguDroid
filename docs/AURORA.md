@@ -65,8 +65,10 @@ changes its button counter. Vulkan has not been tested.
   `target/aurora/device-compose-audb-input.png`, and the pixel dump
   `target/aurora/device-compose-interactive.png`.
 - MAX 26.40.1 (`ru.oneme.app`, `one.me.android.MainActivity`) also runs on the
-  phone. The supplied APK lacks `bool/dps_auto_init_enabled`; a separate test
-  copy disables that optional DPS auto-init, leaving the original APK untouched.
+  phone from the original, unmodified APK. Its vendor manifest explicitly sets
+  `android:enabled="false"` on DpsInitProvider; the manifest parser now honours
+  that flag instead of incorrectly invoking the disabled provider. The earlier
+  no-DPS diagnostic copy is no longer needed for startup.
   `PENGUDROID_NATIVE_LIB_DIR` supports an exec-capable package-owned library
   directory, and a typed `InstallSourceInfo` reply fixed its PackageManager
   failure. Bionic condition variables now use aligned host objects: their size
@@ -217,18 +219,19 @@ Exec=io.github.denizomer10.MaxNext --cli launch MaxNext.apk --backend art --widt
 
 A bare APK name is resolved from the package's read-only
 `/opt/app/io.github.denizomer10.PenguDroid/current/data/apps/` directory. The
-combined development package supplies the DPS-patched `MaxNext.apk`, prepared
-ART libraries and MAX's processed ARM64 libraries; the original
-`~/max_app.apk` is not changed. PackageManager replies now contain the real
-certificate chain obtained through Android's ApkSignatureVerifier instead of an
-empty SigningInfo. Since the no-DPS ZIP rewrite removed the APK Signing Block,
-the development package also includes the untouched original as
-`MaxOriginal.apk` and uses `--signature-apk` solely as its certificate source.
-This fixed CallsSdkInitializer.initializeSessionSeed's GetArrayLength(null)
-abort: after pressing Continue the process remains alive. Server acceptance or
-completion of phone authentication is not implied. Evidence:
-`target/aurora/maxnext-signing-fixed.log` and
-`target/aurora/maxnext-signing-result.png`. Runtime files for this device test live in
+combined development package supplies the original `MaxNext.apk`, prepared
+ART libraries and MAX's processed ARM64 libraries; `~/max_app.apk` is not
+changed. PackageManager replies contain the real certificate chain obtained
+through Android's ApkSignatureVerifier instead of an empty SigningInfo. An
+optional `--signature-apk` remains available for explicitly diagnostic,
+modified APK copies, but is not needed for the original MAX package. This also
+fixed CallsSdkInitializer.initializeSessionSeed's GetArrayLength(null) abort.
+The original APK now logs `skipping disabled provider
+ru.trace_flow.dps.internal.DpsInitProvider`, verifies one scheme-3 certificate,
+and reaches the interactive login screen without a DPS patch. Evidence:
+`target/aurora/maxnext-dps-final.log` and
+`target/aurora/maxnext-dps-final.png`. Server acceptance or completion
+of phone authentication is not implied. Runtime files for this device test live in
 `~/Documents/PenguDroid/runtime/android17-arm64`, accessible through the
 existing `Documents` permission. Private prefixes use Aurora's
 `~/.local/share/io.github.denizomer10/PenguDroid` and

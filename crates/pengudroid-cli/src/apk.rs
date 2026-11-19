@@ -33,6 +33,8 @@ pub struct Component {
     pub name: String,
     /// `android:exported`, defaulting to the platform default when absent.
     pub exported: bool,
+    /// `android:enabled`; components are enabled unless explicitly disabled.
+    pub enabled: bool,
     /// True if this component handles the MAIN/LAUNCHER intent.
     pub is_launcher: bool,
     /// `android:theme` as a resource id, when the manifest names one.
@@ -820,6 +822,7 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                         let component = Component {
                             name: resolved.clone(),
                             exported: explicit.unwrap_or(false),
+                            enabled: attr_bool(&attrs, "enabled").unwrap_or(true),
                             is_launcher: false,
                             theme: attr_ref(&attrs, "theme"),
                             authority: attr_str(&pool, &attrs, "authorities"),
@@ -871,6 +874,7 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                             let component = Component {
                                 name: resolved.clone(),
                                 exported: explicit.unwrap_or(true),
+                                enabled: attr_bool(&attrs, "enabled").unwrap_or(true),
                                 is_launcher: false,
                                 theme: attr_ref(&attrs, "theme"),
                                 authority: None,
@@ -1342,6 +1346,25 @@ mod tests {
         let info = parse_axml(&b.finish()).expect("queries provider is valid");
         assert_eq!(info.package, "com.example.demo");
         assert!(info.providers.is_empty());
+    }
+
+    #[test]
+    fn component_enabled_defaults_to_true_and_honours_explicit_false() {
+        let mut b = Axml::new();
+        b.start("manifest", &[("package", A::Str("com.example.demo"))]);
+        b.start("application", &[]);
+        b.start("provider", &[
+            ("name", A::Str(".DisabledProvider")),
+            ("enabled", A::Bool(false)),
+        ]);
+        b.end("provider");
+        b.start("provider", &[("name", A::Str(".DefaultProvider"))]);
+        b.end("provider");
+        b.end("application");
+        b.end("manifest");
+        let info = parse_axml(&b.finish()).expect("component enabled flags");
+        assert!(!info.providers[0].enabled);
+        assert!(info.providers[1].enabled);
     }
 
     #[test]

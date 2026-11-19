@@ -2529,7 +2529,10 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         .skip(1)
         .map(|p| std::path::PathBuf::from(p))
         .collect();
-    // Drop providers whose class the APK does not ship. A missing one makes
+    // Respect android:enabled="false" exactly as PackageManager does. MAX's
+    // DpsInitProvider is explicitly disabled in the vendor manifest; invoking
+    // it anyway made the original APK fail before Application.onCreate.
+    // Also drop providers whose class the APK does not ship. A missing one makes
     // `installContentProviders` throw, which aborts the whole
     // `handleBindApplication`; a split-based bundle can legitimately lack a
     // feature split that its manifest still names.
@@ -2537,6 +2540,10 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         .providers
         .iter()
         .filter(|p| {
+            if !p.enabled {
+                println!("apphost: skipping disabled provider {}", p.name);
+                return false;
+            }
             let present = classpath.iter().any(|a| crate::apk::contains_class(a, &p.name));
             if !present {
                 println!(
