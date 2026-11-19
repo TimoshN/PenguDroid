@@ -403,6 +403,17 @@ The comparable low-latency run wrote 1,307 lines total and zero VelocityTracker
 lines; INFO/WARN/ERROR/FATAL from other components remain enabled. Evidence:
 `target/aurora/maxnext-low-latency.log`.
 
+CLOCK_MONOTONIC instrumentation then showed that transport plus
+dispatchInputEvent was normally only 1–15 ms, but every contact was dispatched
+twice: once from evdev and once from wl_touch, with different coordinates and
+Android pointer IDs. When a real hardware reader exists, evdev is now the single
+multitouch source and compositor touch is deduplicated; the Wayland fallback is
+unchanged where no hardware reader exists. The deduplicated device run has one
+kernel pointer stream and no duplicate id=0 dispatch, while tap/swipe dispatch
+returns in a few milliseconds. Timing logs are opt-in through
+`PENGUDROID_TRACE_INPUT_TIMING=1`. Evidence:
+`target/aurora/maxnext-dedup.log` and `target/aurora/maxnext-dedup.png`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through

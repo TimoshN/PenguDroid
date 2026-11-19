@@ -5269,6 +5269,9 @@ fn spawn_input_pump(env: &JniEnv) {
         let gesture_down = std::cell::Cell::new(0i64);
         let deliver_touch_event = |event: crate::keymap_gesture::TouchEvent| {
             use crate::keymap_gesture::TouchEvent;
+            if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
+                println!("input: ts={} touch {event:?} dispatch begin", monotonic_ms());
+            }
             let Some(multi) = &multi_touch else {
                 match event {
                     TouchEvent::Down { x, y, .. } => {
@@ -5310,6 +5313,9 @@ fn spawn_input_pump(env: &JniEnv) {
             if let Some(event) = multi.obtain(&env, motion_class, &frame, gesture_down.get(), now) {
                 env.call_void(root, dispatch, &[JValue { l: event }]);
             }
+            if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
+                println!("input: ts={} touch action={} dispatch end", monotonic_ms(), frame.action);
+            }
         };
 
         // Universal native kernel touch setup:
@@ -5339,6 +5345,16 @@ fn spawn_input_pump(env: &JniEnv) {
                 println!("input: hardware kernel touchscreen active ({})", path.display());
                 kernel_touch_readers.push((reader, false));
             }
+        }
+
+        // Lipstick forwards the same physical contact through wl_touch while
+        // the kernel also exposes it through evdev. Feeding both into Android
+        // creates two pointers with different coordinates and makes gestures
+        // stutter. Prefer the lossless multitouch kernel stream whenever a real
+        // hardware reader exists; elsewhere Wayland remains the fallback.
+        let kernel_touch_primary = kernel_touch_readers.iter().any(|(_, is_virtual)| !*is_virtual);
+        if kernel_touch_primary {
+            println!("input: hardware kernel touch is primary; compositor touch deduplicated");
         }
 
         let mut kernel_pointer_ids = crate::keymap_gesture::KernelPointerIds::default();
@@ -5749,6 +5765,14 @@ fn spawn_input_pump(env: &JniEnv) {
             // falling back cleanly to direct `deliver_touch_event` when `/dev/uinput`
             // or `/dev/input/eventN` is inaccessible.
             match tag {
+                1 | 3 if kernel_touch_primary => {
+                    // The matching hardware contact is delivered by
+                    // drain_kernel_touches; do not dispatch it a second time.
+                    last = (a, b);
+                }
+                4 if kernel_touch_primary && a as u32 == 0x110 => {
+                    pressed = b != 0.0;
+                }
                 1 | 3 => {
                     last = (a, b);
                     if pressed {

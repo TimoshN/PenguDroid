@@ -1811,6 +1811,12 @@ fn subscribe_input(surface_id: u32) {
             match conn.recv_message() {
                 Ok((Message::InputEvent { surface_id, event }, fds)) => {
                     close_fds(&fds);
+                    if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
+                        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                        let ms = ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128 / 1_000_000;
+                        eprintln!("[gleshim:input] ts={ms} recv {event:?}");
+                    }
                     if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
                         match &event {
                             pengudroid_proto::InputKind::CommitText { text }
@@ -1945,6 +1951,12 @@ pub unsafe extern "C" fn pengudroid_input_poll(out: *mut u8) -> i32 {
         q.remove(0)
     };
     let (surface_id, kind) = event;
+    if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        let ms = ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128 / 1_000_000;
+        eprintln!("[gleshim:input] ts={ms} poll {kind:?}");
+    }
     if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
         match &kind {
             pengudroid_proto::InputKind::CommitText { text }
