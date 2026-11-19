@@ -349,9 +349,16 @@ global keep the existing xdg/wl_shell behavior.
 Lipstick draws the system bar, while Android receives a separate top inset via
 `WindowInsets.Builder` once per root View. On Dialog-S the dconf statusbar and
 cutout heights are both 132 px; `PENGUDROID_STATUSBAR_HEIGHT` overrides this
-value and zero disables the inset. The device log records `applied status-bar
-inset 132px`, and the screenshot shows both the system status bar and MAX content
-below it: `target/aurora/maxnext-statusbar-device.png`.
+value and zero disables the inset. Dispatch alone is insufficient for
+edge-to-edge Compose: after the app-driven layout, the host checks the real
+`android.R.id.content` global top and reserves only the missing space on
+DecorView. Waiting for layout avoids double-insetting traditional Views such as
+PSB. The real desktop-launch paths for MAX and Sberbank now record
+`reserved missing status-bar space after layout: 0px -> 132px`; PSB already lays
+out at 132 px and receives no extra DecorView padding. Evidence:
+`target/aurora/maxnext-statusbar-after-layout.png`,
+`target/aurora/psbmobile-statusbar-after-layout.png`, and
+`target/aurora/sberbank-statusbar-after-layout.png`.
 
 The phone logs `qt_surface_extension enabled`, `surface 1 has
 qt_extended_surface`, and `onscreen visibility=true`; MAX remains visible and

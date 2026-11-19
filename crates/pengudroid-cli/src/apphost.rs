@@ -3780,6 +3780,7 @@ impl ActivityHostWaker {
                     let activity = unsafe { pending() };
                     let ime = !IME_TEXT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
                         || STATUSBAR_INSET_PENDING.load(std::sync::atomic::Ordering::Acquire)
+                        || STATUSBAR_LAYOUT_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || CLIPBOARD_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || NETWORK_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || OUTSIDE_FOCUS_PENDING.load(std::sync::atomic::Ordering::Acquire);
@@ -6311,7 +6312,69 @@ fn apply_statusbar_insets(env: &JniEnv, root: JObject) -> Option<()> {
     let build = env.method_id(builder_class, "build", "()Landroid/view/WindowInsets;")?;
     let window_insets = env.call_object(builder, build, &[])?;
     env.call_object(view, dispatch, &[JValue { l: window_insets }])?;
+
     println!("apphost: applied status-bar inset {height}px");
+    Some(())
+}
+
+/// After the app-driven layout has completed, check where its content actually
+/// landed. A manual WindowInsets dispatch alone does not reserve physical
+/// space for edge-to-edge Compose. Conversely, traditional Views may apply the
+/// same inset during the following traversal, so checking padding immediately
+/// after dispatch would incorrectly inset them twice.
+fn ensure_statusbar_layout_inset(env: &JniEnv, root: JObject) -> Option<()> {
+    let height = std::env::var("PENGUDROID_STATUSBAR_HEIGHT").ok()
+        .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0);
+    if height <= 0 { return Some(()); }
+    let root_class = env.find_class("android/view/ViewRootImpl")?;
+    let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+    let view = env.object_field(root, m_view);
+    if view.is_null() { return None; }
+    let view_class = env.find_class("android/view/View")?;
+    let layout_requested = env.method_id(view_class, "isLayoutRequested", "()Z")?;
+    if env.call_boolean(view, layout_requested, &[])? {
+        return None;
+    }
+    let find_by_id = env.method_id(
+        view_class,
+        "findViewById",
+        "(I)Landroid/view/View;",
+    )?;
+    let content = env.call_object(view, find_by_id, &[JValue { i: 0x0102_0002 }])?;
+    if content.is_null() { return Some(()); }
+    let (_, rect) = new_instance(env, "android/graphics/Rect")?;
+    let visible_rect = env.method_id(
+        view_class,
+        "getGlobalVisibleRect",
+        "(Landroid/graphics/Rect;)Z",
+    )?;
+    if !env.call_boolean(content, visible_rect, &[JValue { l: rect }])? {
+        return None;
+    }
+    let rect_class = env.find_class("android/graphics/Rect")?;
+    let content_top = env.int_field(rect, env.field_id(rect_class, "top", "I")?);
+    if content_top >= height { return Some(()); }
+
+    let padding_top = env.method_id(view_class, "getPaddingTop", "()I")?;
+    let left = env.method_id(view_class, "getPaddingLeft", "()I")?;
+    let right = env.method_id(view_class, "getPaddingRight", "()I")?;
+    let bottom = env.method_id(view_class, "getPaddingBottom", "()I")?;
+    let set_padding = env.method_id(view_class, "setPadding", "(IIII)V")?;
+    let request_layout = env.method_id(view_class, "requestLayout", "()V")?;
+    let values = [
+        env.call_int(view, left, &[])?,
+        env.call_int(view, padding_top, &[])? + height - content_top.max(0),
+        env.call_int(view, right, &[])?,
+        env.call_int(view, bottom, &[])?,
+    ];
+    env.call_void(view, set_padding, &[
+        JValue { i: values[0] }, JValue { i: values[1] },
+        JValue { i: values[2] }, JValue { i: values[3] },
+    ]);
+    env.call_void(view, request_layout, &[]);
+    println!(
+        "apphost: reserved missing status-bar space after layout: {content_top}px -> {height}px"
+    );
     Some(())
 }
 
@@ -6558,6 +6621,8 @@ static IME_TEXT_EVENTS: std::sync::Mutex<std::collections::VecDeque<(String, i32
     std::sync::Mutex::new(std::collections::VecDeque::new());
 static STATUSBAR_INSET_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static STATUSBAR_LAYOUT_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static CLIPBOARD_SMOKE_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static NETWORK_SMOKE_PENDING: std::sync::atomic::AtomicBool =
@@ -6667,6 +6732,7 @@ fn current_keyboard_root(env: &JniEnv) -> Option<JObject> {
 fn apply_deferred_window_updates(env: &JniEnv) {
     use std::sync::atomic::Ordering;
     if !STATUSBAR_INSET_PENDING.load(Ordering::Acquire)
+        && !STATUSBAR_LAYOUT_PENDING.load(Ordering::Acquire)
         && !CLIPBOARD_SMOKE_PENDING.load(Ordering::Acquire)
         && !NETWORK_SMOKE_PENDING.load(Ordering::Acquire)
         && !OUTSIDE_FOCUS_PENDING.load(Ordering::Acquire)
@@ -6677,8 +6743,15 @@ fn apply_deferred_window_updates(env: &JniEnv) {
         clear_outside_text_focus_on_main(env);
     }
     let Some(root) = current_keyboard_root(env) else { return };
-    if STATUSBAR_INSET_PENDING.swap(false, Ordering::AcqRel) {
-        let _ = apply_statusbar_insets(env, root);
+    if STATUSBAR_INSET_PENDING.swap(false, Ordering::AcqRel)
+        && apply_statusbar_insets(env, root).is_some()
+    {
+        STATUSBAR_LAYOUT_PENDING.store(true, Ordering::Release);
+    }
+    if STATUSBAR_LAYOUT_PENDING.load(Ordering::Acquire)
+        && ensure_statusbar_layout_inset(env, root).is_some()
+    {
+        STATUSBAR_LAYOUT_PENDING.store(false, Ordering::Release);
     }
     if CLIPBOARD_SMOKE_PENDING.swap(false, Ordering::AcqRel) {
         let _ = run_android_clipboard_smoke(env, root);
