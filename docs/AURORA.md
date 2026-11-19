@@ -503,11 +503,25 @@ AndroidX EncryptedSharedPreferences and Tink validation. Evidence:
 
 The next independent startup blocker is DGis native code. A missing
 `pthread_atfork` export was added and forwarded; DGis then entered native
-`DGis.initialize` and crashed at `libdgismap-2.3.0.so+0x1147c0c`, with a
-corrupted `_ctype_`-related pointer. This is outside the Keystore2 backend. No
-Activity launch or rendered PSB UI has been verified yet. Evidence:
-`target/aurora/psbmobile-atfork.log` and the earlier native diagnostics
-`target/aurora/psbmobile-lddebug.log`. The original APK remains unchanged.
+`DGis.initialize` and crashed at `libdgismap-2.3.0.so+0x1147c0c`, in a loop
+indexing the `_ctype_` table through a corrupted pointer. This is outside the
+Keystore2 backend. Evidence: `target/aurora/psbmobile-atfork.log` and the
+earlier native diagnostics `target/aurora/psbmobile-lddebug.log`.
+
+DGis is used by the offices/ATMs map and is not required to reach the first
+unauthenticated Activity. The target-only diagnostic
+`target/aurora/psbmobile-nodgis.apk` changes only
+`DgisInteractor.b(): void` in `classes5.dex` to `return-void`; the original APK
+and regular RPM are unchanged. On the phone this copy completed `AppContainer`,
+launched `PreLoaderActivity` and then `MainNoAuthActivity`, rendered through
+gralloc and remained alive. A visible PSB splash/loading screen with its
+spinner is captured in `target/aurora/psbmobile-nodgis.png` and
+`target/aurora/psbmobile-nodgis-later.png`; lifecycle and rendering details are
+in `target/aurora/psbmobile-nodgis.log`. This does not make the map feature
+usable and does not prove the login flow: the loader remained visible, with
+cleartext `nuc-cdp.voskhod.ru` requests rejected by Android network security
+policy. The no-DGIS copy is development evidence, not a production banking
+package.
 
 ## Runtime work still required
 
