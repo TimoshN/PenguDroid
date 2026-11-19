@@ -546,10 +546,19 @@ The red "Нет связи с сетью" banner is gone and the full bottom nav
 visible in `target/aurora/psbmobile-network-direct.png`; the corresponding log
 records delivery after both PreLoaderActivity and MainNoAuthActivity resumes,
 without Binder/parcel failures. This is a verified connectivity-monitor fix,
-not a claim that every bank endpoint or login succeeds. A subsequent real tap
-on Login reached the app but exposed a separate `pc=0` failure after
-`Looper.loopOnce` threw; authentication remains unverified. See
+not a claim that every bank endpoint or login succeeds. See
 `target/aurora/psbmobile-network-direct.log`.
+
+Opening the login pager then exposed a missing platform NFC initializer:
+`NfcAdapter.getDefaultAdapter()` threw because `NfcServiceManager` itself was
+null. PenguDroid now installs the ordinary framework NfcServiceManager but does
+not publish an `nfc` Binder service or emulate hardware. Consequently the
+adapter query returns null and Android logs `this device does not have NFC
+support`, rather than throwing UnsupportedOperationException. The Login button
+now reaches the card/login form and the process remains alive; see
+`target/aurora/psbmobile-nfc-absent-login3.png` and
+`target/aurora/psbmobile-nfc-absent.log`. No credentials or authenticated
+banking operation have been tested.
 
 ## Runtime work still required
 

@@ -10328,12 +10328,15 @@ fn install_service_info_replies(env: &JniEnv, app_info: JObject, spec: &AppSpec<
 
 /// Install the platform singletons `system_server` normally creates.
 ///
-/// Both `MediaFrameworkPlatformInitializer` and `TelephonyFrameworkInitializer`
-/// only *hold* their manager object; `SystemServer` sets it once during boot and
-/// nothing creates it lazily. The framework dereferences them unconditionally,
-/// so without this a `MediaSession` cannot be constructed (NewPipe's
-/// `PlayerService.onCreate` dies) and `TelephonyManager.getITelephony` NPEs
-/// (ExoPlayer's `DefaultBandwidthMeter` dies in `onStartCommand`).
+/// These framework initializers only *hold* their manager object;
+/// `SystemServer` sets it once during boot and nothing creates it lazily. The
+/// framework dereferences them unconditionally, so without this a
+/// `MediaSession` cannot be constructed (NewPipe's `PlayerService.onCreate`
+/// dies), `TelephonyManager.getITelephony` NPEs (ExoPlayer's
+/// `DefaultBandwidthMeter` dies in `onStartCommand`), and NfcAdapter cannot
+/// even query ServiceManager. Installing NfcServiceManager does not create an
+/// NFC service: with no published `nfc` binder, getDefaultAdapter() returns
+/// null, which is the normal API result on a device without NFC.
 fn install_platform_service_managers(env: &JniEnv) {
     install_platform_singleton(
         env,
@@ -10346,6 +10349,12 @@ fn install_platform_service_managers(env: &JniEnv) {
         "android/telephony/TelephonyFrameworkInitializer",
         "android/os/TelephonyServiceManager",
         "setTelephonyServiceManager",
+    );
+    install_platform_singleton(
+        env,
+        "android/nfc/NfcFrameworkInitializer",
+        "android/nfc/NfcServiceManager",
+        "setNfcServiceManager",
     );
 }
 
