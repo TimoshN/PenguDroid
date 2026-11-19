@@ -386,6 +386,15 @@ control text. Actual device tests entered `123` and then verified Backspace
 `target/aurora/maxnext-textinput-backspace-verified.png`. Preedit is implemented
 but was not exercised by this numeric keyboard test.
 
+Kernel touchscreen slots are mapped to stable Android MotionEvent pointer IDs
+1..31 (ID 0 remains the compositor/mouse pointer) and recycled after ACTION_UP.
+The previous `100 + slot` mapping produced pointer ID 101 and aborted
+VelocityTracker on the SMS-code screen. A subsequent original-APK device run
+recorded simultaneous valid pointerId 0 and pointerId 1 events without a fatal
+error or guest exit. Regression coverage also checks allocation, stability,
+recycling and the 31-pointer hardware bound. Evidence:
+`target/aurora/maxnext-pointer-fixed.log`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through

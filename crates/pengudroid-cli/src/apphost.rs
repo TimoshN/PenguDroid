@@ -5341,16 +5341,19 @@ fn spawn_input_pump(env: &JniEnv) {
             }
         }
 
+        let mut kernel_pointer_ids = crate::keymap_gesture::KernelPointerIds::default();
         let mut drain_kernel_touches = || {
             let (sw, sh) = (surface_w().max(1) as f32, surface_h().max(1) as f32);
-            for (reader, _is_virtual) in kernel_touch_readers.iter_mut() {
+            for (reader_index, (reader, _is_virtual)) in kernel_touch_readers.iter_mut().enumerate() {
                 let Ok(events) = reader.drain() else { continue };
                 for kev in events {
-                    let id = if kev.slot == 0 {
-                        crate::keymap_gesture::MOUSE_POINTER
-                    } else {
-                        100 + kev.slot
+                    let id = match kev.phase {
+                        pengudroid_input::KernelTouchPhase::Down => {
+                            kernel_pointer_ids.activate(reader_index, kev.slot)
+                        }
+                        _ => kernel_pointer_ids.get(reader_index, kev.slot),
                     };
+                    let Some(id) = id else { continue };
                     let x = kev.norm_x * sw;
                     let y = kev.norm_y * sh;
                     let te = match kev.phase {
@@ -5365,6 +5368,9 @@ fn spawn_input_pump(env: &JniEnv) {
                         }
                     };
                     deliver_touch_event(te);
+                    if matches!(kev.phase, pengudroid_input::KernelTouchPhase::Up) {
+                        kernel_pointer_ids.release(reader_index, kev.slot);
+                    }
                 }
             }
         };

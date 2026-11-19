@@ -16,6 +16,34 @@ use pengudroid_input::uinput::GamepadHostEvent;
 
 pub const MOUSE_POINTER: i32 = 0;
 
+/// Android MotionEvent pointer IDs are limited to 0..=31. ID 0 is reserved for
+/// the compositor/mouse pointer; every hardware (device, slot) pair receives a
+/// stable ID from the remaining range until its ACTION_UP.
+#[derive(Default)]
+pub struct KernelPointerIds {
+    assigned: HashMap<(usize, i32), i32>,
+}
+
+impl KernelPointerIds {
+    pub fn activate(&mut self, reader: usize, slot: i32) -> Option<i32> {
+        let key = (reader, slot);
+        if let Some(id) = self.assigned.get(&key) {
+            return Some(*id);
+        }
+        let id = (1..=31).find(|id| !self.assigned.values().any(|used| used == id))?;
+        self.assigned.insert(key, id);
+        Some(id)
+    }
+
+    pub fn get(&self, reader: usize, slot: i32) -> Option<i32> {
+        self.assigned.get(&(reader, slot)).copied()
+    }
+
+    pub fn release(&mut self, reader: usize, slot: i32) {
+        self.assigned.remove(&(reader, slot));
+    }
+}
+
 /// Single finger event from the host pointer or kernel evdev touchscreen.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TouchEvent {
@@ -416,5 +444,24 @@ mod tests {
         let f4 = ts.apply(TouchEvent::Up { id: 1, x: 50.0, y: 60.0 }).unwrap();
         assert_eq!(f4.action, ACTION_UP);
         assert!(ts.is_idle());
+    }
+
+    #[test]
+    fn kernel_pointer_ids_stay_in_android_range_and_recycle() {
+        let mut ids = KernelPointerIds::default();
+        let first = ids.activate(0, 0).unwrap();
+        let second = ids.activate(0, 1).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(ids.get(0, 1), Some(second));
+        assert_eq!(ids.activate(1, 1), Some(3));
+        ids.release(0, 1);
+        assert_eq!(ids.get(0, 1), None);
+        assert_eq!(ids.activate(0, 99), Some(second));
+        for slot in 2..=29 {
+            assert!(ids.activate(2, slot).is_some());
+        }
+        assert!((1..=31).all(|id| ids.assigned.values().any(|used| *used == id)));
+        assert_eq!(ids.activate(3, 100), None);
     }
 }
