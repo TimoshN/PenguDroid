@@ -526,10 +526,30 @@ in `target/aurora/psbmobile-nodgis.log`. With the subsequent automatic
 window and showed the PSB welcome screen with Login and bank-onboarding
 buttons: `target/aurora/psbmobile-raise.png` and
 `target/aurora/psbmobile-raise.log`. This does not make the map feature usable
-and does not prove the login flow. The screen reported no network connection,
-and cleartext `nuc-cdp.voskhod.ru` requests were rejected by Android network
-security policy. The no-DGIS copy is development evidence, not a production
-banking package.
+and does not prove the login flow. The no-DGIS copy is development evidence,
+not a production banking package.
+
+Network startup exposed three separate compatibility details. The real
+`android:networkSecurityConfig` and `usesCleartextTraffic` values are now copied
+from the manifest into `ApplicationInfo`; other applications do not inherit a
+global cleartext exception. PSB's own config does not permit HTTP to
+`nuc-cdp.voskhod.ru`, so that secondary request is still rejected correctly.
+The visible offline banner had a different cause: its monitor starts in
+DISCONNECT and waits for `CONNECTIVITY_CHANGE`. PenguDroid now supplies sticky
+replies for both Android-17 registerReceiver transactions, an initial
+`IMessenger` `CALLBACK_AVAILABLE` for modern NetworkCallbacks, and main-thread
+sticky delivery through real LoadedApk ReceiverDispatchers whose
+`getExpectedAction()` matches. The receiver then calls the published
+`getActiveNetworkInfo().isConnected()` itself.
+
+The red "Нет связи с сетью" banner is gone and the full bottom navigation is
+visible in `target/aurora/psbmobile-network-direct.png`; the corresponding log
+records delivery after both PreLoaderActivity and MainNoAuthActivity resumes,
+without Binder/parcel failures. This is a verified connectivity-monitor fix,
+not a claim that every bank endpoint or login succeeds. A subsequent real tap
+on Login reached the app but exposed a separate `pc=0` failure after
+`Looper.loopOnce` threw; authentication remains unverified. See
+`target/aurora/psbmobile-network-direct.log`.
 
 ## Runtime work still required
 

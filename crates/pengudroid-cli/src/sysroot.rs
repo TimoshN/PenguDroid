@@ -2567,6 +2567,8 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         // the initial one.
         activities: &info.activities,
         application_theme: info.application_theme,
+        network_security_config: info.network_security_config,
+        uses_cleartext_traffic: info.uses_cleartext_traffic,
         // `ActivityInfo.theme` decides whether AppCompat accepts the activity:
         // with no theme the framework falls back to the platform default and
         // `setContentView` throws "You need to use a Theme.AppCompat theme".

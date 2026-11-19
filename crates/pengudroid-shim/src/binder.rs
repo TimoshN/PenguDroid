@@ -619,6 +619,28 @@ pub unsafe extern "C" fn __pengudroid_binder_set_storage_volumes(code: u32, ptr:
 /// own Parcel code (`ConnectivityManager`'s active network, for instance).
 static SERVICE_REPLIES: Mutex<Vec<(String, u32, Vec<u8>)>> = Mutex::new(Vec::new());
 
+/// Typed `android.os.Message` body for the initial connectivity
+/// `CALLBACK_AVAILABLE`. It is marshalled by the framework on the host side
+/// and delivered to the app's IMessenger with the normal oneway AIDL call.
+static CONNECTIVITY_CALLBACK_MESSAGE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// # Safety
+/// `ptr` must be readable for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_connectivity_callback(
+    ptr: *const u8,
+    len: usize,
+) -> bool {
+    if ptr.is_null() || len < 8 {
+        return false;
+    }
+    *CONNECTIVITY_CALLBACK_MESSAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) =
+        std::slice::from_raw_parts(ptr, len).to_vec();
+    true
+}
+
 /// `bool __pengudroid_binder_set_reply(service, service_len, code, body, body_len)`:
 /// answer `code` on the service registered as `service` with `body` (whatever
 /// the AIDL proxy reads after the status word). A later call replaces it.
@@ -3249,6 +3271,40 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
+    // ConnectivityManager passes its callback Handler as an IMessenger in
+    // requestNetwork/listenForNetwork. A real ConnectivityService immediately
+    // notifies a newly registered default callback of the current network.
+    // Without this initial message, getActiveNetwork() works but applications
+    // waiting for NetworkCallback.onAvailable still display "no connection".
+    if tr.target_handle == handle_for("connectivity") && tr.data_size > 0 && tr.data_ptr != 0 {
+        let message = CONNECTIVITY_CALLBACK_MESSAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !message.is_empty() {
+            let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+            if let Some((weak, cookie, at)) = find_local_binder(data) {
+                let mut body = aidl_interface_token("android.os.IMessenger");
+                body.extend_from_slice(&message);
+                APP_TX_QUEUE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(PendingAppTransaction {
+                        weak,
+                        cookie,
+                        code: 1, // IMessenger.send(Message), oneway
+                        flags: TF_ONE_WAY,
+                        parcel: body,
+                    });
+                if trace_enabled() {
+                    diag(&format!(
+                        "[binder] queued connectivity CALLBACK_AVAILABLE for IMessenger cookie={cookie:#x} (object at {at})\n"
+                    ));
+                }
+            }
+        }
+    }
+
     // Any transaction that carries a local binder object is a client handing us
     // a node it wants called back on. `attachApplication` is the one that
     // matters: its object is the app's `ApplicationThread`.
@@ -4287,20 +4343,37 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
 /// The parcel layout libbinder writes is `[u32 type][u32 flags][u64 binder or
 /// handle][u64 cookie]`, followed by the stability word for handle objects.
 /// Returns the object's address and its offset in the parcel.
-fn find_local_binder(data: &[u8]) -> Option<(u64, u64, usize)> {
+fn find_local_binders(data: &[u8]) -> Vec<(u64, u64, usize)> {
+    let mut found = Vec::new();
     let mut at = 0usize;
     while at + 32 <= data.len() {
-        let ty = u32::from_ne_bytes(data[at..at + 4].try_into().ok()?);
+        let ty = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
         if ty == BINDER_TYPE_BINDER {
-            let weak = u64::from_ne_bytes(data[at + 8..at + 16].try_into().ok()?);
-            let cookie = u64::from_ne_bytes(data[at + 16..at + 24].try_into().ok()?);
+            let weak = u64::from_ne_bytes(data[at + 8..at + 16].try_into().unwrap());
+            let cookie = u64::from_ne_bytes(data[at + 16..at + 24].try_into().unwrap());
             if weak != 0 && cookie != 0 {
-                return Some((weak, cookie, at));
+                found.push((weak, cookie, at));
             }
         }
         at += 4;
     }
-    None
+    found
+}
+
+fn find_local_binder(data: &[u8]) -> Option<(u64, u64, usize)> {
+    find_local_binders(data).into_iter().next()
+}
+
+/// Encode the complete native `Parcel.writeInterfaceToken` prefix used for an
+/// incoming AIDL transaction: strict-mode policy, work-source uid, TSYS magic,
+/// then the String16 interface descriptor.
+fn aidl_interface_token(descriptor: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + descriptor.len() * 2 + 8);
+    out.extend_from_slice(&0u32.to_ne_bytes());
+    out.extend_from_slice(&(-1i32).to_ne_bytes());
+    out.extend_from_slice(b"TSYS");
+    out.extend_from_slice(&string16(descriptor));
+    out
 }
 
 /// Build an incoming `BR_TRANSACTION` command addressed to the app's binder node.
@@ -4555,17 +4628,18 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
         }
     }
 
-    // Deliver queued callbacks to the app's own binder nodes (currently
-    // `IWindow.resized`, the window manager's answer to `relayoutAsync`). The
-    // kernel driver does this itself; the broker has to emulate it.
+    // Deliver queued callbacks to the app's own binder nodes. A synchronous
+    // request can receive an incoming oneway callback before its BR_REPLY:
+    // IPCThreadState.waitForResponse dispatches that callback and then resumes
+    // parsing the reply it was waiting for. This is required for the initial
+    // sticky CONNECTIVITY_CHANGE during registerReceiver.
     //
-    // Only on a *pure read* (`write_size == 0`), which is what a looper thread
-    // parked in the driver does. Attaching the callback to the same call that
-    // produced it deadlocks: the client is inside `waitForResponse` for its own
-    // oneway `relayoutAsync`, `resized` runs there, and the completion it is
-    // waiting for can never be parsed (measured: Java stack parked in
-    // `IWindowSession$Stub$Proxy.relayoutAsync`).
-    if wr.write_size == 0 && wr.read_size > 0 {
+    // Keep one-way producers on a *pure read* only. Attaching IWindow.resized
+    // to the same oneway relayoutAsync deadlocks: its completion can never be
+    // parsed while resized runs on the caller (measured in
+    // IWindowSession$Stub$Proxy.relayoutAsync).
+    let synchronous_reply = pending.len() == 1 && pending.first().is_some_and(Option::is_some);
+    if (wr.write_size == 0 || synchronous_reply) && wr.read_size > 0 {
         loop {
             if out.len() as u64 >= wr.read_size {
                 break;

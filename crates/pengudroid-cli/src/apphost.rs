@@ -136,6 +136,11 @@ pub struct AppSpec<'a> {
     pub activities: &'a [crate::apk::Component],
     /// `android:theme` of `<application>`, used when an activity declares none.
     pub application_theme: Option<u32>,
+    /// `android:networkSecurityConfig` resource from the real application
+    /// manifest. Android's NetworkSecurityConfigProvider reads this field.
+    pub network_security_config: Option<u32>,
+    /// Explicit `android:usesCleartextTraffic` value from the manifest.
+    pub uses_cleartext_traffic: Option<bool>,
     /// `android:theme` resource id for the launched activity, if the manifest
     /// declares one.
     pub theme: Option<u32>,
@@ -235,7 +240,24 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
     // create a `ThreadedRenderer`; without it the window is added but nothing is
     // ever drawn. `FLAG_HAS_CODE` (0x4) and `FLAG_SUPPORTS_SCREEN_DENSITIES`
     // (0x2000) are what a normal APK declares.
-    set_int("flags", 0x1000_0000 | 0x2000 | 0x4);
+    let mut application_flags = 0x1000_0000 | 0x2000 | 0x4;
+    if let Some(uses_cleartext) = spec.uses_cleartext_traffic {
+        // FLAG_USES_CLEARTEXT_TRAFFIC_SET and FLAG_USES_CLEARTEXT_TRAFFIC.
+        // Preserve an explicit false instead of treating it as an absent value.
+        application_flags |= 1 << 28;
+        if uses_cleartext {
+            application_flags |= 1 << 27;
+        }
+        match env.field_id(class, "usesCleartextTraffic", "Z") {
+            Some(id) => env.set_boolean_field(info, id, uses_cleartext),
+            None => eprintln!("apphost: ApplicationInfo.usesCleartextTraffic not found"),
+        }
+    }
+    set_int("flags", application_flags);
+    if let Some(resource) = spec.network_security_config {
+        set_int("networkSecurityConfigRes", resource as i32);
+        println!("apphost: ApplicationInfo.networkSecurityConfigRes = 0x{resource:08x}");
+    }
     // `BillingClient$Builder.build()` calls `metaData.getBoolean(...)` straight
     // off ApplicationInfo; a null metaData NPEs there (seen in BBR2's
     // VuBillingHelper). Fill it from the manifest's `<application>` meta-data:
@@ -7565,6 +7587,10 @@ fn launch_hosted_activity(
             // behavior on `onStart` (SDLActivity's native thread) work.
             start_activity(env, thread_class, thread, record);
             resume_activity(env, thread_class, thread, record);
+            // Registration commonly happens in Activity.onResume. Deliver the
+            // current sticky connectivity state only to matching monitor
+            // receivers after that registration has actually run.
+            let _ = deliver_connectivity_receivers(env, loaded_apk);
             // `handleResumeActivity` calls `makeVisible()` only when it decides the
             // activity will be visible; drive it explicitly so the decor view is
             // attached and the first traversal reaches `performDraw`.
@@ -9892,8 +9918,9 @@ fn install_connectivity(env: &JniEnv) -> Option<()> {
     // the service hands back a NetworkRequest. Without one, the later
     // `unregisterNetworkCallback` throws "NetworkCallback was not registered"
     // (Chromium does this when the last WebView goes away: Genshin crashed
-    // right after its login pages closed). Callbacks are never invoked; the
-    // network above is the only one and never changes.
+    // right after its login pages closed). New Messenger callbacks receive an
+    // initial onAvailable; legacy monitor receivers are dispatched after
+    // Activity.onResume through their LoadedApk ReceiverDispatcher.
     let request_builder = env.find_class("android/net/NetworkRequest$Builder")?;
     let builder = env.new_object(request_builder, env.method_id(request_builder, "<init>", "()V")?, &[])?;
     if let Some(add) = env.method_id(request_builder, "addCapability", "(I)Landroid/net/NetworkRequest$Builder;") {
@@ -9901,6 +9928,90 @@ fn install_connectivity(env: &JniEnv) -> Option<()> {
     }
     let request = env.call_object(builder, env.method_id(request_builder, "build", "()Landroid/net/NetworkRequest;")?, &[])?;
     let request_bytes = typed(request)?;
+
+    // ConnectivityService sends an initial CALLBACK_AVAILABLE through the
+    // Messenger registered by ConnectivityManager. Build a real Message and
+    // Bundle with the framework so its private Parcel layout stays correct.
+    let callback_message = (|| -> Option<Vec<u8>> {
+        let message_class = env.find_class("android/os/Message")?;
+        let message = env.call_static_object(
+            message_class,
+            env.static_method_id(message_class, "obtain", "()Landroid/os/Message;")?,
+            &[],
+        )?;
+        let what = env.field_id(message_class, "what", "I")?;
+        env.set_int_field(message, what, 2); // CALLBACK_AVAILABLE
+        if let Some(arg1) = env.field_id(message_class, "arg1", "I") {
+            env.set_int_field(message, arg1, 0); // not blocked
+        }
+        let (_, data) = new_instance(env, "android/os/Bundle")?;
+        let bundle_class = env.find_class("android/os/Bundle")?;
+        let put = env.method_id(
+            bundle_class,
+            "putParcelable",
+            "(Ljava/lang/String;Landroid/os/Parcelable;)V",
+        )?;
+        for (key, value) in [
+            ("NetworkRequest", request),
+            ("Network", network),
+            ("NetworkCapabilities", caps),
+            ("LinkProperties", link),
+        ] {
+            env.call_void(data, put, &[JValue { l: env.new_string(key) }, JValue { l: value }]);
+        }
+        env.call_void(
+            message,
+            env.method_id(message_class, "setData", "(Landroid/os/Bundle;)V")?,
+            &[JValue { l: data }],
+        );
+        typed(message)
+    })();
+    if let Some(bytes) = callback_message {
+        let setter = shim_symbol("__pengudroid_binder_set_connectivity_callback")?;
+        let setter: unsafe extern "C" fn(*const u8, usize) -> bool =
+            unsafe { std::mem::transmute(setter) };
+        if unsafe { setter(bytes.as_ptr(), bytes.len()) } {
+            println!("apphost: initial NetworkCallback.onAvailable message installed");
+        }
+    }
+
+    // The legacy receiver path is independent of NetworkCallback. Supply the
+    // current sticky Intent from both registerReceiver AIDL variants. Matching
+    // monitor receivers are dispatched from LoadedApk after onResume.
+    let connectivity_broadcast = (|| -> Option<([u32; 2], Vec<u8>)> {
+        let intent_class = env.find_class("android/content/Intent")?;
+        let (_, intent) = new_instance(env, "android/content/Intent")?;
+        env.call_object(
+            intent,
+            env.method_id(intent_class, "setAction", "(Ljava/lang/String;)Landroid/content/Intent;")?,
+            &[JValue { l: env.new_string("android.net.conn.CONNECTIVITY_CHANGE") }],
+        )?;
+        // Receivers query ConnectivityManager for the current state; no
+        // deprecated NetworkInfo extra is needed.
+        let intent_bytes = typed(intent)?;
+        let manager = env.find_class("android/app/IActivityManager$Stub")?;
+        let mut codes = [0u32; 2];
+        for (out, field) in codes.iter_mut().zip([
+            "TRANSACTION_registerReceiver",
+            "TRANSACTION_registerReceiverWithFeature",
+        ]) {
+            *out = u32::try_from(env.static_int_field(
+                manager,
+                env.static_field_id(manager, field, "I")?,
+            )).ok()?;
+        }
+        Some((codes, intent_bytes))
+    })();
+    if let Some((codes, reply)) = connectivity_broadcast {
+        let install = shim_symbol("__pengudroid_binder_set_reply")?;
+        let install: unsafe extern "C" fn(*const u8, usize, u32, *const u8, usize) -> bool =
+            unsafe { std::mem::transmute(install) };
+        let service = b"activity";
+        for code in codes {
+            unsafe { install(service.as_ptr(), service.len(), code, reply.as_ptr(), reply.len()) };
+        }
+        println!("apphost: sticky CONNECTIVITY_CHANGE reply installed for {codes:?}");
+    }
 
     let info_bytes = typed(info)?;
     let network_bytes = typed(network)?;
@@ -9940,6 +10051,99 @@ fn install_connectivity(env: &JniEnv) -> Option<()> {
     }
     println!("apphost: active network published (Wi-Fi, validated): {}", installed.join(", "));
     (!installed.is_empty()).then_some(())
+}
+
+/// Deliver the initial sticky CONNECTIVITY_CHANGE to registered receivers that
+// explicitly expose `getExpectedAction()` (the monitor-receiver pattern used
+// by PSB). LoadedApk retains the real ReceiverDispatcher objects, so this runs
+// the ordinary BroadcastReceiver.onReceive on the main thread without a raw
+// IIntentReceiver Binder roundtrip. The receiver itself queries the published
+// ConnectivityManager state; no online/offline result is invented here.
+fn deliver_connectivity_receivers(env: &JniEnv, loaded_apk: JObject) -> Option<usize> {
+    let _frame = env.local_frame(128)?;
+    let apk_class = env.find_class("android/app/LoadedApk")?;
+    let receivers = env.object_field(
+        loaded_apk,
+        env.field_id(apk_class, "mReceivers", "Landroid/util/ArrayMap;")?,
+    );
+    if receivers.is_null() {
+        return Some(0);
+    }
+    let map_class = env.find_class("android/util/ArrayMap")?;
+    let size = env.method_id(map_class, "size", "()I")?;
+    let value_at = env.method_id(map_class, "valueAt", "(I)Ljava/lang/Object;")?;
+    let dispatcher_class = env.find_class("android/app/LoadedApk$ReceiverDispatcher")?;
+    let receiver_field = env.field_id(
+        dispatcher_class,
+        "mReceiver",
+        "Landroid/content/BroadcastReceiver;",
+    )?;
+    let context_field = env.field_id(
+        dispatcher_class,
+        "mContext",
+        "Landroid/content/Context;",
+    )?;
+    let (_, intent) = new_instance(env, "android/content/Intent")?;
+    let intent_class = env.find_class("android/content/Intent")?;
+    env.call_object(
+        intent,
+        env.method_id(intent_class, "setAction", "(Ljava/lang/String;)Landroid/content/Intent;")?,
+        &[JValue { l: env.new_string("android.net.conn.CONNECTIVITY_CHANGE") }],
+    )?;
+    let receiver_base = env.find_class("android/content/BroadcastReceiver")?;
+    let on_receive = env.method_id(
+        receiver_base,
+        "onReceive",
+        "(Landroid/content/Context;Landroid/content/Intent;)V",
+    )?;
+    let mut delivered = 0usize;
+    let outer_count = env.call_int(receivers, size, &[])?;
+    for outer in 0..outer_count {
+        let inner = env.call_object(receivers, value_at, &[JValue { i: outer }])?;
+        if inner.is_null() {
+            continue;
+        }
+        let inner_count = env.call_int(inner, size, &[])?;
+        for index in 0..inner_count {
+            let dispatcher = env.call_object(inner, value_at, &[JValue { i: index }])?;
+            if dispatcher.is_null() {
+                continue;
+            }
+            let receiver = env.object_field(dispatcher, receiver_field);
+            if receiver.is_null() {
+                continue;
+            }
+            let class = env.object_class(receiver)?;
+            // Most BroadcastReceivers do not expose this monitor-specific
+            // method. Skipping them avoids delivering an unrelated action.
+            let Some(expected) = env.method_id_quiet(
+                class,
+                "getExpectedAction",
+                "()Ljava/lang/String;",
+            ) else {
+                continue;
+            };
+            let action = env.call_object(receiver, expected, &[])?;
+            if env.get_string(action).as_deref()
+                != Some("android.net.conn.CONNECTIVITY_CHANGE")
+            {
+                continue;
+            }
+            let context = env.object_field(dispatcher, context_field);
+            if context.is_null() {
+                continue;
+            }
+            if !env.call_void(receiver, on_receive, &[JValue { l: context }, JValue { l: intent }]) {
+                env.describe_exception();
+                return None;
+            }
+            delivered += 1;
+        }
+    }
+    if delivered != 0 {
+        println!("apphost: delivered initial CONNECTIVITY_CHANGE to {delivered} registered receiver(s)");
+    }
+    Some(delivered)
 }
 
 /// Hand a serialized reply to the binder broker.

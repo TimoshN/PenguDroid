@@ -63,6 +63,10 @@ pub struct ApkInfo {
     pub application_class: Option<String>,
     /// `android:theme` of `<application>` as a resource id.
     pub application_theme: Option<u32>,
+    /// `android:networkSecurityConfig` of `<application>` as a resource id.
+    pub network_security_config: Option<u32>,
+    /// Explicit `android:usesCleartextTraffic`, including an explicit false.
+    pub uses_cleartext_traffic: Option<bool>,
     /// `<meta-data>` children of `<application>`.
     pub application_meta: Vec<(String, MetaValue)>,
     pub activities: Vec<Component>,
@@ -792,6 +796,8 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                         // here, so only inline strings are kept.
                         info.label = attr_str(&pool, &attrs, "label");
                         info.application_theme = attr_ref(&attrs, "theme");
+                        info.network_security_config = attr_ref(&attrs, "networkSecurityConfig");
+                        info.uses_cleartext_traffic = attr_bool(&attrs, "usesCleartextTraffic");
                         if let Some(n) = attr_str(&pool, &attrs, "name") {
                             info.application_class = Some(info.resolve(&n));
                         }
@@ -1092,6 +1098,7 @@ mod tests {
     enum A {
         Str(&'static str),
         Int(u32),
+        Ref(u32),
         Bool(bool),
     }
 
@@ -1149,6 +1156,13 @@ mod tests {
                         c.extend(8u16.to_le_bytes());
                         c.push(0);
                         c.push(TYPE_INT_DEC);
+                        c.extend(v.to_le_bytes());
+                    }
+                    A::Ref(v) => {
+                        c.extend(NO_INDEX.to_le_bytes());
+                        c.extend(8u16.to_le_bytes());
+                        c.push(0);
+                        c.push(TYPE_REFERENCE);
                         c.extend(v.to_le_bytes());
                     }
                     A::Bool(v) => {
@@ -1296,7 +1310,11 @@ mod tests {
         b.end("uses-sdk");
         b.start("uses-permission", &[("name", A::Str("android.permission.INTERNET"))]);
         b.end("uses-permission");
-        b.start("application", &[("label", A::Str("Demo"))]);
+        b.start("application", &[
+            ("label", A::Str("Demo")),
+            ("networkSecurityConfig", A::Ref(0x7f15_0008)),
+            ("usesCleartextTraffic", A::Bool(true)),
+        ]);
         b.start("activity", &[("name", A::Str(".MainActivity"))]);
         b.start("intent-filter", &[]);
         b.start("action", &[("name", A::Str("android.intent.action.MAIN"))]);
@@ -1337,6 +1355,8 @@ mod tests {
         assert_eq!(info.min_sdk, Some(21));
         assert_eq!(info.target_sdk, Some(36));
         assert_eq!(info.label.as_deref(), Some("Demo"));
+        assert_eq!(info.network_security_config, Some(0x7f15_0008));
+        assert_eq!(info.uses_cleartext_traffic, Some(true));
         assert_eq!(info.main_activity.as_deref(), Some("com.example.demo.MainActivity"));
         assert!(info.permissions.iter().any(|p| p == "android.permission.INTERNET"));
 
