@@ -164,6 +164,20 @@ fn prio_name(prio: i32) -> &'static str {
 // Logging (<android/log.h>)
 // ---------------------------------------------------------------------------
 
+fn log_priority_enabled(prio: i32, debug_enabled: bool) -> bool {
+    prio > ANDROID_LOG_DEBUG || debug_enabled
+}
+
+fn log_tag_priority_enabled(prio: i32, tag: &str, debug_enabled: bool) -> bool {
+    log_priority_enabled(prio, debug_enabled)
+        && (debug_enabled || prio >= ANDROID_LOG_ERROR || tag != "VelocityTracker")
+}
+
+fn debug_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PENGUDROID_LOG_DEBUG").is_some())
+}
+
 /// Render a single log line in the shim's canonical format:
 /// `[pengudroid:log] <PRIO> <tag>: <text>`.
 pub fn format_log_line(prio: i32, tag: &str, text: &str) -> String {
@@ -176,6 +190,9 @@ pub fn format_log_line(prio: i32, tag: &str, text: &str) -> String {
 /// success, or `-1` on error. This mirrors the "bytes written / negative on
 /// error" contract callers expect from the Bionic log functions.
 pub fn log_to_stderr(prio: i32, tag: &str, text: &str) -> isize {
+    if !log_tag_priority_enabled(prio, tag, debug_log_enabled()) {
+        return 0;
+    }
     // One choke point for every log entry (Bionic has half a dozen of them), so
     // `PENGUDROID_TRACE_BT` works no matter which one the caller picked. The
     // `bt` tag is this hook's own output and must not recurse.
@@ -827,30 +844,28 @@ pub unsafe extern "C" fn __android_log_buf_write(
 
 /// `__android_log_is_loggable(prio, tag, default_prio)`.
 ///
-/// We never suppress logging, so this unconditionally reports "loggable"
-/// (`1`), matching what a guest expects when its log level is at least as
-/// permissive as the requested priority.
+/// VERBOSE/DEBUG are opt-in because per-frame input logging otherwise dominates
+/// touch latency on the device. INFO and more important priorities remain on.
 #[no_mangle]
 pub unsafe extern "C" fn __android_log_is_loggable(
-    _prio: c_int,
-    _tag: *const c_char,
+    prio: c_int,
+    tag: *const c_char,
     _default_prio: c_int,
 ) -> c_int {
-    1
+    i32::from(log_tag_priority_enabled(prio, &cstr_lossy(tag), debug_log_enabled()))
 }
 
 /// `__android_log_is_loggable_len(prio, tag, len, default_prio)`.
 ///
-/// Length-bounded variant of [`__android_log_is_loggable`]; see that function
-/// for why we always answer `1`. `len` is ignored.
+/// Length-bounded variant of [`__android_log_is_loggable`]. `len` is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn __android_log_is_loggable_len(
-    _prio: c_int,
-    _tag: *const c_char,
+    prio: c_int,
+    tag: *const c_char,
     _len: usize,
     _default_prio: c_int,
 ) -> c_int {
-    1
+    i32::from(log_tag_priority_enabled(prio, &cstr_lossy(tag), debug_log_enabled()))
 }
 
 // ---------------------------------------------------------------------------
@@ -6288,6 +6303,20 @@ mod tests {
         );
         // Unknown priorities degrade to "UNKNOWN" rather than panicking.
         assert_eq!(format_log_line(42, "T", "x"), "[pengudroid:log] UNKNOWN T: x");
+    }
+
+    #[test]
+    fn verbose_and_debug_logging_are_opt_in() {
+        assert!(!log_priority_enabled(ANDROID_LOG_VERBOSE, false));
+        assert!(!log_priority_enabled(ANDROID_LOG_DEBUG, false));
+        assert!(log_priority_enabled(ANDROID_LOG_VERBOSE, true));
+        assert!(log_priority_enabled(ANDROID_LOG_DEBUG, true));
+        for prio in [ANDROID_LOG_INFO, ANDROID_LOG_WARN, ANDROID_LOG_ERROR, ANDROID_LOG_FATAL] {
+            assert!(log_priority_enabled(prio, false));
+        }
+        assert!(!log_tag_priority_enabled(ANDROID_LOG_INFO, "VelocityTracker", false));
+        assert!(log_tag_priority_enabled(ANDROID_LOG_ERROR, "VelocityTracker", false));
+        assert!(log_tag_priority_enabled(ANDROID_LOG_INFO, "VelocityTracker", true));
     }
 
     #[test]

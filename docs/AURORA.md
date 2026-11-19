@@ -395,6 +395,14 @@ error or guest exit. Regression coverage also checks allocation, stability,
 recycling and the 31-pointer hardware bound. Evidence:
 `target/aurora/maxnext-pointer-fixed.log`.
 
+Per-motion logging was also removed from the default device path: the previous
+run wrote 13,878 VelocityTracker lines (73% of the entire log), which stalled
+touch processing. VERBOSE/DEBUG now require `PENGUDROID_LOG_DEBUG=1`, and noisy
+VelocityTracker messages below ERROR are suppressed unless that option is set.
+The comparable low-latency run wrote 1,307 lines total and zero VelocityTracker
+lines; INFO/WARN/ERROR/FATAL from other components remain enabled. Evidence:
+`target/aurora/maxnext-low-latency.log`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through
