@@ -1759,6 +1759,52 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
 
 /// Input events forwarded by the daemon, waiting for the host to pick them up.
 static INPUT_QUEUE: Mutex<Vec<(u32, pengudroid_proto::InputKind)>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Copy)]
+struct TouchDebugState {
+    x: f32,
+    y: f32,
+    pressed: bool,
+    last_ms: u64,
+}
+
+static TOUCH_DEBUG_STATE: Mutex<TouchDebugState> = Mutex::new(TouchDebugState {
+    x: 0.0,
+    y: 0.0,
+    pressed: false,
+    last_ms: 0,
+});
+
+fn touch_debug_now_ms() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64).saturating_mul(1000) + ts.tv_nsec as u64 / 1_000_000
+}
+
+fn record_touch_debug(event: &pengudroid_proto::InputKind) {
+    if std::env::var_os("PENGUDROID_TOUCH_DEBUG").is_none() {
+        return;
+    }
+    let mut state = TOUCH_DEBUG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    match event {
+        pengudroid_proto::InputKind::PointerEnter { x, y }
+        | pengudroid_proto::InputKind::PointerMotion { x, y } => {
+            state.x = *x;
+            state.y = *y;
+            state.last_ms = touch_debug_now_ms();
+        }
+        pengudroid_proto::InputKind::PointerButton { pressed, .. } => {
+            state.pressed = *pressed;
+            state.last_ms = touch_debug_now_ms();
+        }
+        pengudroid_proto::InputKind::PointerLeave => {
+            state.pressed = false;
+            state.last_ms = touch_debug_now_ms();
+        }
+        _ => {}
+    }
+}
+
 /// Text is kept out of the fixed 16-byte pointer-event record. The input pump
 /// immediately follows tag 8 with pengudroid_input_read_text.
 static TEXT_INPUT_QUEUE: Mutex<std::collections::VecDeque<String>> =
@@ -1811,6 +1857,7 @@ fn subscribe_input(surface_id: u32) {
             match conn.recv_message() {
                 Ok((Message::InputEvent { surface_id, event }, fds)) => {
                     close_fds(&fds);
+                    record_touch_debug(&event);
                     if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
                         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
                         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
@@ -4400,6 +4447,75 @@ fn glyph_3x5(ch: char) -> [u8; 5] {
     }
 }
 
+/// Render the most recent touch as a ring and crosshair into the surface FBO.
+/// This deliberately uses the same state-preserving glScissor/glClear approach
+/// as the performance HUD, so no Android shader, texture or VAO state is changed.
+unsafe fn draw_touch_debug_overlay(surface: EGLSurface, host: &Host) {
+    if std::env::var_os("PENGUDROID_TOUCH_DEBUG").is_none() {
+        return;
+    }
+    let state = *TOUCH_DEBUG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.last_ms == 0 || touch_debug_now_ms().saturating_sub(state.last_ms) > 750 {
+        return;
+    }
+    let rec = &*(surface as *const SurfaceRec);
+    let (w, h) = (rec.w as i32, rec.h as i32);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let (
+        Some(enable), Some(disable), Some(is_enabled), Some(scissor),
+        Some(clear_color), Some(clear), Some(get_int), Some(get_float), Some(get_bool),
+        Some(color_mask),
+    ) = (
+        host.gl_enable, host.gl_disable, host.gl_is_enabled, host.gl_scissor,
+        host.gl_clear_color, host.gl_clear, host.gl_get_integerv,
+        host.gl_get_floatv, host.gl_get_booleanv, host.gl_color_mask,
+    ) else {
+        return;
+    };
+    let was_scissor = is_enabled(GL_SCISSOR_TEST) != 0;
+    let mut prev_box = [0i32; 4];
+    get_int(GL_SCISSOR_BOX, prev_box.as_mut_ptr());
+    let mut prev_clear = [0f32; 4];
+    get_float(GL_COLOR_CLEAR_VALUE, prev_clear.as_mut_ptr());
+    let mut prev_mask = [1u8; 4];
+    get_bool(GL_COLOR_WRITEMASK, prev_mask.as_mut_ptr());
+    enable(GL_SCISSOR_TEST);
+    color_mask(1, 1, 1, 1);
+    let flipped = std::env::var_os("PENGUDROID_NO_PRESENT_FLIP").is_none();
+    let (r, g, b) = if state.pressed { (1.0, 0.45, 0.08) } else { (0.15, 0.85, 1.0) };
+    clear_color(r, g, b, 1.0);
+    let cx = state.x.round() as i32;
+    let cy = state.y.round() as i32;
+    let radius = if state.pressed { 42 } else { 30 };
+    let pixel = 4;
+    let mut fill = |x: i32, y: i32, rw: i32, rh: i32| {
+        if rw <= 0 || rh <= 0 || x < 0 || y < 0 || x + rw > w || y + rh > h {
+            return;
+        }
+        let gl_y = if flipped { h - y - rh } else { y };
+        scissor(x, gl_y, rw, rh);
+        clear(GL_COLOR_BUFFER_BIT);
+    };
+    for dy in (-radius..=radius).step_by(pixel as usize) {
+        for dx in (-radius..=radius).step_by(pixel as usize) {
+            let d2 = dx * dx + dy * dy;
+            if d2 <= radius * radius && d2 >= (radius - pixel) * (radius - pixel) {
+                fill(cx + dx, cy + dy, pixel, pixel);
+            }
+        }
+    }
+    fill(cx - 2, cy - 14, 4, 28);
+    fill(cx - 14, cy - 2, 28, 4);
+    color_mask(prev_mask[0], prev_mask[1], prev_mask[2], prev_mask[3]);
+    clear_color(prev_clear[0], prev_clear[1], prev_clear[2], prev_clear[3]);
+    scissor(prev_box[0], prev_box[1], prev_box[2], prev_box[3]);
+    if !was_scissor {
+        disable(GL_SCISSOR_TEST);
+    }
+}
+
 /// Render an in-frame MangoHud-style performance overlay into the surface FBO.
 ///
 /// Uses `glScissor` + `glClear` so it works identically on GLES 1/2/3 without
@@ -4591,6 +4707,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
     }
     probe_gralloc_once();
     draw_mangohud_overlay(surface, host);
+    draw_touch_debug_overlay(surface, host);
     let finish_started = std::time::Instant::now();
     if let Some(finish) = host.gl_finish {
         finish();

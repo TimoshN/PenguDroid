@@ -414,6 +414,14 @@ returns in a few milliseconds. Timing logs are opt-in through
 `PENGUDROID_TRACE_INPUT_TIMING=1`. Evidence:
 `target/aurora/maxnext-dedup.log` and `target/aurora/maxnext-dedup.png`.
 
+For visual touch/latency debugging, `PENGUDROID_TOUCH_DEBUG=1` renders the
+latest contact directly into the Android surface FBO before eglSwapBuffers.
+The pressed indicator is an orange ring/crosshair; release turns it cyan for
+750 ms. It uses the existing state-preserving glScissor/glClear overlay path,
+so Android shaders, textures and VAOs are untouched, and normal launches have
+no overlay. Device screenshots: `target/aurora/maxnext-touch-debug-pressed.png`
+and `target/aurora/maxnext-touch-debug-released.png`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through
