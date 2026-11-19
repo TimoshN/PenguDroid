@@ -458,6 +458,28 @@ omits `-Xint`, but the current runtime still crashes at
 `nterp0_op_invoke_virtual+36` with SIGSEGV and exits, so it is not a usable fix.
 Evidence: `target/aurora/maxnext-jit.log`.
 
+The larger scroll-latency root cause was the vsync producer/consumer mismatch:
+the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI
+pipeline rendered about 30 FPS. Surplus events left Compose processing stale
+frame timelines; the old run accumulated 657 DisplayEventDispatcher warnings.
+A pure one-shot experiment stalled MAX (it does not continually issue
+requestNextVsync), and SIOCOUTQ cannot inspect AF_UNIX seqpacket queues, so
+neither experiment is retained. Instead `PENGUDROID_VSYNC_INTERVAL_US`
+configures one consistent interval for the producer, event timeline and latest
+vsync reply. Aurora/Hybris packages now default to 33333 us unless explicitly
+overridden; QEMU and ordinary Linux keep the previous default.
+
+With explicit 30 Hz vsync, two diagnostic swipes changed content after 14 ms
+and 39 ms instead of 3172/2358 ms. With the automatic package default and no
+PENGUDROID_VSYNC_INTERVAL_US override, two subsequent swipes changed content
+after 281 ms and 290 ms, still eliminating the multi-second stall. The automatic
+run had 41 dispatcher warnings over the whole log and no crash. Content hashes
+measure pixel changes, not a semantic proof that every change is scroll rather
+than a ripple, so the exact sub-frame/ripple components need separate analysis.
+Evidence: `target/aurora/maxnext-vsync30.log`,
+`target/aurora/maxnext-vsync-auto.log`, and
+`target/aurora/maxnext-vsync-auto-after-swipes.png`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through

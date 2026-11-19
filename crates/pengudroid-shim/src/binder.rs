@@ -1150,6 +1150,18 @@ const DISPLAY_EVENT_SIZE: usize = 224;
 const DISPLAY_EVENT_VSYNC: u32 = 0x7673_796e;
 const VSYNC_FRAME_INTERVAL_NS: i64 = 16_666_666;
 
+fn frame_interval_ns() -> i64 {
+    static INTERVAL: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+        std::env::var("PENGUDROID_VSYNC_INTERVAL_US")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| (4_000..=1_000_000).contains(value))
+            .map(|value| value * 1_000)
+            .unwrap_or(VSYNC_FRAME_INTERVAL_NS)
+    });
+    *INTERVAL
+}
+
 /// `ILocaleManager` transaction codes.
 ///
 /// `AppCompatDelegate.getApplicationLocales()` goes through the locale service
@@ -2214,11 +2226,11 @@ fn vsync_event(vsync_time: i64, frame: u32) -> [u8; DISPLAY_EVENT_SIZE] {
     // displayId stays 0 (the hosted display).
     event[16..24].copy_from_slice(&vsync_time.to_ne_bytes());
     event[24..28].copy_from_slice(&frame.to_ne_bytes());
-    event[32..40].copy_from_slice(&VSYNC_FRAME_INTERVAL_NS.to_ne_bytes());
+    event[32..40].copy_from_slice(&frame_interval_ns().to_ne_bytes());
     event[40..44].copy_from_slice(&0u32.to_ne_bytes()); // preferredFrameTimelineIndex
     event[44..48].copy_from_slice(&1u32.to_ne_bytes()); // frameTimelinesLength
     // numberQueuedBuffers and alignment precede FrameTimeline[7] at offset 56.
-    let expected = vsync_time + VSYNC_FRAME_INTERVAL_NS;
+    let expected = vsync_time + frame_interval_ns();
     event[56..64].copy_from_slice(&(frame as i64).to_ne_bytes());
     event[64..72].copy_from_slice(&expected.to_ne_bytes());
     event[72..80].copy_from_slice(&expected.to_ne_bytes());
@@ -2262,7 +2274,7 @@ fn send_vsync() -> Result<(), String> {
     {
         static LAST_SEND: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
         let previous = LAST_SEND.load(Ordering::Relaxed);
-        if previous != 0 && vsync_time - previous < VSYNC_FRAME_INTERVAL_NS / 2 {
+        if previous != 0 && vsync_time - previous < frame_interval_ns() / 2 {
             return Ok(());
         }
         LAST_SEND.store(vsync_time, Ordering::Relaxed);
@@ -2291,19 +2303,22 @@ fn send_vsync() -> Result<(), String> {
             dropped += 1;
         }
     }
-    // One line per second: vsync fires 60 times a second, and every one of them
-    // in the trace buries the transactions that matter.
-    if trace_enabled() && frame % 60 == 0 {
+    // Keep normal binder tracing sparse; PENGUDROID_TRACE_VSYNC opts into every
+    // pulse when diagnosing frame-timeline stalls.
+    if (trace_enabled() && frame % 60 == 0)
+        || std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some()
+    {
         unsafe {
             diag(&format!(
-                "[binder]   -> vsync frame {frame} ts={vsync_time} dropped={dropped}\n"
+                "[binder]   -> vsync frame {frame} ts={vsync_time} dropped={dropped} channels={}\n",
+                fds.len()
             ))
         };
     }
     Ok(())
 }
 
-/// Start the 60 Hz frame clock, once per process.
+/// Start the configured-rate frame clock, once per process.
 ///
 /// A real compositor emits vsync continuously; the app's `Choreographer` only
 /// asks for the *next* pulse, so answering just that one request leaves the
@@ -2313,7 +2328,7 @@ fn start_frame_clock() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         std::thread::spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_micros(16_666));
+            std::thread::sleep(std::time::Duration::from_micros((frame_interval_ns() / 1_000) as u64));
             if !VSYNC_SEND_FDS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3901,10 +3916,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // `[presence int][int64][uint32][uint32 count][count x {int64,int64,int64}]`.
         // The proxy reads it with `Parcel::readParcelable` (presence must be
         // kNonNullParcelableFlag = 1) after the AIDL status word written above.
-        // Answer with one frame timeline whose deadline is the next 60 Hz pulse,
+        // Answer with one frame timeline whose deadline is the next configured pulse,
         // so `Choreographer` sees a sane vsync instead of garbage.
         let now = monotonic_ns();
-        let deadline = now + VSYNC_FRAME_INTERVAL_NS;
+        let deadline = now + frame_interval_ns();
         parcel.extend_from_slice(&1u32.to_ne_bytes()); // kNonNullParcelableFlag
         parcel.extend_from_slice(&0i64.to_ne_bytes()); // preferredFrameTimelineIndex
         parcel.extend_from_slice(&0u32.to_ne_bytes());
@@ -3923,6 +3938,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             parcel.extend_from_slice(&0u32.to_ne_bytes());
         }
         if matches!(tr.code, IDEC_REQUEST_NEXT_VSYNC | IDEC_SET_VSYNC_RATE) {
+            if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
+                unsafe { diag(&format!("[binder]   <- display event code={}\n", tr.code)) };
+            }
             // ViewRootImpl schedules its first traversal from this pulse.
             if let Err(error) = send_vsync() {
                 return Reply::unknown_transaction(tr, &error);
