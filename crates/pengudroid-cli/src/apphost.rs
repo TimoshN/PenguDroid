@@ -1185,6 +1185,13 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     } else {
         eprintln!("apphost: warning: AndroidKeyStoreProvider installation unavailable");
     }
+    if std::env::var_os("PENGUDROID_TEST_KEYSTORE").is_some() {
+        if run_android_keystore_smoke(env).is_some() {
+            println!("keystore-smoke: AndroidKeyStore AES-GCM generate/get/encrypt/decrypt/delete passed");
+        } else {
+            eprintln!("keystore-smoke: FAILED");
+        }
+    }
     println!("apphost: calling handleBindApplication for {}", spec.package);
     let ok = env.call_void(thread, handle, &[JValue { l: data }]);
     if ok {
@@ -6804,6 +6811,116 @@ fn install_android_keystore_provider(env: &JniEnv) -> Option<()> {
     let provider = env.find_class("android/security/keystore2/AndroidKeyStoreProvider")?;
     let install = env.static_method_id(provider, "install", "()V")?;
     env.call_static_void(provider, install, &[]).then_some(())
+}
+
+/// Exercise the real Android JCA provider end to end without logging plaintext,
+/// key bytes, IVs, ciphertext or tags. The fixed smoke payload is not app data.
+fn run_android_keystore_smoke(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(96)?;
+    let alias = "pengudroid_keystore2_smoke";
+    let alias_object = env.new_string(alias);
+    let aes = env.new_string("AES");
+    let provider = env.new_string("AndroidKeyStore");
+    let gcm = env.new_string("GCM");
+    let no_padding = env.new_string("NoPadding");
+    let null = std::ptr::null_mut();
+
+    let key_store_class = env.find_class("java/security/KeyStore")?;
+    let get_key_store = env.static_method_id(
+        key_store_class, "getInstance", "(Ljava/lang/String;)Ljava/security/KeyStore;",
+    )?;
+    let key_store = env.call_static_object(key_store_class, get_key_store, &[JValue { l: provider }])?;
+    let load = env.method_id(key_store_class, "load", "(Ljava/security/KeyStore$LoadStoreParameter;)V")?;
+    if !env.call_void(key_store, load, &[JValue { l: null }]) { return None; }
+    let delete = env.method_id(key_store_class, "deleteEntry", "(Ljava/lang/String;)V")?;
+    let contains = env.method_id(key_store_class, "containsAlias", "(Ljava/lang/String;)Z")?;
+    if env.call_boolean(key_store, contains, &[JValue { l: alias_object }]) == Some(true) {
+        if !env.call_void(key_store, delete, &[JValue { l: alias_object }]) { return None; }
+    }
+
+    let builder_class = env.find_class("android/security/keystore/KeyGenParameterSpec$Builder")?;
+    let builder_ctor = env.method_id(builder_class, "<init>", "(Ljava/lang/String;I)V")?;
+    let builder = env.new_object(builder_class, builder_ctor, &[
+        JValue { l: alias_object }, JValue { i: 3 }, // ENCRYPT | DECRYPT
+    ])?;
+    let string_class = env.find_class("java/lang/String")?;
+    let modes = env.new_object_array(1, string_class, gcm)?;
+    let paddings = env.new_object_array(1, string_class, no_padding)?;
+    let set_modes = env.method_id(
+        builder_class, "setBlockModes",
+        "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+    )?;
+    env.call_object(builder, set_modes, &[JValue { l: modes }])?;
+    let set_paddings = env.method_id(
+        builder_class, "setEncryptionPaddings",
+        "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+    )?;
+    env.call_object(builder, set_paddings, &[JValue { l: paddings }])?;
+    let set_size = env.method_id(
+        builder_class, "setKeySize",
+        "(I)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+    )?;
+    env.call_object(builder, set_size, &[JValue { i: 256 }])?;
+    let build = env.method_id(
+        builder_class, "build", "()Landroid/security/keystore/KeyGenParameterSpec;",
+    )?;
+    let spec = env.call_object(builder, build, &[])?;
+
+    let generator_class = env.find_class("javax/crypto/KeyGenerator")?;
+    let get_generator = env.static_method_id(
+        generator_class, "getInstance",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
+    )?;
+    let generator = env.call_static_object(generator_class, get_generator, &[
+        JValue { l: aes }, JValue { l: provider },
+    ])?;
+    let init = env.method_id(generator_class, "init", "(Ljava/security/spec/AlgorithmParameterSpec;)V")?;
+    if !env.call_void(generator, init, &[JValue { l: spec }]) { return None; }
+    let generate = env.method_id(generator_class, "generateKey", "()Ljavax/crypto/SecretKey;")?;
+    let key = env.call_object(generator, generate, &[])?;
+    if env.call_boolean(key_store, contains, &[JValue { l: alias_object }]) != Some(true) {
+        return None;
+    }
+
+    let cipher_class = env.find_class("javax/crypto/Cipher")?;
+    let get_cipher = env.static_method_id(
+        cipher_class, "getInstance", "(Ljava/lang/String;)Ljavax/crypto/Cipher;",
+    )?;
+    let transformation = env.new_string("AES/GCM/NoPadding");
+    let encrypt = env.call_static_object(cipher_class, get_cipher, &[JValue { l: transformation }])?;
+    let init_key = env.method_id(cipher_class, "init", "(ILjava/security/Key;)V")?;
+    if !env.call_void(encrypt, init_key, &[JValue { i: 1 }, JValue { l: key }]) { return None; }
+    let update_aad = env.method_id(cipher_class, "updateAAD", "([B)V")?;
+    let aad = env.new_byte_array(8)?;
+    env.set_byte_array_region(aad, 0, b"smoke123");
+    if !env.call_void(encrypt, update_aad, &[JValue { l: aad }]) { return None; }
+    let do_final = env.method_id(cipher_class, "doFinal", "([B)[B")?;
+    let plaintext = env.new_byte_array(3)?;
+    env.set_byte_array_region(plaintext, 0, b"123");
+    let ciphertext = env.call_object(encrypt, do_final, &[JValue { l: plaintext }])?;
+    let get_iv = env.method_id(cipher_class, "getIV", "()[B")?;
+    let iv = env.call_object(encrypt, get_iv, &[])?;
+
+    let gcm_spec_class = env.find_class("javax/crypto/spec/GCMParameterSpec")?;
+    let gcm_spec_ctor = env.method_id(gcm_spec_class, "<init>", "(I[B)V")?;
+    let gcm_spec = env.new_object(gcm_spec_class, gcm_spec_ctor, &[
+        JValue { i: 128 }, JValue { l: iv },
+    ])?;
+    let decrypt = env.call_static_object(cipher_class, get_cipher, &[JValue { l: transformation }])?;
+    let init_spec = env.method_id(
+        cipher_class, "init", "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+    )?;
+    if !env.call_void(decrypt, init_spec, &[
+        JValue { i: 2 }, JValue { l: key }, JValue { l: gcm_spec },
+    ]) { return None; }
+    if !env.call_void(decrypt, update_aad, &[JValue { l: aad }]) { return None; }
+    let decrypted = env.call_object(decrypt, do_final, &[JValue { l: ciphertext }])?;
+    if env.byte_array_copy(decrypted)? != b"123" { return None; }
+    if !env.call_void(key_store, delete, &[JValue { l: alias_object }]) { return None; }
+    if env.call_boolean(key_store, contains, &[JValue { l: alias_object }]) != Some(false) {
+        return None;
+    }
+    Some(())
 }
 
 /// Restore Android's normal final uncaught-exception handler for diagnostics.

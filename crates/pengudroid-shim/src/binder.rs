@@ -24,6 +24,8 @@ use libc::{c_int, c_ulong, c_void};
 
 use crate::mediasession::Operation;
 
+mod keystore2;
+
 /// Protocol version `libbinder` expects from Android 10 onward.
 const BINDER_CURRENT_PROTOCOL_VERSION: c_int = 8;
 
@@ -2452,7 +2454,7 @@ fn hosted_interface_descriptor(handle: u32) -> Option<&'static str> {
         "pengudroid.activity_host" => Some(ACTIVITY_HOST_DESCRIPTOR),
         "clipboard" => Some("android.content.IClipboard"),
         BILLING_SERVICE => Some("com.android.vending.billing.IInAppBillingService"),
-        _ => None,
+        name => keystore2::descriptor_for_name(name),
     }
 }
 
@@ -2953,6 +2955,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             let parcel = string16(descriptor);
             return Reply { parcel, objects: Vec::new(), flags: 0 };
         }
+    }
+    if let Some(reply) = keystore2::transaction(tr) {
+        return reply;
     }
     if let Some(reply) = clipboard_transaction(tr) {
         return reply;

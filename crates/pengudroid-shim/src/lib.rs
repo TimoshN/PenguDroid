@@ -4390,6 +4390,28 @@ macro_rules! host_pthread_call {
 host_pthread_call!(pthread_detach, b"pthread_detach\0", () -> c_int);
 host_pthread_call!(pthread_join, b"pthread_join\0", (retval: *mut *mut c_void) -> c_int);
 host_pthread_call!(pthread_kill, b"pthread_kill\0", (signal: c_int) -> c_int);
+
+/// Bionic and glibc use the same callback signatures for pthread_atfork.
+/// Forward registrations instead of leaving Android native libraries with an
+/// unresolved symbol; callbacks execute only if the hosted process forks.
+#[no_mangle]
+pub unsafe extern "C" fn pthread_atfork(
+    prepare: Option<unsafe extern "C" fn()>,
+    parent: Option<unsafe extern "C" fn()>,
+    child: Option<unsafe extern "C" fn()>,
+) -> c_int {
+    type Next = unsafe extern "C" fn(
+        Option<unsafe extern "C" fn()>,
+        Option<unsafe extern "C" fn()>,
+        Option<unsafe extern "C" fn()>,
+    ) -> c_int;
+    static NEXT: OnceLock<Option<Next>> = OnceLock::new();
+    let Some(next) = *NEXT.get_or_init(|| dlsym_next(b"pthread_atfork\0")) else {
+        return libc::ENOSYS;
+    };
+    next(prepare, parent, child)
+}
+
 #[repr(C)]
 struct BionicPthreadAttr {
     flags: u32,

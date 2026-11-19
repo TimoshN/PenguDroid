@@ -481,15 +481,32 @@ zero entries. The device-verified `libcspjni.so` subsequently passed direct
 registered CryptoPro native methods. The ELF crate has regression coverage for
 both cases (12 tests).
 
-PenguDroid also now performs the normal
+PenguDroid also performs the normal
 `android.security.keystore2.AndroidKeyStoreProvider.install()` registration
-from Zygote's JCA warmup before application binding. This exposed the next,
-separate backend boundary: `IKeystoreSecurityLevel.asBinder()` is null because
-there is no hosted Android Keystore2 service. The current failure is therefore
-`Unable to create application AppContainer` in AndroidX security crypto, not
-the former native init-array crash. No Activity launch or rendered PSB UI has
-been verified yet. Evidence: `target/aurora/psbmobile-keystore.log`,
-`target/aurora/psbmobile-keystore.png`, and the earlier native diagnostics
+from Zygote's JCA warmup before application binding. A real software Keystore2
+AIDL backend now implements service/security-level/operation handles, app-scoped
+AES-128/192/256 GCM key generation/import/get/list/delete, purpose checks,
+nonce generation, AAD/update/finish/abort and service-specific errors. It uses
+host OpenSSL EVP rather than a handwritten cipher and reports
+`SECURITY_LEVEL_SOFTWARE`, never TEE/StrongBox. Persistent records use an atomic
+app-private file below `$PENGUDROID_PREFIX/keystore2`; the device directory is
+0700 and the file is 0600. This is OS-file-backed software key storage, not a
+claim of hardware-backed banking security. Key/plaintext/ciphertext contents
+are not logged.
+
+The opt-in `PENGUDROID_TEST_KEYSTORE=1` JCA test passed the real Android
+KeyGenerator/KeyStore/Cipher generate/get/encrypt/decrypt/delete path on the
+phone. Unit tests cover descriptor/parameter Parcel roundtrips, the NIST
+AES-256-GCM vector and modified-tag rejection. PSB then progressed through
+AndroidX EncryptedSharedPreferences and Tink validation. Evidence:
+`target/aurora/psbmobile-keystore2-keyid.log`.
+
+The next independent startup blocker is DGis native code. A missing
+`pthread_atfork` export was added and forwarded; DGis then entered native
+`DGis.initialize` and crashed at `libdgismap-2.3.0.so+0x1147c0c`, with a
+corrupted `_ctype_`-related pointer. This is outside the Keystore2 backend. No
+Activity launch or rendered PSB UI has been verified yet. Evidence:
+`target/aurora/psbmobile-atfork.log` and the earlier native diagnostics
 `target/aurora/psbmobile-lddebug.log`. The original APK remains unchanged.
 
 ## Runtime work still required
