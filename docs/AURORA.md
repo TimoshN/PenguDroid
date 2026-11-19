@@ -510,6 +510,25 @@ explicit value of 0/false disables it. Verification:
 `apphost: cleared text focus after outside tap`, `IME visible=false`, and the
 full-height layout in `target/aurora/maxnext-outside-fix-after.png`.
 
+## Wayland output geometry and theme-derived Android density
+
+Aurora package launches no longer hardcode 1080x2460 in their desktop entries.
+Without explicit `--width/--height`, `CreateSurface(0,0)` selects the current
+physical `wl_output.mode` with rotation applied. The launcher then reads the
+actual `SurfaceGeometry` after the initial configure and exports those pixels
+to Android. Explicit dimensions and `PENGUDROID_DISPLAY` remain overrides;
+non-Aurora defaults are unchanged.
+
+Independently, `dconf read /desktop/sailfish/silica/theme_pixel_ratio` is read
+without modifying it, and Android gets
+`densityDpi = round(theme_pixel_ratio * 1.5 * 160)` unless
+`PENGUDROID_DENSITY_DPI` or `--density` is explicit. On Dialog-S the verified
+values for MaxNext, PSB no-DGIS and Sberbank are Wayland 1080x2460, theme 1.75,
+densityDpi 420 and DisplayMetrics.density/scaledDensity 2.625 (about 384x937
+dp). Evidence: `target/aurora/maxnext-wayland-density.log`,
+`target/aurora/psbmobile-wayland-density-nodgis2.log`, and
+`target/aurora/sberbank-wayland-density.log`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through

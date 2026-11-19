@@ -618,11 +618,24 @@ pub fn launch(args: &[String]) -> i32 {
             }
             // Show a host window immediately instead of leaving Lipstick's
             // splash up while ART interprets the application startup code.
-            // The guest later attaches to this id and presents into it.
+            // With no explicit size, Aurora takes the current wl_output mode
+            // instead of inventing a fixed phone resolution.
+            let use_wayland_output = aurora_hybris_host()
+                && width.is_none() && height.is_none()
+                && std::env::var_os(crate::display::DISPLAY_ENV).is_none();
+            let requested_size = if use_wayland_output { (0, 0) } else { surface_size };
             let _loading_surface = match precreate_loading_surface(
-                surface_size.0, surface_size.1, &info.package,
+                requested_size.0, requested_size.1, &info.package,
             ) {
-                Ok((client, id)) => {
+                Ok((client, id, output_size)) => {
+                    if use_wayland_output {
+                        cmd.env(crate::display::SURFACE_W_ENV, output_size.0.to_string());
+                        cmd.env(crate::display::SURFACE_H_ENV, output_size.1.to_string());
+                        println!(
+                            "  wayland : output {}x{} px",
+                            output_size.0, output_size.1,
+                        );
+                    }
                     cmd.env("PENGUDROID_SURFACE_ID", id.to_string());
                     Some(client)
                 }
@@ -791,6 +804,29 @@ fn aurora_application_name() -> Option<String> {
     aurora_package_name()?.rsplit('.').next().map(str::to_owned)
 }
 
+fn theme_scaled_density_dpi(ratio: f64) -> Option<i32> {
+    let dpi = (ratio * 1.5 * 160.0).round();
+    (ratio.is_finite() && ratio > 0.0 && (80.0..=960.0).contains(&dpi))
+        .then_some(dpi as i32)
+}
+
+fn aurora_theme_density_dpi() -> Option<(f64, i32)> {
+    let output = std::process::Command::new("dconf")
+        .args(["read", "/desktop/sailfish/silica/theme_pixel_ratio"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ratio = std::str::from_utf8(&output.stdout).ok()?.trim().parse::<f64>().ok()?;
+    theme_scaled_density_dpi(ratio).map(|dpi| (ratio, dpi))
+}
+
+fn aurora_hybris_host() -> bool {
+    Path::new("/usr/lib/libhybris-common.so.1").is_file()
+        && Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file()
+}
+
 fn apply_aurora_package_env(
     cmd: &mut std::process::Command,
     package: &str,
@@ -808,8 +844,7 @@ fn apply_aurora_package_env(
             || configured_env.iter().any(|(key, _)| key == name)
     };
     cmd.env("PENGUDROID_ART_LIBS", &lib);
-    let hybris = Path::new("/usr/lib/libhybris-common.so.1").is_file()
-        && Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file();
+    let hybris = aurora_hybris_host();
     if hybris {
         configure_aurora_hybris_properties();
         if !overridden("PENGUDROID_VSYNC_ON_PRESENT") {
@@ -824,6 +859,16 @@ fn apply_aurora_package_env(
         }
         if !overridden("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE") {
             cmd.env("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE", "1");
+        }
+        if !overridden("PENGUDROID_DENSITY_DPI") {
+            if let Some((ratio, dpi)) = aurora_theme_density_dpi() {
+                // Match the physical panel size across apps, but derive the
+                // logical Android dp scale from Silica's current theme.
+                cmd.env("PENGUDROID_DENSITY_DPI", dpi.to_string());
+                println!(
+                    "pengudroid launch: theme_pixel_ratio={ratio} -> Android densityDpi={dpi} (x1.5)"
+                );
+            }
         }
     }
     let force_shm = overridden("PENGUDROID_FORCE_SHM")
@@ -1190,7 +1235,7 @@ fn precreate_loading_surface(
     width: u32,
     height: u32,
     package: &str,
-) -> Result<(crate::client::Client, u32), String> {
+) -> Result<(crate::client::Client, u32, (u32, u32)), String> {
     use pengudroid_proto::{Message, Role};
     let socket = pengudroid_proto::default_socket_path();
     let client = crate::client::Client::connect_to(&socket)
@@ -1205,7 +1250,29 @@ fn precreate_loading_surface(
         .request(&Message::CreateSurface { width, height, title })
         .map_err(|e| e.to_string())?;
     match reply {
-        Message::SurfaceCreated { surface_id, .. } => Ok((client, surface_id)),
+        Message::SurfaceCreated { surface_id, .. } => {
+            // create_toplevel is followed by the compositor's initial
+            // configure. Query briefly so Android receives the actual Wayland
+            // window size rather than the pre-create fallback.
+            let mut geometry = None;
+            for _ in 0..50 {
+                if let Some((buffer_w, buffer_h, display_w, display_h)) =
+                    client.surface_geometry(surface_id).ok().flatten()
+                {
+                    let (w, h) = if display_w > 0 && display_h > 0 {
+                        (display_w, display_h)
+                    } else {
+                        (buffer_w, buffer_h)
+                    };
+                    if w > 0 && h > 0 {
+                        geometry = Some((w, h));
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok((client, surface_id, geometry.unwrap_or((width, height))))
+        }
         Message::Error { code, message } => Err(format!("daemon error {code}: {message}")),
         other => Err(format!("unexpected reply: {other:?}")),
     }
@@ -1318,5 +1385,14 @@ mod tests {
     fn backend_names_are_stable() {
         assert_eq!(Backend::Native.name(), "native");
         assert_eq!(Backend::Art.name(), "art");
+    }
+
+    #[test]
+    fn silica_theme_ratio_drives_android_density() {
+        assert_eq!(theme_scaled_density_dpi(1.75), Some(420));
+        assert_eq!(theme_scaled_density_dpi(2.0), Some(480));
+        assert_eq!(theme_scaled_density_dpi(1.0), Some(240));
+        assert_eq!(theme_scaled_density_dpi(0.0), None);
+        assert_eq!(theme_scaled_density_dpi(f64::NAN), None);
     }
 }

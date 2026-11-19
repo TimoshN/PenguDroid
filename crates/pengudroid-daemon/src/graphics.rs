@@ -901,6 +901,19 @@ mod imp {
         }
 
         /// Create a toplevel-backed surface `width`×`height` with `title`.
+        /// Current physical output mode for a surface whose launcher did not
+        /// request a fixed size. Logical desktop sizes are deliberately not
+        /// used: Android density is derived independently from the theme.
+        pub fn output_surface_size(&self) -> Option<(u32, u32)> {
+            self.state.outputs.values()
+                .filter_map(|output| {
+                    let (mut w, mut h) = output.pixels;
+                    if output.rotated { std::mem::swap(&mut w, &mut h); }
+                    (w > 0 && h > 0).then_some((w, h))
+                })
+                .max_by_key(|(w, h)| *w as u64 * *h as u64)
+        }
+
         pub fn create_toplevel(
             &mut self,
             width: u32,

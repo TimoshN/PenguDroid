@@ -675,11 +675,6 @@ fn handle(
         }
 
         Message::CreateSurface { width, height, title } => {
-            let (w, h) = if width == 0 || height == 0 {
-                (DEFAULT_SURFACE_W, DEFAULT_SURFACE_H)
-            } else {
-                (width, height)
-            };
             let mut guard = daemon.graphics.lock().unwrap();
             let Some(gfx) = guard.as_mut() else {
                 return (
@@ -690,6 +685,11 @@ fn handle(
                     vec![],
                     false,
                 );
+            };
+            let (w, h) = if width == 0 || height == 0 {
+                gfx.output_surface_size().unwrap_or((DEFAULT_SURFACE_W, DEFAULT_SURFACE_H))
+            } else {
+                (width, height)
             };
             match gfx.create_toplevel(w, h, &title) {
                 Some(info) => {
