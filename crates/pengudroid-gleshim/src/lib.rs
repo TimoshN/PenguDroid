@@ -1846,6 +1846,9 @@ unsafe fn trace_content_hash(surface: EGLSurface, host: &Host) {
 }
 
 fn record_frame_touch(event: &pengudroid_proto::InputKind) {
+    if matches!(event, pengudroid_proto::InputKind::PointerButton { pressed: true, .. }) {
+        notify_input_wakeup_vsync();
+    }
     if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_none() {
         return;
     }
@@ -1918,6 +1921,23 @@ fn notify_frame_presented_vsync() {
         libc::dlsym(
             libc::RTLD_DEFAULT,
             b"__pengudroid_vsync_frame_presented\0".as_ptr().cast(),
+        ) as usize
+    });
+    if address != 0 {
+        let notify: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
+        unsafe { notify() };
+    }
+}
+
+fn notify_input_wakeup_vsync() {
+    if std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT").is_none() {
+        return;
+    }
+    static NOTIFY: OnceLock<usize> = OnceLock::new();
+    let address = *NOTIFY.get_or_init(|| unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            b"__pengudroid_vsync_input_wakeup\0".as_ptr().cast(),
         ) as usize
     });
     if address != 0 {

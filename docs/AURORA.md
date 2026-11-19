@@ -494,6 +494,22 @@ free-running modes, idle presentation no longer generates an independent vsync
 backlog. Evidence: `target/aurora/maxnext-vsync-present.log` and
 `target/aurora/maxnext-present-auto.log`.
 
+A later Lipstick remap exposed a recovery case: the process stayed alive but
+the last frame was old and the screen became black because pure on-present
+had no producer to restart the loop. A bounded
+`__pengudroid_vsync_input_wakeup()` now emits at most one pulse per 250 ms
+when a real down arrives after at least 100 ms without a present. It does not
+restart a free-running clock. Home/app-cover/resume was verified visibly;
+`target/aurora/maxnext-wakeup-resumed.png` shows the restored UI.
+
+MAX also has no root outside-click handler to clear editor focus. Optional
+compatibility `PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE=1` reads the focused editor's
+global bounds on ACTION_DOWN, defers View.clearFocus to the main Looper, hides
+IME and still dispatches the click. Aurora/Hybris enables it by default; an
+explicit value of 0/false disables it. Verification:
+`apphost: cleared text focus after outside tap`, `IME visible=false`, and the
+full-height layout in `target/aurora/maxnext-outside-fix-after.png`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through

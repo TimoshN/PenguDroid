@@ -2318,6 +2318,9 @@ fn send_vsync() -> Result<(), String> {
     Ok(())
 }
 
+static LAST_PRESENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_INPUT_WAKEUP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Emit the next pulse only after the guest successfully presented a frame.
 /// This is a backpressure boundary: Compose can never accumulate a queue of
 /// free-running pulses faster than it produces real frames.
@@ -2326,11 +2329,37 @@ pub extern "C" fn __pengudroid_vsync_frame_presented() {
     if std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT").is_none() {
         return;
     }
+    LAST_PRESENT_MS.store(monotonic_ms() as u64, Ordering::Relaxed);
     if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
         unsafe { diag("[binder]   <- frame presented\n") };
     }
     if let Err(error) = send_vsync() {
         unsafe { diag(&format!("[binder] on-present vsync failed: {error}\n")) };
+    }
+}
+
+/// Recover a frame-driven loop after Lipstick hides and remaps a surface. No
+/// new present means no next pulse, so a real touch supplies one bounded kick.
+#[no_mangle]
+pub extern "C" fn __pengudroid_vsync_input_wakeup() {
+    if std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT").is_none() {
+        return;
+    }
+    let now = monotonic_ms() as u64;
+    let presented = LAST_PRESENT_MS.load(Ordering::Relaxed);
+    if presented == 0 || now.saturating_sub(presented) < 100 {
+        return;
+    }
+    let previous = LAST_INPUT_WAKEUP_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) < 250 {
+        return;
+    }
+    LAST_INPUT_WAKEUP_MS.store(now, Ordering::Relaxed);
+    if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
+        unsafe { diag(&format!("[binder]   <- input wakeup after {} ms without present\n", now - presented)) };
+    }
+    if let Err(error) = send_vsync() {
+        unsafe { diag(&format!("[binder] input-wakeup vsync failed: {error}\n")) };
     }
 }
 

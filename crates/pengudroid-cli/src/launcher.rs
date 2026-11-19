@@ -822,6 +822,9 @@ fn apply_aurora_package_env(
         if !overridden("PENGUDROID_VSYNC_INTERVAL_US") {
             cmd.env("PENGUDROID_VSYNC_INTERVAL_US", "33333");
         }
+        if !overridden("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE") {
+            cmd.env("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE", "1");
+        }
     }
     let force_shm = overridden("PENGUDROID_FORCE_SHM")
         && !overridden("PENGUDROID_FORCE_DMABUF");

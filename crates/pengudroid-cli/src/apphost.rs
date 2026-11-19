@@ -3781,7 +3781,8 @@ impl ActivityHostWaker {
                     let ime = !IME_TEXT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
                         || STATUSBAR_INSET_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || CLIPBOARD_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
-                        || NETWORK_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire);
+                        || NETWORK_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
+                        || OUTSIDE_FOCUS_PENDING.load(std::sync::atomic::Ordering::Acquire);
                     if (activity || ime) && env.call_boolean(handler, send, &[JValue { i: 0 }]) != Some(true) {
                         eprintln!("apphost: main Handler rejected activity/IME wakeup");
                         return None;
@@ -5269,6 +5270,11 @@ fn spawn_input_pump(env: &JniEnv) {
         let gesture_down = std::cell::Cell::new(0i64);
         let deliver_touch_event = |event: crate::keymap_gesture::TouchEvent| {
             use crate::keymap_gesture::TouchEvent;
+            if let TouchEvent::Down { x, y, .. } = event {
+                if is_outside_text_focus(&env, x, y) {
+                    OUTSIDE_FOCUS_PENDING.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
             if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
                 println!("input: ts={} touch {event:?} dispatch begin", monotonic_ms());
             }
@@ -6556,6 +6562,74 @@ static CLIPBOARD_SMOKE_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static NETWORK_SMOKE_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static OUTSIDE_FOCUS_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Return true when a down coordinate is outside the focused text editor.
+/// This only reads geometry; the actual View.clearFocus call is deferred to
+/// the main Looper thread below.
+fn outside_focus_enabled() -> bool {
+    std::env::var("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+fn is_outside_text_focus(env: &JniEnv, x: f32, y: f32) -> bool {
+    if !outside_focus_enabled() {
+        return false;
+    }
+    let Some(root) = current_keyboard_root(env) else { return false };
+    let (Some(root_class), Some(view_class), Some(rect_class)) = (
+        env.find_class("android/view/ViewRootImpl"),
+        env.find_class("android/view/View"),
+        env.find_class("android/graphics/Rect"),
+    ) else { return false };
+    let (Some(view_field), Some(find_focus), Some(is_editor)) = (
+        env.field_id(root_class, "mView", "Landroid/view/View;"),
+        env.method_id(view_class, "findFocus", "()Landroid/view/View;"),
+        env.method_id(view_class, "onCheckIsTextEditor", "()Z"),
+    ) else { return false };
+    let view = env.object_field(root, view_field);
+    if view.is_null() { return false; }
+    let Some(focused) = env.call_object(view, find_focus, &[]) else { return false };
+    if focused.is_null() || env.call_boolean(focused, is_editor, &[]) != Some(true) {
+        return false;
+    }
+    let (Some(ctor), Some(get_rect), Some(contains)) = (
+        env.method_id(rect_class, "<init>", "()V"),
+        env.method_id(view_class, "getGlobalVisibleRect", "(Landroid/graphics/Rect;)Z"),
+        env.method_id(rect_class, "contains", "(II)Z"),
+    ) else { return false };
+    let Some(rect) = env.new_object(rect_class, ctor, &[]) else { return false };
+    if env.call_boolean(focused, get_rect, &[JValue { l: rect }]) != Some(true) {
+        return false;
+    }
+    env.call_boolean(rect, contains, &[
+        JValue { i: x.round() as i32 }, JValue { i: y.round() as i32 },
+    ]) == Some(false)
+}
+
+fn clear_outside_text_focus_on_main(env: &JniEnv) {
+    let Some(root) = current_keyboard_root(env) else { return };
+    let (Some(root_class), Some(view_class)) = (
+        env.find_class("android/view/ViewRootImpl"), env.find_class("android/view/View"),
+    ) else { return };
+    let (Some(view_field), Some(find_focus), Some(clear_focus)) = (
+        env.field_id(root_class, "mView", "Landroid/view/View;"),
+        env.method_id(view_class, "findFocus", "()Landroid/view/View;"),
+        env.method_id(view_class, "clearFocus", "()V"),
+    ) else { return };
+    let view = env.object_field(root, view_field);
+    if view.is_null() { return; }
+    let focused = env.call_object(view, find_focus, &[]);
+    let Some(focused) = focused.filter(|focused| !focused.is_null()) else { return };
+    env.call_void(focused, clear_focus, &[]);
+    if let Some(symbol) = shim_symbol("pengudroid_set_ime_state") {
+        let set_ime: unsafe extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(symbol) };
+        unsafe { set_ime(0) };
+    }
+    println!("apphost: cleared text focus after outside tap");
+}
 
 fn drain_ime_text_events(env: &JniEnv) {
     loop {
@@ -6595,8 +6669,12 @@ fn apply_deferred_window_updates(env: &JniEnv) {
     if !STATUSBAR_INSET_PENDING.load(Ordering::Acquire)
         && !CLIPBOARD_SMOKE_PENDING.load(Ordering::Acquire)
         && !NETWORK_SMOKE_PENDING.load(Ordering::Acquire)
+        && !OUTSIDE_FOCUS_PENDING.load(Ordering::Acquire)
     {
         return;
+    }
+    if OUTSIDE_FOCUS_PENDING.swap(false, Ordering::AcqRel) {
+        clear_outside_text_focus_on_main(env);
     }
     let Some(root) = current_keyboard_root(env) else { return };
     if STATUSBAR_INSET_PENDING.swap(false, Ordering::AcqRel) {
