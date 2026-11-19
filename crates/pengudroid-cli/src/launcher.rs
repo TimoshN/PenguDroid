@@ -739,9 +739,14 @@ pub fn launch(args: &[String]) -> i32 {
                      (set PENGUDROID_NATIVE_BRIDGE_LIB)"
                 );
             }
-            // The JIT crashes in `nterp_op_invoke_virtual` on this framework
-            // build, so the interpreter is the only working execution mode.
-            cmd.arg("--vm-option").arg("-Xint");
+            // The JIT previously crashed in `nterp_op_invoke_virtual` on this
+            // framework build. Keep the safe interpreter default, but allow a
+            // controlled performance experiment without changing normal RPMs.
+            if std::env::var_os("PENGUDROID_ART_JIT").is_none() {
+                cmd.arg("--vm-option").arg("-Xint");
+            } else {
+                eprintln!("pengudroid launch: experimental ART JIT enabled (without -Xint)");
+            }
             if !app_args.is_empty() {
                 cmd.arg("--").args(&app_args);
             }

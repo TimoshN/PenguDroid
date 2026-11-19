@@ -440,6 +440,24 @@ scanout and does not rule out a different stall during real-finger use.
 Evidence: `target/aurora/maxnext-frame-trace.log` and
 `target/aurora/maxnext-frame-trace-summary.txt`.
 
+Swap timing alone does not prove visual responsiveness: unchanged pixels can
+be resubmitted at normal FPS. `PENGUDROID_TRACE_CONTENT=1` therefore hashes a
+small country-name strip after glFinish. In the open country list, two 1 s
+swipes had their first changed-content frame 3172 ms and 2358 ms after down,
+after 89 and 106 unchanged frames respectively. The list then flung for
+several seconds. This confirms delayed Compose/ART gesture processing rather
+than multi-second input transport or presentation. The readback probe is
+opt-in and can itself affect timing. Evidence:
+`target/aurora/maxnext-list-content.log`,
+`target/aurora/maxnext-list-after-swipe1.png`, and
+`target/aurora/maxnext-list-after-swipe2.png`.
+
+MAX normally runs with ART `-Xint`; interpreting Kotlin/Compose is a major
+performance limitation. `PENGUDROID_ART_JIT=1` is an explicit experiment which
+omits `-Xint`, but the current runtime still crashes at
+`nterp0_op_invoke_virtual+36` with SIGSEGV and exits, so it is not a usable fix.
+Evidence: `target/aurora/maxnext-jit.log`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through

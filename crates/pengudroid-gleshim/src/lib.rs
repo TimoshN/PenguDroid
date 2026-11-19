@@ -1805,6 +1805,46 @@ static FRAME_TRACE_STATE: Mutex<FrameTraceState> = Mutex::new(FrameTraceState {
     presented_seq: 0,
 });
 
+static CONTENT_HASHES: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Hash a narrow strip containing country names. Unlike eglSwapBuffers alone,
+/// this distinguishes a real visual scroll update from resubmitting unchanged
+/// pixels. Readback is deliberately opt-in because it can affect timing.
+unsafe fn trace_content_hash(surface: EGLSurface, host: &Host) {
+    if std::env::var_os("PENGUDROID_TRACE_CONTENT").is_none() {
+        return;
+    }
+    let Some(read_pixels) = host.gl_read_pixels else { return };
+    let rec = &*(surface as *const SurfaceRec);
+    let w = 64.min(rec.w.max(1) as usize);
+    let h = 512.min(rec.h.max(1) as usize);
+    let x = 120u32.min(rec.w.saturating_sub(w as u32));
+    let top = 350u32.min(rec.h.saturating_sub(h as u32));
+    let y = rec.h - top - h as u32;
+    let mut pixels = vec![0u8; w * h * 4];
+    read_pixels(
+        x as i32, y as i32, w as i32, h as i32, GL_RGBA as u32,
+        GL_UNSIGNED_BYTE, pixels.as_mut_ptr().cast(),
+    );
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in pixels {
+        hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+    }
+    let now = input_trace_now_ms();
+    let mut hashes = CONTENT_HASHES.lock().unwrap_or_else(|e| e.into_inner());
+    if hashes.get(&(surface as usize)) == Some(&hash) {
+        return;
+    }
+    hashes.insert(surface as usize, hash);
+    let state = FRAME_TRACE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    eprintln!(
+        "[gleshim:content] ts={now} frame={} surface={:x} hash={hash:016x} last_touch_seq={} kind={} since_touch_ms={}",
+        state.frame, surface as usize, state.touch_seq, state.touch_kind,
+        now.saturating_sub(state.touch_recv_ms),
+    );
+}
+
 fn record_frame_touch(event: &pengudroid_proto::InputKind) {
     if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_none() {
         return;
@@ -4803,6 +4843,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         finish();
     }
     let finish_elapsed = finish_started.elapsed();
+    trace_content_hash(surface, host);
     let flip_started = std::time::Instant::now();
     flip_gralloc_surface(surface, host);
     let flip_elapsed = flip_started.elapsed();
