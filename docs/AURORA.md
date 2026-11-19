@@ -529,6 +529,20 @@ dp). Evidence: `target/aurora/maxnext-wayland-density.log`,
 `target/aurora/psbmobile-wayland-density-nodgis2.log`, and
 `target/aurora/sberbank-wayland-density.log`.
 
+The same 1080x2460 / 420 dpi / 2.625 values are verified through the actual
+Sailjail desktop-launch path for all three packages. Sailjail's `--private-bin`
+hides the `dconf` executable, so the launcher uses `libdconf.so.1` and
+`dconf_client_read()` in process instead of spawning `dconf`; the system setting
+is still read-only. Evidence: `target/aurora/maxnext-sailjail-libdconf.log`,
+`target/aurora/psbmobile-sailjail-libdconf.log`, and
+`target/aurora/sberbank-sailjail-libdconf.log`.
+
+The Aurora packaging script selects each package's own desktop file and source
+icon (`maxnext.png`, `psbmobile.png`, or `sberbank.png`) before generating the
+launcher sizes. A previous unconditional `maxnext.png` input was the reason all
+three installed icons looked identical. `target/aurora/icons-home-after-fix.png`
+shows the distinct MAX, PSB and Sberbank icons on their application covers.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through

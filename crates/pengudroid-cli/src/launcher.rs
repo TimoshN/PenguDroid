@@ -810,15 +810,68 @@ fn theme_scaled_density_dpi(ratio: f64) -> Option<i32> {
         .then_some(dpi as i32)
 }
 
-fn aurora_theme_density_dpi() -> Option<(f64, i32)> {
-    let output = std::process::Command::new("dconf")
-        .args(["read", "/desktop/sailfish/silica/theme_pixel_ratio"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+fn aurora_theme_pixel_ratio_from_libdconf() -> Option<f64> {
+    use std::ffi::{c_char, c_double, c_void, CString};
+
+    type DconfClientNew = unsafe extern "C" fn() -> *mut c_void;
+    type DconfClientRead =
+        unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
+    type VariantGetDouble = unsafe extern "C" fn(*mut c_void) -> c_double;
+    type Unref = unsafe extern "C" fn(*mut c_void);
+
+    // Sailjail's --private-bin intentionally hides /usr/bin/dconf. The shared
+    // library remains available and reads the same whitelisted user database
+    // without spawning an executable outside the application's private bin.
+    unsafe {
+        let library = CString::new("libdconf.so.1").ok()?;
+        let handle = libc::dlopen(library.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+        if handle.is_null() {
+            return None;
+        }
+        let result = (|| {
+            let symbol = |name: &str| {
+                let name = CString::new(name).ok()?;
+                let symbol = libc::dlsym(handle, name.as_ptr());
+                (!symbol.is_null()).then_some(symbol)
+            };
+            let new: DconfClientNew = std::mem::transmute(symbol("dconf_client_new")?);
+            let read: DconfClientRead = std::mem::transmute(symbol("dconf_client_read")?);
+            let get_double: VariantGetDouble =
+                std::mem::transmute(symbol("g_variant_get_double")?);
+            let variant_unref: Unref = std::mem::transmute(symbol("g_variant_unref")?);
+            let object_unref: Unref = std::mem::transmute(symbol("g_object_unref")?);
+            let key = CString::new("/desktop/sailfish/silica/theme_pixel_ratio").ok()?;
+            let client = new();
+            if client.is_null() {
+                return None;
+            }
+            let value = read(client, key.as_ptr());
+            object_unref(client);
+            if value.is_null() {
+                return None;
+            }
+            let ratio = get_double(value);
+            variant_unref(value);
+            Some(ratio)
+        })();
+        libc::dlclose(handle);
+        result
     }
-    let ratio = std::str::from_utf8(&output.stdout).ok()?.trim().parse::<f64>().ok()?;
+}
+
+fn aurora_theme_density_dpi() -> Option<(f64, i32)> {
+    let ratio = aurora_theme_pixel_ratio_from_libdconf().or_else(|| {
+        // Keep a generic-host fallback; on Aurora the in-process path above is
+        // required because application launchers run inside Sailjail.
+        let output = std::process::Command::new("dconf")
+            .args(["read", "/desktop/sailfish/silica/theme_pixel_ratio"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        std::str::from_utf8(&output.stdout).ok()?.trim().parse::<f64>().ok()
+    })?;
     theme_scaled_density_dpi(ratio).map(|dpi| (ratio, dpi))
 }
 

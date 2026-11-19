@@ -12,6 +12,19 @@ TARGET=${CARGO_TARGET_DIR:-$ROOT/target}
 TRIPLE=aarch64-unknown-linux-gnu
 TOOLCHAIN=${PENGUDROID_RUST_TOOLCHAIN:-1.93}
 PACKAGE=${PENGUDROID_AURORA_PACKAGE:-io.github.denizomer10.MaxNext}
+DESKTOP_SOURCE="$ROOT/rpm/aurora/pengudroid.desktop"
+ICON_SOURCE="$ROOT/rpm/aurora/maxnext.png"
+case "$PACKAGE" in
+    io.github.denizomer10.MaxNext) ;;
+    io.github.denizomer10.PsbMobile)
+        DESKTOP_SOURCE="$ROOT/rpm/aurora/psbmobile.desktop"
+        ICON_SOURCE="$ROOT/rpm/aurora/psbmobile.png"
+        ;;
+    io.github.denizomer10.Sberbank)
+        DESKTOP_SOURCE="$ROOT/rpm/aurora/sberbank.desktop"
+        ICON_SOURCE="$ROOT/rpm/aurora/sberbank.png"
+        ;;
+esac
 SYSROOT=${PENGUDROID_AURORA_SYSROOT:-}
 SKIP_BUILD=0
 NO_RPM=0
@@ -99,9 +112,9 @@ install -m 0755 "$ARTIFACTS/pengudroid-gui" "$STAGE/usr/bin/$PACKAGE"
 for file in libpengudroid_shim.so libpengudroid_gleshim.so libpengudroid_vkshim.so; do
     install -m 0644 "$ARTIFACTS/$file" "$PRIVATE/$file"
 done
-install -m 0644 "$ROOT/rpm/aurora/pengudroid.desktop" \
+install -m 0644 "$DESKTOP_SOURCE" \
     "$STAGE/usr/share/applications/$PACKAGE.desktop"
-install -m 0644 "$ROOT/rpm/aurora/maxnext.png" "$STAGE/usr/share/icons/hicolor/256x256/apps/$PACKAGE.png"
+install -m 0644 "$ICON_SOURCE" "$STAGE/usr/share/icons/hicolor/256x256/apps/$PACKAGE.png"
 install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/$PACKAGE/LICENSE"
 
 # Aurora's launcher uses these sizes. The original remains as a generic fallback.
@@ -109,7 +122,7 @@ if command -v ffmpeg >/dev/null 2>&1; then
     for size in 86 108 128 172; do
         dir="$STAGE/usr/share/icons/hicolor/${size}x${size}/apps"
         mkdir -p "$dir"
-        ffmpeg -loglevel error -y -i "$ROOT/rpm/aurora/maxnext.png" -vf "scale=$size:$size" \
+        ffmpeg -loglevel error -y -i "$ICON_SOURCE" -vf "scale=$size:$size" \
             -frames:v 1 "$dir/$PACKAGE.png"
     done
 fi
