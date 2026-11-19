@@ -1775,10 +1775,98 @@ static TOUCH_DEBUG_STATE: Mutex<TouchDebugState> = Mutex::new(TouchDebugState {
     last_ms: 0,
 });
 
-fn touch_debug_now_ms() -> u64 {
+fn input_trace_now_ms() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec as u64).saturating_mul(1000) + ts.tv_nsec as u64 / 1_000_000
+}
+
+struct FrameTraceState {
+    frame: u64,
+    last_swap_ms: u64,
+    touch_seq: u64,
+    touch_kind: &'static str,
+    touch_recv_ms: u64,
+    swapped_seq: u64,
+    swapped_kind: &'static str,
+    swapped_recv_ms: u64,
+    presented_seq: u64,
+}
+
+static FRAME_TRACE_STATE: Mutex<FrameTraceState> = Mutex::new(FrameTraceState {
+    frame: 0,
+    last_swap_ms: 0,
+    touch_seq: 0,
+    touch_kind: "none",
+    touch_recv_ms: 0,
+    swapped_seq: 0,
+    swapped_kind: "none",
+    swapped_recv_ms: 0,
+    presented_seq: 0,
+});
+
+fn record_frame_touch(event: &pengudroid_proto::InputKind) {
+    if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_none() {
+        return;
+    }
+    let kind = match event {
+        pengudroid_proto::InputKind::PointerMotion { .. } => "move",
+        pengudroid_proto::InputKind::PointerButton { pressed: true, .. } => "down",
+        pengudroid_proto::InputKind::PointerButton { pressed: false, .. } => "up",
+        _ => return,
+    };
+    let mut state = FRAME_TRACE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    state.touch_seq = state.touch_seq.wrapping_add(1);
+    state.touch_kind = kind;
+    state.touch_recv_ms = input_trace_now_ms();
+}
+
+fn trace_touch_swap() {
+    if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_none() {
+        return;
+    }
+    let now = input_trace_now_ms();
+    let mut state = FRAME_TRACE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    state.frame = state.frame.wrapping_add(1);
+    let gap = if state.last_swap_ms == 0 { 0 } else { now.saturating_sub(state.last_swap_ms) };
+    state.last_swap_ms = now;
+    if state.touch_seq > state.swapped_seq {
+        state.swapped_seq = state.touch_seq;
+        state.swapped_kind = state.touch_kind;
+        state.swapped_recv_ms = state.touch_recv_ms;
+        eprintln!(
+            "[gleshim:frame] ts={now} frame={} gap_ms={gap} touch_seq={} kind={} touch_to_swap_ms={}",
+            state.frame, state.touch_seq, state.touch_kind,
+            now.saturating_sub(state.touch_recv_ms),
+        );
+    } else {
+        eprintln!("[gleshim:frame] ts={now} frame={} gap_ms={gap} touch=none", state.frame);
+    }
+}
+
+fn trace_touch_present(
+    path: &str,
+    success: bool,
+    finish: Duration,
+    flip: Duration,
+    present: Duration,
+) {
+    if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_none() {
+        return;
+    }
+    let now = input_trace_now_ms();
+    let mut state = FRAME_TRACE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.presented_seq >= state.swapped_seq {
+        return;
+    }
+    // A newer touch which arrived during this frame belongs to the next swap.
+    let seq = state.swapped_seq;
+    state.presented_seq = seq;
+    eprintln!(
+        "[gleshim:frame] ts={now} frame={} path={path} success={success} touch_seq={seq} kind={} touch_to_present_ms={} finish_us={} flip_us={} present_us={}",
+        state.frame, state.swapped_kind, now.saturating_sub(state.swapped_recv_ms),
+        finish.as_micros(), flip.as_micros(), present.as_micros(),
+    );
 }
 
 fn record_touch_debug(event: &pengudroid_proto::InputKind) {
@@ -1791,15 +1879,15 @@ fn record_touch_debug(event: &pengudroid_proto::InputKind) {
         | pengudroid_proto::InputKind::PointerMotion { x, y } => {
             state.x = *x;
             state.y = *y;
-            state.last_ms = touch_debug_now_ms();
+            state.last_ms = input_trace_now_ms();
         }
         pengudroid_proto::InputKind::PointerButton { pressed, .. } => {
             state.pressed = *pressed;
-            state.last_ms = touch_debug_now_ms();
+            state.last_ms = input_trace_now_ms();
         }
         pengudroid_proto::InputKind::PointerLeave => {
             state.pressed = false;
-            state.last_ms = touch_debug_now_ms();
+            state.last_ms = input_trace_now_ms();
         }
         _ => {}
     }
@@ -1858,6 +1946,7 @@ fn subscribe_input(surface_id: u32) {
                 Ok((Message::InputEvent { surface_id, event }, fds)) => {
                     close_fds(&fds);
                     record_touch_debug(&event);
+                    record_frame_touch(&event);
                     if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
                         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
                         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
@@ -4455,7 +4544,7 @@ unsafe fn draw_touch_debug_overlay(surface: EGLSurface, host: &Host) {
         return;
     }
     let state = *TOUCH_DEBUG_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if state.last_ms == 0 || touch_debug_now_ms().saturating_sub(state.last_ms) > 750 {
+    if state.last_ms == 0 || input_trace_now_ms().saturating_sub(state.last_ms) > 750 {
         return;
     }
     let rec = &*(surface as *const SurfaceRec);
@@ -4706,6 +4795,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         return EGL_FALSE;
     }
     probe_gralloc_once();
+    trace_touch_swap();
     draw_mangohud_overlay(surface, host);
     draw_touch_debug_overlay(surface, host);
     let finish_started = std::time::Instant::now();
@@ -4725,6 +4815,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         let present_started = std::time::Instant::now();
         let presented = present_gralloc_shm(surface);
         let present_elapsed = present_started.elapsed();
+        let gralloc_presented = presented.is_ok();
         let pace_started = std::time::Instant::now();
         if presented.is_ok() {
             pace_swap(surface as usize);
@@ -4746,6 +4837,10 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
                 }
             }
         };
+        trace_touch_present(
+            if gralloc_presented { "gralloc-shm" } else { "gralloc-readback" },
+            outcome == EGL_TRUE, finish_elapsed, flip_elapsed, present_elapsed,
+        );
         if std::env::var_os("PENGUDROID_PROFILE_GRALLOC").is_some() {
             profile_gralloc(
                 finish_elapsed, flip_elapsed, present_elapsed, pace_elapsed,

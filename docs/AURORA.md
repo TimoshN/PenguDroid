@@ -422,6 +422,24 @@ so Android shaders, textures and VAOs are untouched, and normal launches have
 no overlay. Device screenshots: `target/aurora/maxnext-touch-debug-pressed.png`
 and `target/aurora/maxnext-touch-debug-released.png`.
 
+The touch overlay is frame-driven: its 750 ms release timeout is checked only
+on a subsequent eglSwapBuffers. If no new frame is submitted, the last presented
+pixels (including the old ring) can remain visible longer than 750 ms; this is
+a diagnostic-overlay limitation, not a measurement of touch latency. The pale
+filled circle seen beside the ring is not drawn by the overlay implementation
+and must not be attributed to MAX versus the compositor without separate proof.
+
+`PENGUDROID_TRACE_INPUT_TIMING=1` now also correlates the latest compositor
+contact with the next eglSwapBuffers and PresentShm reply, and logs every swap
+gap plus glFinish/flip/present costs. A 3718-frame MAX run with tap/swipe had:
+swap-gap median 30 ms, maximum 83 ms, no gaps over 100 ms; touch-to-swap median
+10 ms, maximum 29 ms; touch-to-PresentShm median 31 ms, maximum 54 ms.
+glFinish was about 13 ms median, flip 4 ms, and PresentShm 1 ms. Thus this run
+has no multi-second application/render stall; it does not measure physical
+scanout and does not rule out a different stall during real-finger use.
+Evidence: `target/aurora/maxnext-frame-trace.log` and
+`target/aurora/maxnext-frame-trace-summary.txt`.
+
 ## Wayland clipboard
 
 Plain-text clipboard support connects Android `IClipboard` to Lipstick through
