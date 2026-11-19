@@ -327,7 +327,11 @@ orientation bits, zero window flags, `BACKGROUND_VISIBLE=true`,
 big-endian encoding. `Close` enters the existing surface/guest close path;
 `OnscreenVisibility` and generic-property events are diagnosed. Extended objects
 are dropped before their owning `wl_surface`. `STATUSBAR_VISIBLE=true` is sent
-at creation and again when the window becomes visible. Compositors without the
+at creation and again when the window becomes visible. After the ordinary
+`wl_shell_surface.set_toplevel`/`xdg_surface.get_toplevel` role and the first
+configure/attach/commit cycle, the daemon sends `qt_extended_surface.raise` and
+flushes it with a roundtrip. This prevents Lipstick from leaving a newly
+launched Android app visible only as a small cover. Compositors without the
 global keep the existing xdg/wl_shell behavior.
 
 Lipstick draws the system bar, while Android receives a separate top inset via
@@ -517,11 +521,15 @@ launched `PreLoaderActivity` and then `MainNoAuthActivity`, rendered through
 gralloc and remained alive. A visible PSB splash/loading screen with its
 spinner is captured in `target/aurora/psbmobile-nodgis.png` and
 `target/aurora/psbmobile-nodgis-later.png`; lifecycle and rendering details are
-in `target/aurora/psbmobile-nodgis.log`. This does not make the map feature
-usable and does not prove the login flow: the loader remained visible, with
-cleartext `nuc-cdp.voskhod.ru` requests rejected by Android network security
-policy. The no-DGIS copy is development evidence, not a production banking
-package.
+in `target/aurora/psbmobile-nodgis.log`. With the subsequent automatic
+`qt_extended_surface.raise`, the same diagnostic copy opened as a full-screen
+window and showed the PSB welcome screen with Login and bank-onboarding
+buttons: `target/aurora/psbmobile-raise.png` and
+`target/aurora/psbmobile-raise.log`. This does not make the map feature usable
+and does not prove the login flow. The screen reported no network connection,
+and cleartext `nuc-cdp.voskhod.ru` requests were rejected by Android network
+security policy. The no-DGIS copy is development evidence, not a production
+banking package.
 
 ## Runtime work still required
 

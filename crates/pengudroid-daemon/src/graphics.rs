@@ -1009,6 +1009,20 @@ mod imp {
                 return None;
             }
 
+            // Lipstick may leave a newly created wl_shell window represented
+            // only by its cover until the client explicitly raises it.  Send
+            // the request after the initial configure/attach/commit cycle: an
+            // earlier raise can arrive before the compositor has a mapped
+            // window.  The role itself was already selected above with
+            // wl_shell_surface.set_toplevel (or xdg_surface.get_toplevel).
+            if let Some(extended) = self.state.extended_surfaces.get(&id) {
+                extended.raise();
+                crate::info!("surface {id} requested qt_extended_surface.raise after toplevel mapping");
+                if let Err(e) = self.queue.roundtrip(&mut self.state) {
+                    crate::warn!("roundtrip after toplevel raise failed: {e}");
+                }
+            }
+
             if let Some(surface) = self.state.surfaces.get_mut(&id) { surface.title = title.to_owned(); }
             let info = SurfaceInfo {
                 id,
