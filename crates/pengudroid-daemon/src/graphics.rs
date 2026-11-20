@@ -523,6 +523,7 @@ mod imp {
             let Some(maliit) = self.maliit.as_mut() else { return };
             let events = maliit.drain_events();
             let Some(surface) = self.ime_surface else { return };
+            let mut deactivated = false;
             for event in events {
                 match event {
                     crate::ime::ImeEvent::Commit(text) => {
@@ -533,6 +534,10 @@ mod imp {
                     }
                     crate::ime::ImeEvent::FinishComposing => {
                         self.input.push((surface, InputKind::FinishComposing));
+                        // Self-initiated hide must also disarm the panel touch
+                        // filter. Keeping only Maliit's hidden flag preserves
+                        // explicit re-show for an already focused editor.
+                        deactivated = true;
                     }
                     crate::ime::ImeEvent::Key { key, text } => {
                         let clipboard = match key as u32 {
@@ -568,6 +573,7 @@ mod imp {
                     }
                 }
             }
+            if deactivated { self.ime_surface = None; }
         }
 
         /// Animate a small twelve-dot spinner in early, launcher-created
@@ -2223,6 +2229,14 @@ mod imp {
                                 crate::qt_extended_surface::qvariant_bool(true),
                             );
                         }
+                    } else if state.ime_surface == Some(id.0) {
+                        // A covered/minimized Android window no longer owns
+                        // Maliit; hide the panel and disarm its touch region.
+                        if let Some(maliit) = state.maliit.as_mut() {
+                            let _ = maliit.set_visible(false);
+                        }
+                        state.ime_surface = None;
+                        crate::info!("surface {} IME visible=false (offscreen)", id.0);
                     }
                 }
                 qt_extended_surface::Event::SetGenericProperty { name, value } => {
