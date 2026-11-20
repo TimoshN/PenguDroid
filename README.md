@@ -108,6 +108,20 @@ flowchart LR
 
 The host implements the framework contracts that normally come from Android services: package metadata, activity lifecycle, surfaces, input, networking and audio. The daemon brokers shared resources while applications remain ordinary host processes. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the boundaries and [NATIVE_BRIDGE.md](docs/NATIVE_BRIDGE.md) for ARM64 translation.
 
+### Native gralloc presentation on Aurora/Hybris
+
+On AArch64 Aurora devices, Android ARM64 code runs natively. The current EGL/GLES presentation path uses the device's native gralloc instead of translating the code or reading every frame back through the CPU:
+
+1. The graphics shim calls `hybris_gralloc_allocate` and requests a **linear BGRA** buffer. The allocation is mmap-able and has a native file descriptor.
+2. The buffer is imported into the isolated host GLES namespace as an **EGLImage**, then connected to a texture/FBO so Android HWUI can render into it.
+3. When the guest and host vertical orientations differ, the frame is flipped on the GPU with `glBlitFramebuffer`. The alternative shader-flip path remains optional; it was not faster on the tested device.
+4. The native fd is sent to the PenguDroid daemon using `SCM_RIGHTS` in a `PresentShm` request. The daemon imports it into a Wayland `wl_shm_pool`, attaches the resulting buffer to the existing application surface and commits it. There is no second launcher window or late surface replacement.
+5. A successfully presented frame schedules the next Android DisplayEvent/vsync. This present-driven backpressure prevents ART/HWUI from accumulating stale frame timelines when the actual device renders at about 30 FPS.
+
+Aurora/Hybris package launches enable `PENGUDROID_GRALLOC=1` and `PENGUDROID_GRALLOC_SHM=1` automatically. `PENGUDROID_FORCE_SHM=1` retains the verified CPU `glReadPixels`/shared-memory fallback; `PENGUDROID_FORCE_DMABUF=1` selects the dma-buf path when the compositor supports it. The current Lipstick setup exposes neither a suitable `linux-dmabuf` nor `wl_drm` path, so native fd transport into `wl_shm` is used instead.
+
+A `PresentShm` reply confirms daemon acceptance/attachment, not physical scanout. Visible-frame validation therefore also uses compositor screenshots and pixel/content changes, not just EGL swap counters. Implementation boundaries live in [`pengudroid-gleshim`](crates/pengudroid-gleshim/src/lib.rs) and the daemon's [`graphics.rs`](crates/pengudroid-daemon/src/graphics.rs).
+
 ## Compatibility boundaries
 
 - The screenshots prove specific application versions on the stated hardware. They are not a general Android compatibility certification or a performance benchmark.
