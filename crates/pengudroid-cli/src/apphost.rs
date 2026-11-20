@@ -3806,7 +3806,8 @@ impl ActivityHostWaker {
                         || STATUSBAR_LAYOUT_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || CLIPBOARD_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || NETWORK_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
-                        || OUTSIDE_FOCUS_PENDING.load(std::sync::atomic::Ordering::Acquire);
+                        || OUTSIDE_FOCUS_PENDING.load(std::sync::atomic::Ordering::Acquire)
+                        || !EDITOR_FOCUS_REQUEST.lock().unwrap_or_else(|e| e.into_inner()).is_none();
                     if (activity || ime) && env.call_boolean(handler, send, &[JValue { i: 0 }]) != Some(true) {
                         eprintln!("apphost: main Handler rejected activity/IME wakeup");
                         return None;
@@ -4993,8 +4994,14 @@ fn spawn_input_pump(env: &JniEnv) {
                 network_smoke_root = root as usize;
                 NETWORK_SMOKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
             }
-            if inset_root != root as usize {
-                inset_root = root as usize;
+            let same_inset_root = inset_root != 0
+                && env.is_same_object(inset_root as JObject, root);
+            if !same_inset_root {
+                if inset_root != 0 {
+                    env.delete_global_ref(inset_root as JObject);
+                }
+                let Some(global) = env.new_global_ref(root) else { return };
+                inset_root = global as usize;
                 STATUSBAR_INSET_PENDING.store(true, std::sync::atomic::Ordering::Release);
             }
             let focused = env.call_object(view, find_focus, &[]);
@@ -5297,10 +5304,45 @@ fn spawn_input_pump(env: &JniEnv) {
             use crate::keymap_gesture::TouchEvent;
             match event {
                 TouchEvent::Down { x, y, .. } => {
-                    // Arm on DOWN using the editor's original bounds, but do not
-                    // mutate focus before UP: a main-Looper clearFocus between
-                    // down/up can otherwise cancel the click being delivered.
-                    outside_focus_armed.set(is_outside_text_focus(&env, x, y));
+                    let hit = text_focus_hit(&env, x, y);
+                    if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                        println!("input: focused editor hit={hit:?}");
+                    }
+                    match hit {
+                        Some(false) => {
+                            // A focused editor does not generate a new focus
+                            // transition when the user taps it again. Explicitly
+                            // request show: Maliit also handles its own
+                            // imInitiatedHide/activationLost state in this call.
+                            if let Some(set_ime) = set_ime {
+                                if unsafe { set_ime(1) } == 1 {
+                                    ime_visible.set(true);
+                                    println!("apphost: requested IME show for focused editor tap");
+                                }
+                            }
+                            outside_focus_armed.set(false);
+                        }
+                        Some(true) => {
+                            // Arm on DOWN using the editor's original bounds,
+                            // but mutate focus only after UP so the click itself
+                            // remains intact. MAX disables this compatibility
+                            // hide through its package-specific launcher default.
+                            outside_focus_armed.set(outside_focus_enabled());
+                        }
+                        None => {
+                            outside_focus_armed.set(false);
+                            if let Some(editor) = text_editor_at_point(&env, x, y) {
+                                if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                                    println!("input: queued editor requestFocus after hit-test");
+                                }
+                                let mut pending = EDITOR_FOCUS_REQUEST.lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if let Some(old) = pending.replace(editor as usize) {
+                                    env.delete_global_ref(old as JObject);
+                                }
+                            }
+                        }
+                    }
                 }
                 TouchEvent::Up { .. } if outside_focus_armed.replace(false) => {
                     OUTSIDE_FOCUS_PENDING.store(true, std::sync::atomic::Ordering::Release);
@@ -6744,49 +6786,118 @@ static NETWORK_SMOKE_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static OUTSIDE_FOCUS_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static EDITOR_FOCUS_REQUEST: std::sync::Mutex<Option<usize>> =
+    std::sync::Mutex::new(None);
 
-/// Return true when a down coordinate is outside the focused text editor.
-/// This only reads geometry; the actual View.clearFocus call is deferred to
-/// the main Looper thread below.
+/// Return true for a DOWN outside the focused editor, false inside it, and
+/// None when there is no focused text editor. This only reads geometry; focus
+/// mutation remains deferred to the main Looper.
 fn outside_focus_enabled() -> bool {
     std::env::var("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE")
         .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
 }
 
-fn is_outside_text_focus(env: &JniEnv, x: f32, y: f32) -> bool {
-    if !outside_focus_enabled() {
-        return false;
+fn text_editor_at_point(env: &JniEnv, x: f32, y: f32) -> Option<JObject> {
+    fn visit(env: &JniEnv, view: JObject, x: i32, y: i32) -> Option<JObject> {
+        let view_class = env.find_class("android/view/View")?;
+        let visible = env.method_id(view_class, "getVisibility", "()I")?;
+        if env.call_int(view, visible, &[])? != 0 { return None; }
+        let (_, rect) = new_instance(env, "android/graphics/Rect")?;
+        let get_rect = env.method_id(
+            view_class, "getGlobalVisibleRect", "(Landroid/graphics/Rect;)Z",
+        )?;
+        if !env.call_boolean(view, get_rect, &[JValue { l: rect }])? { return None; }
+        let rect_class = env.find_class("android/graphics/Rect")?;
+        let contains = env.method_id(rect_class, "contains", "(II)Z")?;
+        if !env.call_boolean(rect, contains, &[JValue { i: x }, JValue { i: y }])? {
+            return None;
+        }
+        let is_editor = env.method_id(view_class, "onCheckIsTextEditor", "()Z")?;
+        if env.call_boolean(view, is_editor, &[])? { return Some(view); }
+
+        let group_class = env.find_class("android/view/ViewGroup")?;
+        let class_class = env.find_class("java/lang/Class")?;
+        let is_instance = env.method_id(class_class, "isInstance", "(Ljava/lang/Object;)Z")?;
+        if !env.call_boolean(group_class, is_instance, &[JValue { l: view }])? {
+            return None;
+        }
+        let count = env.method_id(group_class, "getChildCount", "()I")?;
+        let child_at = env.method_id(
+            group_class, "getChildAt", "(I)Landroid/view/View;",
+        )?;
+        let count = env.call_int(view, count, &[])?;
+        for index in (0..count).rev() {
+            let child = env.call_object(view, child_at, &[JValue { i: index }])?;
+            if child.is_null() { continue; }
+            if let Some(editor) = visit(env, child, x, y) { return Some(editor); }
+        }
+        None
     }
-    let Some(root) = current_keyboard_root(env) else { return false };
-    let (Some(root_class), Some(view_class), Some(rect_class)) = (
-        env.find_class("android/view/ViewRootImpl"),
-        env.find_class("android/view/View"),
-        env.find_class("android/graphics/Rect"),
-    ) else { return false };
-    let (Some(view_field), Some(find_focus), Some(is_editor)) = (
-        env.field_id(root_class, "mView", "Landroid/view/View;"),
-        env.method_id(view_class, "findFocus", "()Landroid/view/View;"),
-        env.method_id(view_class, "onCheckIsTextEditor", "()Z"),
-    ) else { return false };
+
+    let _frame = env.local_frame(256)?;
+    let root = current_keyboard_root(env)?;
+    let root_class = env.find_class("android/view/ViewRootImpl")?;
+    let view_field = env.field_id(root_class, "mView", "Landroid/view/View;")?;
     let view = env.object_field(root, view_field);
-    if view.is_null() { return false; }
-    let Some(focused) = env.call_object(view, find_focus, &[]) else { return false };
+    if view.is_null() { return None; }
+    let editor = visit(env, view, x.round() as i32, y.round() as i32)?;
+    env.new_global_ref(editor)
+}
+
+fn request_editor_focus_on_main(env: &JniEnv) {
+    let editor = EDITOR_FOCUS_REQUEST.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(editor) = editor else { return };
+    let editor = editor as JObject;
+    let result = (|| -> Option<()> {
+        let view_class = env.find_class("android/view/View")?;
+        let request = env.method_id(view_class, "requestFocus", "()Z")?;
+        if !env.call_boolean(editor, request, &[])? {
+            eprintln!("apphost: Android editor requestFocus rejected after tap");
+            return None;
+        }
+        if let Some(symbol) = shim_symbol("pengudroid_set_ime_state") {
+            let set_ime: unsafe extern "C" fn(i32) -> i32 =
+                unsafe { std::mem::transmute(symbol) };
+            unsafe { set_ime(1) };
+        }
+        println!("apphost: restored Android editor focus and requested IME show");
+        Some(())
+    })();
+    env.delete_global_ref(editor);
+    let _ = result;
+}
+
+fn text_focus_hit(env: &JniEnv, x: f32, y: f32) -> Option<bool> {
+    let root = current_keyboard_root(env)?;
+    let (root_class, view_class, rect_class) = (
+        env.find_class("android/view/ViewRootImpl")?,
+        env.find_class("android/view/View")?,
+        env.find_class("android/graphics/Rect")?,
+    );
+    let (view_field, find_focus, is_editor) = (
+        env.field_id(root_class, "mView", "Landroid/view/View;")?,
+        env.method_id(view_class, "findFocus", "()Landroid/view/View;")?,
+        env.method_id(view_class, "onCheckIsTextEditor", "()Z")?,
+    );
+    let view = env.object_field(root, view_field);
+    if view.is_null() { return None; }
+    let focused = env.call_object(view, find_focus, &[])?;
     if focused.is_null() || env.call_boolean(focused, is_editor, &[]) != Some(true) {
-        return false;
+        return None;
     }
-    let (Some(ctor), Some(get_rect), Some(contains)) = (
-        env.method_id(rect_class, "<init>", "()V"),
-        env.method_id(view_class, "getGlobalVisibleRect", "(Landroid/graphics/Rect;)Z"),
-        env.method_id(rect_class, "contains", "(II)Z"),
-    ) else { return false };
-    let Some(rect) = env.new_object(rect_class, ctor, &[]) else { return false };
+    let (ctor, get_rect, contains) = (
+        env.method_id(rect_class, "<init>", "()V")?,
+        env.method_id(view_class, "getGlobalVisibleRect", "(Landroid/graphics/Rect;)Z")?,
+        env.method_id(rect_class, "contains", "(II)Z")?,
+    );
+    let rect = env.new_object(rect_class, ctor, &[])?;
     if env.call_boolean(focused, get_rect, &[JValue { l: rect }]) != Some(true) {
-        return false;
+        return None;
     }
     env.call_boolean(rect, contains, &[
         JValue { i: x.round() as i32 }, JValue { i: y.round() as i32 },
-    ]) == Some(false)
+    ]).map(|contains| !contains)
 }
 
 fn clear_outside_text_focus_on_main(env: &JniEnv) {
@@ -6851,9 +6962,11 @@ fn apply_deferred_window_updates(env: &JniEnv) {
         && !CLIPBOARD_SMOKE_PENDING.load(Ordering::Acquire)
         && !NETWORK_SMOKE_PENDING.load(Ordering::Acquire)
         && !OUTSIDE_FOCUS_PENDING.load(Ordering::Acquire)
+        && EDITOR_FOCUS_REQUEST.lock().unwrap_or_else(|e| e.into_inner()).is_none()
     {
         return;
     }
+    request_editor_focus_on_main(env);
     if OUTSIDE_FOCUS_PENDING.swap(false, Ordering::AcqRel) {
         clear_outside_text_focus_on_main(env);
     }

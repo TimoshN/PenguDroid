@@ -911,7 +911,11 @@ fn apply_aurora_package_env(
             cmd.env("PENGUDROID_VSYNC_INTERVAL_US", "33333");
         }
         if !overridden("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE") {
-            cmd.env("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE", "1");
+            // Keep MAX's phone/country editors focused when tapping elsewhere;
+            // its nested login/BottomSheet flow relies on that focus. Other
+            // Hybris apps retain the compatibility outside-tap hide.
+            let enabled = if package == "ru.oneme.app" { "0" } else { "1" };
+            cmd.env("PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE", enabled);
         }
         if !overridden("PENGUDROID_DENSITY_DPI") {
             if let Some((ratio, dpi)) = aurora_theme_density_dpi() {

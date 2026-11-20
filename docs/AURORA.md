@@ -516,6 +516,16 @@ on the main Looper so the focus change cannot cancel the in-flight click. Aurora
 explicit value of 0/false disables it. Verification:
 `apphost: cleared text focus after outside tap`, `IME visible=false`, and the
 full-height layout in `target/aurora/maxnext-outside-fix-after.png`.
+The current MAX package default disables outside-tap hiding
+(`PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE=0`). Tapping an already focused editor
+explicitly requests Maliit show; if host-initiated hiding left no focused
+editor, a real editor hit-test is followed by `requestFocus()` on the main
+Looper before showing IME. Statusbar dispatch is deduplicated by a global JNI
+reference and `is_same_object`, not by the address of a temporary local
+reference. Consequently repeated keyboard show requests do not repeatedly
+apply the 132-px WindowInsets or DecorView fallback. Evidence:
+`target/aurora/maxnext-statusbar-ime-final.log` contains one initial inset and
+multiple subsequent IME show requests without another inset.
 
 ## Wayland output geometry and theme-derived Android density
 
