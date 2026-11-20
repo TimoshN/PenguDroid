@@ -1713,6 +1713,29 @@ fn report_surface_views(env: &JniEnv, verbose: bool) {
                 lp_h,
                 if id > 0 { format!(" id={id:#x}{id_name}") } else { String::new() },
             );
+            if id_name.contains("oneme_bottom_sheet_popup")
+                || id_name.contains("oneme_country_container")
+            {
+                let read_float = |method: &str| -> f32 {
+                    let Some(method) = env.method_id(view_class, method, "()F") else {
+                        return -1.0;
+                    };
+                    let call: unsafe extern "C" fn(
+                        *mut c_void, JObject, JMethodId, *const JValue,
+                    ) -> f32 = unsafe {
+                        let table = *(env.0 as *const *const *const c_void);
+                        std::mem::transmute(*table.add(57)) // CallFloatMethodA
+                    };
+                    unsafe { call(env.0, view, method, std::ptr::null()) }
+                };
+                println!(
+                    "views: {:indent$}translationY={} alpha={} scaleY={}",
+                    "",
+                    read_float("getTranslationY"),
+                    read_float("getAlpha"),
+                    read_float("getScaleY"),
+                );
+            }
         }
         if name.contains("SurfaceView") || name.contains("TextureView") {
             // A `SurfaceView` that measured 0 wide never sets `mHaveFrame`, so
@@ -4943,7 +4966,7 @@ fn spawn_input_pump(env: &JniEnv) {
         } else {
             Some(unsafe { std::mem::transmute(read_text_symbol) })
         };
-        let mut ime_visible = false;
+        let ime_visible = std::cell::Cell::new(false);
         let mut inset_root = 0usize;
         let mut clipboard_smoke_root = 0usize;
         let mut network_smoke_root = 0usize;
@@ -4979,9 +5002,9 @@ fn spawn_input_pump(env: &JniEnv) {
                 !focused.is_null()
                     && env.call_boolean(focused, text_editor, &[]).unwrap_or(false)
             });
-            if accepts == ime_visible { return; }
+            if accepts == ime_visible.get() { return; }
             if unsafe { set_ime(i32::from(accepts)) } == 1 {
-                ime_visible = accepts;
+                ime_visible.set(accepts);
                 println!("apphost: text input focus={accepts}");
             }
         };
@@ -5269,12 +5292,20 @@ fn spawn_input_pump(env: &JniEnv) {
 
         let touch_state = std::cell::RefCell::new(crate::keymap_gesture::TouchState::default());
         let gesture_down = std::cell::Cell::new(0i64);
+        let outside_focus_armed = std::cell::Cell::new(false);
         let deliver_touch_event = |event: crate::keymap_gesture::TouchEvent| {
             use crate::keymap_gesture::TouchEvent;
-            if let TouchEvent::Down { x, y, .. } = event {
-                if is_outside_text_focus(&env, x, y) {
+            match event {
+                TouchEvent::Down { x, y, .. } => {
+                    // Arm on DOWN using the editor's original bounds, but do not
+                    // mutate focus before UP: a main-Looper clearFocus between
+                    // down/up can otherwise cancel the click being delivered.
+                    outside_focus_armed.set(is_outside_text_focus(&env, x, y));
+                }
+                TouchEvent::Up { .. } if outside_focus_armed.replace(false) => {
                     OUTSIDE_FOCUS_PENDING.store(true, std::sync::atomic::Ordering::Release);
                 }
+                _ => {}
             }
             if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
                 println!("input: ts={} touch {event:?} dispatch begin", monotonic_ms());
@@ -5347,10 +5378,12 @@ fn spawn_input_pump(env: &JniEnv) {
                 println!("input: native kernel uinput touch active ({})", node.display());
             }
         }
-        for path in pengudroid_input::uinput::touchscreens(&exclude_touch_nodes) {
-            if let Ok(reader) = pengudroid_input::KernelTouchReader::open(&path) {
-                println!("input: hardware kernel touchscreen active ({})", path.display());
-                kernel_touch_readers.push((reader, false));
+        if std::env::var_os("PENGUDROID_DISABLE_KERNEL_TOUCH").is_none() {
+            for path in pengudroid_input::uinput::touchscreens(&exclude_touch_nodes) {
+                if let Ok(reader) = pengudroid_input::KernelTouchReader::open(&path) {
+                    println!("input: hardware kernel touchscreen active ({})", path.display());
+                    kernel_touch_readers.push((reader, false));
+                }
             }
         }
 
@@ -5379,6 +5412,26 @@ fn spawn_input_pump(env: &JniEnv) {
                     let Some(id) = id else { continue };
                     let x = kev.norm_x * sw;
                     let y = kev.norm_y * sh;
+                    // Maliit is a separate host surface, but the physical evdev
+                    // stream still contains contacts targeted at its panel.
+                    // Suppress only gestures which START there; application
+                    // gestures beginning above the keyboard keep their move/up
+                    // sequence, and an outside tap above the panel can hide IME.
+                    let ime_top = std::env::var("PENGUDROID_IME_PANEL_TOP_PX").ok()
+                        .and_then(|value| value.trim().parse::<i32>().ok())
+                        .unwrap_or_else(|| (surface_h() * 5) / 8);
+                    if ime_visible.get()
+                        && std::env::var_os("PENGUDROID_IME_TOUCH_FILTER")
+                            .as_deref() != Some(std::ffi::OsStr::new("0"))
+                        && matches!(kev.phase, pengudroid_input::KernelTouchPhase::Down)
+                        && y >= ime_top as f32
+                    {
+                        kernel_pointer_ids.release(reader_index, kev.slot);
+                        if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                            println!("input: suppressed contact in visible Maliit panel");
+                        }
+                        continue;
+                    }
                     let te = match kev.phase {
                         pengudroid_input::KernelTouchPhase::Down => {
                             crate::keymap_gesture::TouchEvent::Down { id, x, y }
@@ -6375,6 +6428,68 @@ fn ensure_statusbar_layout_inset(env: &JniEnv, root: JObject) -> Option<()> {
     println!(
         "apphost: reserved missing status-bar space after layout: {content_top}px -> {height}px"
     );
+    Some(())
+}
+
+fn trace_activity_geometry(env: &JniEnv, activity: JObject) -> Option<()> {
+    let context = env.find_class("android/content/Context")?;
+    let get_resources = env.method_id(
+        context,
+        "getResources",
+        "()Landroid/content/res/Resources;",
+    )?;
+    let resources = env.call_object(activity, get_resources, &[])?;
+    let resources_class = env.find_class("android/content/res/Resources")?;
+    let get_config = env.method_id(
+        resources_class,
+        "getConfiguration",
+        "()Landroid/content/res/Configuration;",
+    )?;
+    let get_metrics = env.method_id(
+        resources_class,
+        "getDisplayMetrics",
+        "()Landroid/util/DisplayMetrics;",
+    )?;
+    let config = env.call_object(resources, get_config, &[])?;
+    let metrics = env.call_object(resources, get_metrics, &[])?;
+    let config_class = env.find_class("android/content/res/Configuration")?;
+    let mut values = Vec::new();
+    for field in ["densityDpi", "screenWidthDp", "screenHeightDp", "smallestScreenWidthDp"] {
+        values.push(env.int_field(config, env.field_id(config_class, field, "I")?));
+    }
+    let metrics_class = env.find_class("android/util/DisplayMetrics")?;
+    let width = env.int_field(metrics, env.field_id(metrics_class, "widthPixels", "I")?);
+    let height = env.int_field(metrics, env.field_id(metrics_class, "heightPixels", "I")?);
+    println!(
+        "apphost: Activity resources {}x{} px, {}x{} dp, smallest={} dp, densityDpi={}",
+        width, height, values[1], values[2], values[3], values[0]
+    );
+    let object_class = env.find_class("java/lang/Object")?;
+    let to_string = env.method_id(object_class, "toString", "()Ljava/lang/String;")?;
+    let trace_resources = |label: &str, resources: JObject| -> Option<()> {
+        let metrics = env.call_object(resources, get_metrics, &[])?;
+        let config = env.call_object(resources, get_config, &[])?;
+        let metrics = env.call_object(metrics, to_string, &[]).and_then(|s| env.get_string(s))?;
+        let config = env.call_object(config, to_string, &[]).and_then(|s| env.get_string(s))?;
+        println!("apphost: {label} metrics {metrics}");
+        println!("apphost: {label} config {config}");
+        Some(())
+    };
+    if let Some(system) = env.call_static_object(resources_class, env.static_method_id(
+        resources_class,
+        "getSystem",
+        "()Landroid/content/res/Resources;",
+    )?, &[]) {
+        let _ = trace_resources("Resources.getSystem", system);
+    }
+    if let Some(eng) = env.find_class_quiet("eng") {
+        if let Some(get) = env.static_method_id(eng, "a", "()Landroid/content/res/Resources;") {
+            if let Some(app_resources) = env.call_static_object(eng, get, &[]) {
+                let _ = trace_resources("MAX eng.a", app_resources);
+            }
+        }
+        env.exception_clear();
+    }
     Some(())
 }
 
@@ -7776,6 +7891,9 @@ fn launch_hosted_activity(
             // activity will be visible; drive it explicitly so the decor view is
             // attached and the first traversal reaches `performDraw`.
             force_visible(env, record);
+            if std::env::var_os("PENGUDROID_TRACE_GEOMETRY").is_some() {
+                trace_activity_geometry(env, activity);
+            }
             let record = env.new_global_ref(record)?;
             let token = registration.id;
             let token_parcel = registration.parcel as usize;

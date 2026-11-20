@@ -511,8 +511,8 @@ restart a free-running clock. Home/app-cover/resume was verified visibly;
 
 MAX also has no root outside-click handler to clear editor focus. Optional
 compatibility `PENGUDROID_CLEAR_FOCUS_ON_OUTSIDE=1` reads the focused editor's
-global bounds on ACTION_DOWN, defers View.clearFocus to the main Looper, hides
-IME and still dispatches the click. Aurora/Hybris enables it by default; an
+global bounds on ACTION_DOWN, and defers View.clearFocus until after ACTION_UP
+on the main Looper so the focus change cannot cancel the in-flight click. Aurora/Hybris enables it by default; an
 explicit value of 0/false disables it. Verification:
 `apphost: cleared text focus after outside tap`, `IME visible=false`, and the
 full-height layout in `target/aurora/maxnext-outside-fix-after.png`.
@@ -531,7 +531,7 @@ without modifying it, and Android gets
 `densityDpi = round(theme_pixel_ratio * 1.5 * 160)` unless
 `PENGUDROID_DENSITY_DPI` or `--density` is explicit. On Dialog-S the verified
 values for MaxNext, PSB no-DGIS and Sberbank are Wayland 1080x2460, theme 1.75,
-densityDpi 420 and DisplayMetrics.density/scaledDensity 2.625 (about 384x937
+densityDpi 420 and DisplayMetrics.density/scaledDensity 2.625 (about 411x937
 dp). Evidence: `target/aurora/maxnext-wayland-density.log`,
 `target/aurora/psbmobile-wayland-density-nodgis2.log`, and
 `target/aurora/sberbank-wayland-density.log`.
@@ -549,6 +549,25 @@ icon (`maxnext.png`, `psbmobile.png`, or `sberbank.png`) before generating the
 launcher sizes. A previous unconditional `maxnext.png` input was the reason all
 three installed icons looked identical. `target/aurora/icons-home-after-fix.png`
 shows the distinct MAX, PSB and Sberbank icons on their application covers.
+
+The current MAX desktop entry deliberately keeps a per-application
+`--density 320` compatibility override. At 420 dpi its country BottomSheet can be
+logically created while remaining visually stuck with only the drag handle;
+Activity, system and MAX `eng.a()` resources were separately checked and all
+reported consistent 420-dpi metrics. At 320 dpi the real desktop launch opens the
+country list correctly with the 132-px statusbar inset. PSB and Sberbank retain
+the theme-derived density. This is a workaround, not proof that the generic
+420-dpi rendering failure is fixed. Evidence:
+`target/aurora/maxnext-final320-flags.png`.
+
+Hardware evdev contacts which start inside the visible Maliit panel (the lower
+3/8 of the display, with `PENGUDROID_IME_PANEL_TOP_PX` as an explicit override)
+are not dispatched to Android. Gestures beginning above the panel retain their
+move/up sequence. This prevents touches passing through the keyboard while
+Maliit still receives the key. On the real country-list screen, a tap on `q`
+produced exactly one IME commit and the expected Iraq/Qatar search results
+without selecting an underlying country row:
+`target/aurora/maxnext-final320-keyboard-filter.png`.
 
 ## Wayland clipboard
 
