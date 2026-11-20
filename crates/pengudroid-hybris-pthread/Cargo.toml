@@ -1,0 +1,13 @@
+[package]
+name = "pengudroid-hybris-pthread"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Host-glibc pthread key boundary for PenguDroid's isolated Hybris namespace."
+
+[lib]
+name = "pengudroid_hybris_pthread"
+crate-type = ["cdylib"]
+
+[dependencies]

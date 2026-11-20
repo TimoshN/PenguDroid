@@ -491,6 +491,39 @@ fn host() -> Result<&'static Host, String> {
 /// libhybris-common first also gives EGL/GLES the same isolated namespace.
 #[cfg(target_arch = "aarch64")]
 fn configure_hybris_sdr_properties(namespace: &mut libc::Lmid_t) {
+    // Hybris brings its own Bionic libc into this isolated namespace. Without
+    // this bridge, Bionic and glibc independently allocate identical pthread
+    // keys: Hybris eglGetError can then overwrite Android IPCThreadState's
+    // mProcess through a shared TLS slot. Load only the tiny pthread boundary
+    // first, then retain that namespace for libhybris-common and EGL/GLES.
+    if let Some(gleshim) = std::env::var_os("PENGUDROID_GLESHIM") {
+        let path = std::path::PathBuf::from(gleshim)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("libpengudroid_hybris_pthread.so");
+        if let Ok(c_path) = CString::new(path.as_os_str().as_encoded_bytes()) {
+            let bridge = unsafe {
+                libc::dlmopen(
+                    *namespace,
+                    c_path.as_ptr(),
+                    libc::RTLD_NOW | libc::RTLD_LOCAL,
+                )
+            };
+            if !bridge.is_null() {
+                if unsafe {
+                    libc::dlinfo(
+                        bridge,
+                        libc::RTLD_DI_LMID,
+                        namespace as *mut libc::Lmid_t as *mut c_void,
+                    )
+                } == 0 && std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                    eprintln!("[gleshim] loaded Hybris pthread bridge in ns={namespace}");
+                }
+            } else if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                eprintln!("[gleshim] could not load Hybris pthread bridge {}", path.display());
+            }
+        }
+    }
     let path = c"/usr/lib/libhybris-common.so.1";
     // The handle deliberately remains open for the process lifetime, like the
     // subsequent EGL/GLES handles.

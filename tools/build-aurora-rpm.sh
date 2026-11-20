@@ -87,13 +87,15 @@ fi
 if [ "$SKIP_BUILD" -eq 0 ]; then
     cargo "+$TOOLCHAIN" build --release --offline --target "$TRIPLE" \
         -p pengudroid-cli -p pengudroid-gui -p pengudroid-daemon \
-        -p pengudroid-shim -p pengudroid-gleshim -p pengudroid-vkshim
+        -p pengudroid-shim -p pengudroid-gleshim -p pengudroid-hybris-pthread \
+        -p pengudroid-vkshim
 fi
 
 ARTIFACTS="$TARGET/$TRIPLE/release"
 missing=""
 for file in pengudroid pengudroid-gui pengudroid-daemon \
-            libpengudroid_shim.so libpengudroid_gleshim.so libpengudroid_vkshim.so; do
+            libpengudroid_shim.so libpengudroid_gleshim.so \
+            libpengudroid_hybris_pthread.so libpengudroid_vkshim.so; do
     [ -f "$ARTIFACTS/$file" ] || missing="$missing $file"
 done
 if [ -n "$missing" ]; then
@@ -109,7 +111,8 @@ mkdir -p "$PRIVATE" "$STAGE/usr/bin" "$STAGE/usr/share/applications" \
     "$STAGE/usr/share/icons/hicolor/256x256/apps"
 
 install -m 0755 "$ARTIFACTS/pengudroid-gui" "$STAGE/usr/bin/$PACKAGE"
-for file in libpengudroid_shim.so libpengudroid_gleshim.so libpengudroid_vkshim.so; do
+for file in libpengudroid_shim.so libpengudroid_gleshim.so \
+            libpengudroid_hybris_pthread.so libpengudroid_vkshim.so; do
     install -m 0644 "$ARTIFACTS/$file" "$PRIVATE/$file"
 done
 install -m 0644 "$DESKTOP_SOURCE" \

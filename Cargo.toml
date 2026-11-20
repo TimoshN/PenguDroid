@@ -8,6 +8,7 @@ members = [
     "crates/pengudroid-elf",
     "crates/pengudroid-hostgpu",
     "crates/pengudroid-gleshim",
+    "crates/pengudroid-hybris-pthread",
     "crates/pengudroid-vkshim",
     "crates/pengudroid-daemon",
     "crates/pengudroid-cli",

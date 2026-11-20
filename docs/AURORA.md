@@ -249,8 +249,22 @@ calls `/usr/bin/setprop` directly when that executable is visible (manual SSH
 launch). Sailjail's private-bin hides it from desktop launches, so cold-boot
 property provisioning inside the sandbox still needs hardening; the manual
 three-property command remains the verified recovery if they are empty after
-a reboot. The ordinary non-Hybris/QEMU path is unchanged. Launch the package
-normally:
+a reboot. The ordinary non-Hybris/QEMU path is unchanged.
+
+The isolated Hybris namespace also used to load its own Bionic `libc.so`.
+Bionic and glibc independently allocated the same pthread key; on MAX's
+`OneVideoRenderT`, Hybris `eglGetError` consequently received Android
+libbinder's `IPCThreadState*` as its EGL error record and overwrote `mProcess`
+with `EGL_SUCCESS`. A later `flushCommands()` crashed. The development package
+now loads `libpengudroid_hybris_pthread.so` before `libhybris-common`: its five
+Bionic `LIBC` pthread-key/once exports branch to explicitly versioned
+`GLIBC_2.34` implementations, so both graphics and Binder use glibc's single
+key allocator. No EGL API is intercepted by this bridge. GDB watchpoint
+evidence is `target/aurora/maxnext-video-gdb-object4.out`; the fixed 90-second
+run is `target/aurora/maxnext-hybris-pthread-fixed.log`, with live ART/daemon,
+continuing presents, and no `OneVideoRenderT` fatal.
+
+Launch the package normally:
 
 ```sh
 audb launch io.github.denizomer10.PenguDroid
