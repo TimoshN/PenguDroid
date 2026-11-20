@@ -5012,6 +5012,7 @@ fn spawn_input_pump(env: &JniEnv) {
             if accepts == ime_visible.get() { return; }
             if unsafe { set_ime(i32::from(accepts)) } == 1 {
                 ime_visible.set(accepts);
+                IME_PANEL_VISIBLE.store(accepts, std::sync::atomic::Ordering::Release);
                 println!("apphost: text input focus={accepts}");
             }
         };
@@ -5317,6 +5318,7 @@ fn spawn_input_pump(env: &JniEnv) {
                             if let Some(set_ime) = set_ime {
                                 if unsafe { set_ime(1) } == 1 {
                                     ime_visible.set(true);
+                                    IME_PANEL_VISIBLE.store(true, std::sync::atomic::Ordering::Release);
                                     println!("apphost: requested IME show for focused editor tap");
                                 }
                             }
@@ -5462,7 +5464,7 @@ fn spawn_input_pump(env: &JniEnv) {
                     let ime_top = std::env::var("PENGUDROID_IME_PANEL_TOP_PX").ok()
                         .and_then(|value| value.trim().parse::<i32>().ok())
                         .unwrap_or_else(|| (surface_h() * 5) / 8);
-                    if ime_visible.get()
+                    if IME_PANEL_VISIBLE.load(std::sync::atomic::Ordering::Acquire)
                         && std::env::var_os("PENGUDROID_IME_TOUCH_FILTER")
                             .as_deref() != Some(std::ffi::OsStr::new("0"))
                         && matches!(kev.phase, pengudroid_input::KernelTouchPhase::Down)
@@ -5740,6 +5742,13 @@ fn spawn_input_pump(env: &JniEnv) {
                 println!("input: received surface={surface} tag={tag} a={a} b={b}");
             }
             if tag == 8 || tag == 10 || tag == 11 {
+                if tag == 10 {
+                    // imInitiatedHide/activationLost/window leave closes the
+                    // panel, but does not clear Android's editor focus. Keep
+                    // those states separate so the next app tap is not treated
+                    // as a Maliit key and the keyboard is not auto-resurrected.
+                    IME_PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::Release);
+                }
                 let mut text = String::new();
                 if tag == 8 {
                     let length = a.max(0.0) as usize;
@@ -6776,6 +6785,9 @@ fn handle_clipboard_action(env: &JniEnv, root: JObject, action: u8) -> Option<()
 /// Looper thread. Calling InputConnection from the pump races DynamicLayout.
 static IME_TEXT_EVENTS: std::sync::Mutex<std::collections::VecDeque<(String, i32)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
+// Actual Maliit panel visibility is independent from Android editor focus.
+static IME_PANEL_VISIBLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static STATUSBAR_INSET_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static STATUSBAR_LAYOUT_PENDING: std::sync::atomic::AtomicBool =
@@ -6859,7 +6871,9 @@ fn request_editor_focus_on_main(env: &JniEnv) {
         if let Some(symbol) = shim_symbol("pengudroid_set_ime_state") {
             let set_ime: unsafe extern "C" fn(i32) -> i32 =
                 unsafe { std::mem::transmute(symbol) };
-            unsafe { set_ime(1) };
+            if unsafe { set_ime(1) } == 1 {
+                IME_PANEL_VISIBLE.store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         println!("apphost: restored Android editor focus and requested IME show");
         Some(())

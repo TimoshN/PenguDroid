@@ -306,6 +306,18 @@ mod imp {
             self.keyboard_focus = None;
         }
 
+        fn hide_ime_surface(&mut self, id: u32, reason: &'static str) {
+            if self.ime_surface != Some(id) { return; }
+            if let Some(maliit) = self.maliit.as_mut() {
+                let _ = maliit.set_visible(false);
+            }
+            self.ime_surface = None;
+            // Also clear the guest's actual-panel state. Android editor focus
+            // deliberately remains intact and must not reopen it by itself.
+            self.input.push((id, pengudroid_proto::InputKind::FinishComposing));
+            crate::info!("surface {id} IME visible=false ({reason})");
+        }
+
         fn request_close(&mut self, id: u32) {
             if let Some(surface) = self.surfaces.get_mut(&id) {
                 if !surface.closed {
@@ -2229,14 +2241,8 @@ mod imp {
                                 crate::qt_extended_surface::qvariant_bool(true),
                             );
                         }
-                    } else if state.ime_surface == Some(id.0) {
-                        // A covered/minimized Android window no longer owns
-                        // Maliit; hide the panel and disarm its touch region.
-                        if let Some(maliit) = state.maliit.as_mut() {
-                            let _ = maliit.set_visible(false);
-                        }
-                        state.ime_surface = None;
-                        crate::info!("surface {} IME visible=false (offscreen)", id.0);
+                    } else {
+                        state.hide_ime_surface(id.0, "offscreen");
                     }
                 }
                 qt_extended_surface::Event::SetGenericProperty { name, value } => {
@@ -2419,7 +2425,14 @@ mod imp {
                         }
                     }
                 }
-                wl_keyboard::Event::Leave { .. } => state.release_keyboard(),
+                wl_keyboard::Event::Leave { surface, .. } => {
+                    // Same lifecycle boundary as Aurora Embedder's
+                    // View::SeatClient::KeyboardLeave(): a window losing seat
+                    // focus must not leave Maliit or its touch filter active.
+                    let id = state.surface_id_of(&surface);
+                    state.release_keyboard();
+                    if let Some(id) = id { state.hide_ime_surface(id, "keyboard leave"); }
+                }
                 wl_keyboard::Event::Key { key, state: key_state, serial, .. } => {
                     let pressed = matches!(key_state, WEnum::Value(KeyState::Pressed));
                     if pressed { state.clipboard_selection_serial = Some(serial); }
