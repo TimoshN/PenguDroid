@@ -3935,6 +3935,12 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
         eprintln!("[pengudroid-gleshim] window attaches to early surface {id}");
         subscribe_input(id);
     }
+    // A login/navigation tap can replace the Android window after its input
+    // event has already been dispatched. With present-driven vsync there may
+    // be no outstanding frame left to wake the new window's first traversal.
+    // Issue the same bounded wakeup used for input; it is rate-limited in the
+    // shim and never becomes a free-running producer.
+    notify_input_wakeup_vsync();
     let rec = Box::new(SurfaceRec {
         w,
         h,
