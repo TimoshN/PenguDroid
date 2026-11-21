@@ -374,6 +374,15 @@ out at 132 px and receives no extra DecorView padding. Evidence:
 `target/aurora/psbmobile-statusbar-after-layout.png`, and
 `target/aurora/sberbank-statusbar-after-layout.png`.
 
+When that fallback padding is necessary, the host also clones the app's own
+full-width top background drawable onto DecorView before applying the final
+padding. This keeps the safe area visually part of the app instead of exposing
+a black framework window. Applying the background last was also tested and
+rejected because drawable padding could reset the safe-area padding. On MAX's
+main UI the old band sampled RGB (0,0,0); the fixed band and adjacent app
+background both sample (23,24,28), while controls remain below Lipstick.
+Evidence: `target/aurora/maxnext-status-app-background2.png` and `.log`.
+
 The phone logs `qt_surface_extension enabled`, `surface 1 has
 qt_extended_surface`, and `onscreen visibility=true`; MAX remains visible and
 touch opens the country selector. See

@@ -6461,6 +6461,40 @@ fn apply_safe_area_insets(env: &JniEnv, root: JObject, include_status: bool) -> 
     Some(())
 }
 
+/// Find the app's own full-width top background so DecorView's forced safe-area
+/// padding does not expose the framework's black window background.
+fn top_background_drawable(
+    env: &JniEnv, view: JObject, content_width: i32, depth: usize,
+) -> Option<JObject> {
+    if view.is_null() || depth > 20 { return None; }
+    let view_class = env.find_class("android/view/View")?;
+    let visible = env.method_id(view_class, "getVisibility", "()I")?;
+    if env.call_int(view, visible, &[])? != 0 { return None; }
+    let width = env.method_id(view_class, "getWidth", "()I")?;
+    let get_background = env.method_id(
+        view_class, "getBackground", "()Landroid/graphics/drawable/Drawable;",
+    )?;
+    if env.call_int(view, width, &[])? >= content_width * 9 / 10 {
+        let background = env.call_object(view, get_background, &[])?;
+        if !background.is_null() { return Some(background); }
+    }
+    let group_class = env.find_class("android/view/ViewGroup")?;
+    let class_class = env.find_class("java/lang/Class")?;
+    let is_instance = env.method_id(class_class, "isInstance", "(Ljava/lang/Object;)Z")?;
+    if !env.call_boolean(group_class, is_instance, &[JValue { l: view }])? {
+        return None;
+    }
+    let count = env.method_id(group_class, "getChildCount", "()I")?;
+    let child_at = env.method_id(group_class, "getChildAt", "(I)Landroid/view/View;")?;
+    for index in 0..env.call_int(view, count, &[])? {
+        let child = env.call_object(view, child_at, &[JValue { i: index }])?;
+        if let Some(background) = top_background_drawable(env, child, content_width, depth + 1) {
+            return Some(background);
+        }
+    }
+    None
+}
+
 /// After the app-driven layout has completed, reserve only safe-area space the
 /// app did not consume itself. In particular, do not add a second IME inset to
 /// an app that already honored WindowInsets. The tracked bottom addition is
@@ -6538,6 +6572,39 @@ fn ensure_safe_area_layout_insets(env: &JniEnv, root: JObject) -> Option<()> {
         env.call_int(view, right, &[])?,
         (env.call_int(view, bottom, &[])? + bottom_delta).max(0),
     ];
+    if top_delta > 0 {
+        let content_width = env.method_id(view_class, "getWidth", "()I")
+            .and_then(|method| env.call_int(content, method, &[])).unwrap_or(0);
+        if let Some(background) = top_background_drawable(env, content, content_width, 0) {
+            let cloned = (|| -> Option<JObject> {
+                let drawable = env.find_class("android/graphics/drawable/Drawable")?;
+                let constant_state = env.method_id(
+                    drawable, "getConstantState", "()Landroid/graphics/drawable/Drawable$ConstantState;",
+                )?;
+                let state = env.call_object(background, constant_state, &[])?;
+                if state.is_null() { return None; }
+                let state_class = env.find_class("android/graphics/drawable/Drawable$ConstantState")?;
+                let resources = env.call_object(content, env.method_id(
+                    view_class, "getResources", "()Landroid/content/res/Resources;",
+                )?, &[])?;
+                let new_drawable = env.method_id(
+                    state_class,
+                    "newDrawable",
+                    "(Landroid/content/res/Resources;)Landroid/graphics/drawable/Drawable;",
+                )?;
+                env.call_object(state, new_drawable, &[JValue { l: resources }])
+            })();
+            if let Some(background) = cloned.filter(|drawable| !drawable.is_null()) {
+                let set_background = env.method_id(
+                    view_class, "setBackground", "(Landroid/graphics/drawable/Drawable;)V",
+                )?;
+                env.call_void(view, set_background, &[JValue { l: background }]);
+                println!("apphost: extended app background behind status-bar safe area");
+            }
+        }
+    }
+    // setBackground may apply the drawable's own padding; safe-area padding
+    // must be the final state.
     env.call_void(view, set_padding, &[
         JValue { i: values[0] }, JValue { i: values[1] },
         JValue { i: values[2] }, JValue { i: values[3] },
