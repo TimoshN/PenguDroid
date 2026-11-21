@@ -468,7 +468,69 @@ unsafe fn chain_to_saved_handler(sig: c_int, info: *mut c_void, ctx: *mut c_void
     true
 }
 
+#[cfg(target_arch = "aarch64")]
+static NTERP_VIRTUAL_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static NTERP_NPE_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn is_nterp_virtual_null(pc: u64) -> bool {
+    if NTERP_VIRTUAL_PC.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(pc as *const c_void, &mut info) != 0
+            && !info.dli_fbase.is_null()
+            && !info.dli_fname.is_null()
+            && std::ffi::CStr::from_ptr(info.dli_fname).to_bytes().ends_with(b"/libart.so")
+            && pc == info.dli_fbase as u64 + 0x719ba4
+        {
+            let base = info.dli_fbase as usize;
+            NTERP_NPE_ENTRY.store(
+                (base + 0x298510) as u64, std::sync::atomic::Ordering::Release,
+            );
+            NTERP_VIRTUAL_PC.store(
+                (base + 0x719ba4) as u64, std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+    pc == NTERP_VIRTUAL_PC.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn recover_nterp_null(ctx: *mut c_void, fault_address: u64) -> bool {
+    let pc = fault_rip(ctx);
+    let base = pc.wrapping_sub(0x719ba4);
+    let sp = fault_rsp(ctx) as *mut usize;
+    let method = if sp.is_null() { 0 } else { std::ptr::read(sp) };
+    type ValidMethod = unsafe extern "C" fn(usize) -> bool;
+    type ValidReturn = unsafe extern "C" fn(*mut usize, u64) -> bool;
+    let valid_method: ValidMethod = std::mem::transmute(base + 0x67787c);
+    let valid_return: ValidReturn = std::mem::transmute(base + 0x306210);
+    let trace = std::env::var_os("PENGUDROID_TRACE_NTERP").is_some();
+    if trace { eprintln!("[nterp-null] pc={pc:#x} sp={sp:p} method={method:#x}"); }
+    let method_ok = valid_method(method);
+    let return_ok = valid_return(sp, pc + 4);
+    if trace { eprintln!("[nterp-null] valid_method={method_ok} valid_return={return_ok}"); }
+    if !method_ok || !return_ok { return false; }
+    // Exact NullPointerHandler::Action recovery from ART's arm64 handler.
+    let uc = ctx as *mut libc::ucontext_t;
+    (*uc).uc_mcontext.sp -= std::mem::size_of::<u64>() as u64;
+    std::ptr::write((*uc).uc_mcontext.sp as *mut u64, pc + 4);
+    (*uc).uc_mcontext.regs[30] = fault_address;
+    (*uc).uc_mcontext.pc = NTERP_NPE_ENTRY.load(std::sync::atomic::Ordering::Acquire);
+    if trace { eprintln!("[nterp-null] recovered through ART NPE entrypoint"); }
+    true
+}
+
 extern "C" fn pengudroid_fault_handler(sig: c_int, info: *mut c_void, ctx: *mut c_void) {
+    #[cfg(target_arch = "aarch64")]
+    if sig == libc::SIGSEGV && unsafe { is_nterp_virtual_null(fault_rip(ctx)) } {
+        let address = if info.is_null() {
+            0
+        } else {
+            unsafe { (*(info as *const libc::siginfo_t)).si_addr() as u64 }
+        };
+        if unsafe { recover_nterp_null(ctx, address) } { return; }
+    }
     // Let whoever had the signal first resolve it. ART's userfaultfd `SIGBUS`
     // handler returns after copying the missing page in, and the faulting
     // instruction simply re-executes; dumping and exiting here would turn a
@@ -4088,7 +4150,8 @@ pub unsafe extern "C" fn sigaction(
     }
     if rc == 0
         && gact.is_some()
-        && std::env::var_os("PENGUDROID_DUMP_BEFORE_ART").is_some()
+        && (std::env::var_os("PENGUDROID_DUMP_BEFORE_ART").is_some()
+            || std::env::var_os("PENGUDROID_ART_JIT").is_some())
     {
         if let Some(index) = CRASH_SIGNALS.iter().position(|&s| s == signum) {
             let replacement = gact.unwrap();

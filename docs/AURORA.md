@@ -495,10 +495,20 @@ opt-in and can itself affect timing. Evidence:
 `target/aurora/maxnext-list-after-swipe2.png`.
 
 MAX normally runs with ART `-Xint`; interpreting Kotlin/Compose is a major
-performance limitation. `PENGUDROID_ART_JIT=1` is an explicit experiment which
-omits `-Xint`, but the current runtime still crashes at
-`nterp0_op_invoke_virtual+36` with SIGSEGV and exits, so it is not a usable fix.
-Evidence: `target/aurora/maxnext-jit.log`.
+performance limitation. `PENGUDROID_ART_JIT=1` omits `-Xint` (including when set
+in the app prefix's `pengudroid.env`). The former nterp failure was an implicit
+null check at `nterp0_op_invoke_virtual+36`: ART's frame validations pass, but
+the fault is not recovered through the generated-code handler. The AArch64
+signal boundary now recognizes that exact PC, calls ART's own IsValidMethod and
+IsValidReturnPc checks, and only then performs the stock arm64 NPE signal
+recovery through art_quick_throw_null_pointer_exception_from_signal. Other
+faults retain the normal handler chain. MAX survives repeated recovery and
+renders with JIT; the measured Settings → Chats transition improved from about
+810 ms to 490–530 ms, so residual route cost remains rather than being claimed
+zero. `PENGUDROID_TRACE_NTERP=1` enables recovery diagnostics. Evidence:
+`target/aurora/maxnext-nterp-recover5.log`,
+`target/aurora/maxnext-jit-fixed.log`, and
+`target/aurora/maxnext-jit-fixed-repeat.log`.
 
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI

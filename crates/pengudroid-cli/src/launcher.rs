@@ -755,10 +755,12 @@ pub fn launch(args: &[String]) -> i32 {
             // The JIT previously crashed in `nterp_op_invoke_virtual` on this
             // framework build. Keep the safe interpreter default, but allow a
             // controlled performance experiment without changing normal RPMs.
-            if std::env::var_os("PENGUDROID_ART_JIT").is_none() {
+            let jit = std::env::var_os("PENGUDROID_ART_JIT").is_some()
+                || env.iter().any(|(key, value)| key == "PENGUDROID_ART_JIT" && value != "0");
+            if !jit {
                 cmd.arg("--vm-option").arg("-Xint");
             } else {
-                eprintln!("pengudroid launch: experimental ART JIT enabled (without -Xint)");
+                eprintln!("pengudroid launch: ART JIT enabled (without -Xint)");
             }
             if !app_args.is_empty() {
                 cmd.arg("--").args(&app_args);
