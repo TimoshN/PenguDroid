@@ -2234,6 +2234,10 @@ mod imp {
                     crate::info!(
                         "surface {} onscreen visibility={}", id.0, visible != 0,
                     );
+                    state.input.push((
+                        id.0,
+                        pengudroid_proto::InputKind::WindowVisibility { visible: visible != 0 },
+                    ));
                     if visible != 0 {
                         if let Some(extended) = state.extended_surfaces.get(&id.0) {
                             extended.update_generic_property(

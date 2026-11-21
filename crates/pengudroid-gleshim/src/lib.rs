@@ -2236,6 +2236,10 @@ pub unsafe extern "C" fn pengudroid_input_poll(out: *mut u8) -> i32 {
         }
         pengudroid_proto::InputKind::FinishComposing => (10, 0.0, 0.0),
         pengudroid_proto::InputKind::ClipboardAction { action } => (11, action as f32, 0.0),
+        pengudroid_proto::InputKind::WindowVisibility { visible } => {
+            if visible { notify_input_wakeup_vsync(); }
+            (12, if visible { 1.0 } else { 0.0 }, 0.0)
+        }
     };
     let buf = std::slice::from_raw_parts_mut(out, 16);
     buf[0..4].copy_from_slice(&surface_id.to_le_bytes());

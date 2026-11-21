@@ -506,11 +506,12 @@ backpressure. `eglSwapBuffers` calls
 `__pengudroid_vsync_frame_presented()` only after successful presentation;
 `PENGUDROID_VSYNC_ON_PRESENT=1` disables the free-running clock and emits one
 following DisplayEvent per presented frame. The initial forced traversal and
-requestNextVsync remain bootstrap paths. A present now completes only an
-outstanding request, and an explicit request bypasses the producer's
-half-interval dedup: dropping such a request could otherwise freeze PIN/editor
-screens when no further frame was produced. Aurora/Hybris enables this mode by
-default while retaining the 33333 us timeline interval and explicit overrides.
+requestNextVsync remain bootstrap paths. Explicit requests bypass the
+producer's half-interval dedup: dropping one could freeze PIN/editor screens.
+Present pulses are not gated on a new request because some MAX window
+transitions do not issue one in time; gating them caused a one-frame regression.
+Aurora/Hybris enables this mode by default while retaining the 33333 us
+timeline interval and explicit overrides.
 The explicit test had 3741 present notifications and zero dispatcher warnings.
 The final automatic run had 3471 frames, zero dispatcher warnings, no crash,
 and changed-content probes at 293/266 ms after down. Unlike the old

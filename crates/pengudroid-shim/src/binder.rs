@@ -2331,16 +2331,6 @@ fn send_vsync_impl(enforce_interval: bool) -> Result<(), String> {
 
 static LAST_PRESENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_INPUT_WAKEUP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static VSYNC_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-fn take_vsync_request() -> bool {
-    VSYNC_REQUESTED.swap(false, Ordering::AcqRel)
-}
-
-fn complete_requested_vsync() -> Result<(), String> {
-    if take_vsync_request() { send_requested_vsync()?; }
-    Ok(())
-}
 
 /// Emit the next pulse only after the guest successfully presented a frame.
 /// This is a backpressure boundary: Compose can never accumulate a queue of
@@ -2354,7 +2344,7 @@ pub extern "C" fn __pengudroid_vsync_frame_presented() {
     if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
         unsafe { diag("[binder]   <- frame presented\n") };
     }
-    if let Err(error) = complete_requested_vsync() {
+    if let Err(error) = send_requested_vsync() {
         unsafe { diag(&format!("[binder] on-present vsync failed: {error}\n")) };
     }
 }
@@ -2379,10 +2369,7 @@ pub extern "C" fn __pengudroid_vsync_input_wakeup() {
     if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
         unsafe { diag(&format!("[binder]   <- input wakeup after {} ms without present\n", now - presented)) };
     }
-    // Recovery may be needed after a lost attach even if the request was
-    // already consumed by a frame which never reached present.
-    VSYNC_REQUESTED.store(true, Ordering::Release);
-    if let Err(error) = complete_requested_vsync() {
+    if let Err(error) = send_requested_vsync() {
         unsafe { diag(&format!("[binder] input-wakeup vsync failed: {error}\n")) };
     }
 }
@@ -4013,11 +4000,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 unsafe { diag(&format!("[binder]   <- display event code={}\n", tr.code)) };
             }
             if tr.code == IDEC_REQUEST_NEXT_VSYNC {
-                // One outstanding request gets exactly one event, even when
-                // it arrives immediately after a present. The request path is
-                // also the bootstrap/recovery path when no frame is pending.
-                VSYNC_REQUESTED.store(true, Ordering::Release);
-                if let Err(error) = complete_requested_vsync() {
+                // Never discard the explicit request just because a present
+                // pulse was sent in the same half-interval.
+                if let Err(error) = send_requested_vsync() {
                     return Reply::unknown_transaction(tr, &error);
                 }
             } else if let Err(error) = send_vsync() {
@@ -5841,16 +5826,6 @@ mod tests {
         assert_eq!(long(64), time + 16_666_666);
         assert_eq!(long(72), time + 16_666_666);
         assert!(event[80..].iter().all(|&byte| byte == 0));
-    }
-
-    #[test]
-    fn present_completes_only_one_outstanding_vsync_request() {
-        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        VSYNC_REQUESTED.store(false, Ordering::Release);
-        assert!(!take_vsync_request(), "no unsolicited present pulse");
-        VSYNC_REQUESTED.store(true, Ordering::Release);
-        assert!(take_vsync_request(), "present completes the request");
-        assert!(!take_vsync_request(), "the same request cannot produce two pulses");
     }
 
     #[test]

@@ -40,7 +40,7 @@ use std::fmt;
 /// v9 adds Maliit commit/preedit text events and finish-composing.
 /// v10 adds plain-text clipboard set/get/clear through Wayland data-device.
 /// v11 adds explicit Maliit Copy/Cut/Paste actions.
-pub const PROTO_VERSION: u16 = 11;
+pub const PROTO_VERSION: u16 = 12;
 
 /// Marker used by the daemon's pid/heartbeat file.
 pub const PROTO_MAGIC: u32 = 0x5044_5247; // "PDRG"
@@ -275,6 +275,8 @@ pub enum InputKind {
     FinishComposing,
     /// 0=copy, 1=cut, 2=paste for the focused Android editor.
     ClipboardAction { action: u8 },
+    /// Actual compositor visibility for a mapped Android window.
+    WindowVisibility { visible: bool },
 }
 
 impl InputKind {
@@ -291,6 +293,7 @@ impl InputKind {
             InputKind::PreeditText { .. } => 9,
             InputKind::FinishComposing => 10,
             InputKind::ClipboardAction { .. } => 11,
+            InputKind::WindowVisibility { .. } => 12,
         }
     }
 }
@@ -829,6 +832,7 @@ impl Message {
                     InputKind::CommitText { text } | InputKind::PreeditText { text } => e.str(text),
                     InputKind::FinishComposing => {}
                     InputKind::ClipboardAction { action } => e.u8(*action),
+                    InputKind::WindowVisibility { visible } => e.u8(u8::from(*visible)),
                 }
             }
         }
@@ -1031,6 +1035,7 @@ impl Message {
                     9 => InputKind::PreeditText { text: d.str()? },
                     10 => InputKind::FinishComposing,
                     11 => InputKind::ClipboardAction { action: d.u8()? },
+                    12 => InputKind::WindowVisibility { visible: d.u8()? != 0 },
                     other => return Err(ProtoError::BadKind(other)),
                 };
                 InputEvent { surface_id, event }
@@ -1297,6 +1302,7 @@ mod tests {
             InputKind::CommitText { text: "123".into() },
             InputKind::PreeditText { text: " composing ".into() },
             InputKind::FinishComposing,
+            InputKind::WindowVisibility { visible: true },
         ] {
             roundtrip(Message::InputEvent { surface_id: 7, event });
         }
