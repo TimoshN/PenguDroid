@@ -528,6 +528,30 @@ request-driven default. Evidence: `target/aurora/maxnext-chat-xint.log`,
 unique visual frames; the opt-in content probe confirmed changing pixels but
 its narrow readback strip is not a full-surface visual-FPS meter.
 
+`PENGUDROID_GRALLOC_ASYNC=1` enables an experimental double-buffered gralloc
+presentation path. It alternates two independent native output fd/FBO pairs,
+issues the full-frame Y-flip without glFinish, creates a real host EGL fence,
+and flushes it. A dedicated presenter thread performs eglClientWaitSync and
+only then sends that buffer through PresentShm. At most two frames per EGL
+surface may be outstanding; the wait for a free slot happens before the third
+Y-flip so it cannot overwrite the oldest buffer. The worker receives only
+metadata and an owned fd, never a SurfaceRec pointer. The final frame does not
+need another swap to wake presentation. Fence/setup failure falls back to a
+synchronous glFinish + native present; the async path adds no readback
+fallback. The normal synchronous path remains the default.
+
+On MAX Chats the async path delivered 70.6 swaps/s with a 14 ms median swap
+gap and 1025/1025 successful fence-to-present operations. Median fence wait
+was 12.1 ms off the RenderThread. Taking the first presented frame associated
+with each input sequence gave about 30 ms median and 38 ms p90 touch-to-present
+latency (later fling frames inherit the old sequence and are not new-input
+latency measurements). Settings ↔ Chats and the final static list frame were
+pixel-checked without a wake-up tap. Evidence:
+`target/aurora/maxnext-async88-scroll.log`,
+`target/aurora/maxnext-async88-scroll.png`,
+`target/aurora/maxnext-async88-settings-final.png`, and
+`target/aurora/maxnext-async88-chats-static.png`.
+
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI
 pipeline rendered about 30 FPS. Surplus events left Compose processing stale

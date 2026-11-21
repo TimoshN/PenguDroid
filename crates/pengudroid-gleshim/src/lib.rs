@@ -34,7 +34,7 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use pengudroid_proto::abi::{ANDROID_RGBA_8888, NATIVE_FD_FLAG};
@@ -912,9 +912,15 @@ struct GrallocTarget {
     stride: u32,
 }
 
-struct GrallocFlip {
+struct GrallocFlipBuffer {
     target: GrallocTarget,
     fbo: u32,
+}
+
+struct GrallocFlip {
+    buffers: Vec<GrallocFlipBuffer>,
+    next: usize,
+    last: usize,
 }
 
 struct Target {
@@ -1154,11 +1160,26 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
             Ok(flip) => {
                 eprintln!(
                     "[gleshim:gralloc] GPU Y-flip enabled through fd={} fbo={}",
-                    flip.target.fd, flip.fbo,
+                    flip.buffers[0].target.fd, flip.buffers[0].fbo,
                 );
                 target.flip = Some(flip);
             }
             Err(error) => eprintln!("[gleshim:gralloc] GPU Y-flip unavailable: {error}"),
+        }
+        if std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_some() {
+            let flip = target.flip.as_mut().unwrap();
+            if flip.buffers.len() == 1 {
+                match create_gralloc_flip_buffer(host, rec.w, rec.h) {
+                    Ok(buffer) => {
+                        eprintln!(
+                            "[gleshim:gralloc] async double buffering enabled through second fd={} fbo={}",
+                            buffer.target.fd, buffer.fbo,
+                        );
+                        flip.buffers.push(buffer);
+                    }
+                    Err(error) => eprintln!("[gleshim:gralloc] second flip buffer unavailable: {error}"),
+                }
+            }
         }
         if let Some(bind) = host.gl_bind_framebuffer {
             bind(GL_FRAMEBUFFER, fbo);
@@ -1372,14 +1393,17 @@ unsafe fn shader_flip_draw(host: &Host, serial: u64, texture: u32, width: u32, h
 /// wl_buffer transforms. No CPU readback is involved.
 unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
     if std::env::var_os("PENGUDROID_GRALLOC_SHM").is_none() { return; }
-    let rec = &*(surface as *const SurfaceRec);
+    let rec = &mut *(surface as *mut SurfaceRec);
     let current = host.get_current_context.map(|f| f() as usize).filter(|c| *c != 0)
         .unwrap_or_else(|| CURRENT_CONTEXT.with(|c| c.get()));
     let info = context_info(current);
-    let Some(target) = rec.targets.iter().find(|target| target.group == info.group) else { return };
-    let Some(flip) = target.flip.as_ref() else { return };
+    let Some(target) = rec.targets.iter_mut().find(|target| target.group == info.group) else { return };
+    let Some(flip) = target.flip.as_mut() else { return };
     let Some((_, read_fbo)) = target.fbos.iter().find(|(serial, _)| *serial == info.serial) else { return };
-    let (read_fbo, write_fbo) = (*read_fbo, flip.fbo);
+    let index = if flip.buffers.len() > 1 { flip.next } else { 0 };
+    flip.last = index;
+    flip.next = index ^ 1;
+    let (read_fbo, write_fbo) = (*read_fbo, flip.buffers[index].fbo);
     let Some(bind) = host.gl_bind_framebuffer else { return };
     bind(0x8CA8, read_fbo); // GL_READ_FRAMEBUFFER
     bind(0x8CA9, write_fbo); // GL_DRAW_FRAMEBUFFER
@@ -1406,7 +1430,9 @@ unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
             if let Some(enable) = host.gl_enable { enable(GL_SCISSOR_TEST); }
         }
     }
-    if let Some(finish) = host.gl_finish { finish(); }
+    if std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_none() {
+        if let Some(finish) = host.gl_finish { finish(); }
+    }
     bind(GL_FRAMEBUFFER, read_fbo);
 }
 
@@ -1569,7 +1595,7 @@ pub fn export_surface_dmabuf(surface: EGLSurface) -> Result<DmabufExport, String
     let (texture, _) = unsafe { ensure_fbo(surface, host)? };
     let rec = unsafe { &*(surface as *const SurfaceRec) };
     if let Some(target) = rec.targets.iter().find(|target| target.tex == texture)
-        .and_then(|target| target.flip.as_ref().map(|flip| &flip.target).or(target.gralloc.as_ref()))
+        .and_then(|target| target.flip.as_ref().map(|flip| &flip.buffers[flip.last].target).or(target.gralloc.as_ref()))
     {
         let fd = unsafe { libc::dup(target.fd) };
         if fd < 0 {
@@ -2547,42 +2573,242 @@ unsafe fn present_shm(surface: EGLSurface) -> Result<(), String> {
 unsafe fn present_gralloc_shm(surface: EGLSurface) -> Result<(), String> {
     let rec = &mut *(surface as *mut SurfaceRec);
     let target = rec.targets.iter().rev().find_map(|target|
-        target.flip.as_ref().map(|flip| &flip.target).or(target.gralloc.as_ref()))
+        target.flip.as_ref().map(|flip| &flip.buffers[flip.last].target).or(target.gralloc.as_ref()))
         .ok_or_else(|| "surface has no gralloc target".to_string())?;
     let fd = libc::dup(target.fd);
     if fd < 0 {
         return Err(format!("cannot duplicate gralloc fd: {}", std::io::Error::last_os_error()));
     }
-    let stride = target.stride * 4; // gralloc pixels -> transport bytes
+    let result = present_gralloc_fd(fd, rec, target.stride * 4);
+    libc::close(fd);
+    result
+}
+
+/// Send one already-synchronized native buffer. The caller retains ownership
+/// of `fd`; the socket duplicates it into the daemon during SCM_RIGHTS send.
+fn present_gralloc_fd(fd: RawFd, rec: &mut SurfaceRec, stride: u32) -> Result<(), String> {
     let mut st = lock_state();
     let surface_id = ensure_surface_id(&mut st, rec)?;
-    let conn = st.conn.take().ok_or_else(|| "daemon is unavailable".to_string())?;
-    let result = (|| -> Result<(), String> {
-        let message = Message::PresentShm {
-            surface_id,
-            width: rec.w,
-            height: rec.h,
-            stride,
-            format: ANDROID_RGBA_8888 | NATIVE_FD_FLAG,
-            crop: BufferCrop::full(rec.w as i32, rec.h as i32),
-        };
-        conn.send_message(&message, &[fd]).map_err(|e| format!("gralloc wl_shm send failed: {e}"))?;
-        let (reply, fds) = conn.recv_message().map_err(|e| format!("gralloc wl_shm reply failed: {e}"))?;
-        close_fds(&fds);
-        match reply {
-            Message::Ack => Ok(()),
-            Message::Error { code, message } => Err(format!("gralloc wl_shm rejected ({code}): {message}")),
-            other => Err(format!("unexpected gralloc wl_shm reply: {other:?}")),
-        }
-    })();
+    let mut conn = st.conn.take().ok_or_else(|| "daemon is unavailable".to_string())?;
+    let result = transmit_gralloc(&mut conn, surface_id, rec.w, rec.h, stride, fd);
     if result.is_err() {
         st.conn = None;
         st.connect_attempted = false;
     } else {
         st.conn = Some(conn);
     }
-    libc::close(fd);
     result
+}
+
+/// Worker-side variant which does not retain a raw SurfaceRec pointer.
+fn present_gralloc_metadata(
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    fd: RawFd,
+) -> Result<(), String> {
+    let mut st = lock_state();
+    let mut conn = st.conn.take().ok_or_else(|| "daemon is unavailable".to_string())?;
+    let result = transmit_gralloc(&mut conn, surface_id, width, height, stride, fd);
+    if result.is_err() {
+        st.conn = None;
+        st.connect_attempted = false;
+    } else {
+        st.conn = Some(conn);
+    }
+    result
+}
+
+fn transmit_gralloc(
+    conn: &mut Connection,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    fd: RawFd,
+) -> Result<(), String> {
+    let message = Message::PresentShm {
+        surface_id,
+        width,
+        height,
+        stride,
+        format: ANDROID_RGBA_8888 | NATIVE_FD_FLAG,
+        crop: BufferCrop::full(width as i32, height as i32),
+    };
+    conn.send_message(&message, &[fd]).map_err(|e| format!("gralloc wl_shm send failed: {e}"))?;
+    let (reply, fds) = conn.recv_message().map_err(|e| format!("gralloc wl_shm reply failed: {e}"))?;
+    close_fds(&fds);
+    match reply {
+        Message::Ack => Ok(()),
+        Message::Error { code, message } => Err(format!("gralloc wl_shm rejected ({code}): {message}")),
+        other => Err(format!("unexpected gralloc wl_shm reply: {other:?}")),
+    }
+}
+
+struct PendingGrallocFrame {
+    surface: usize,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    fd: RawFd,
+    display: usize,
+    sync: usize,
+    frame: u64,
+    touch_seq: u64,
+    touch_kind: &'static str,
+    touch_recv_ms: u64,
+}
+
+#[derive(Default)]
+struct AsyncOutstanding {
+    counts: std::collections::HashMap<usize, usize>,
+}
+
+fn async_outstanding() -> &'static (Mutex<AsyncOutstanding>, Condvar) {
+    static OUTSTANDING: OnceLock<(Mutex<AsyncOutstanding>, Condvar)> = OnceLock::new();
+    OUTSTANDING.get_or_init(|| (Mutex::new(AsyncOutstanding::default()), Condvar::new()))
+}
+
+fn async_presenter() -> &'static std::sync::mpsc::Sender<PendingGrallocFrame> {
+    static SENDER: OnceLock<std::sync::mpsc::Sender<PendingGrallocFrame>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PendingGrallocFrame>();
+        std::thread::Builder::new()
+            .name("pengudroid-present".into())
+            .spawn(move || {
+                while let Ok(frame) = rx.recv() {
+                    let Ok(host) = host() else { break };
+                    let wait_started = std::time::Instant::now();
+                    let waited = host.client_wait_sync.map(|wait| unsafe { wait(
+                        frame.display as EGLDisplay,
+                        frame.sync as EGLSync,
+                        0,
+                        1_000_000_000,
+                    ) });
+                    let wait_elapsed = wait_started.elapsed();
+                    if let Some(destroy) = host.destroy_sync {
+                        unsafe { destroy(frame.display as EGLDisplay, frame.sync as EGLSync); }
+                    }
+                    let present_started = std::time::Instant::now();
+                    let result = if waited == Some(EGL_CONDITION_SATISFIED_KHR) {
+                        present_gralloc_metadata(
+                            frame.surface_id, frame.width, frame.height, frame.stride, frame.fd,
+                        )
+                    } else {
+                        Err(format!("async GPU fence did not signal: {waited:?}"))
+                    };
+                    let present_elapsed = present_started.elapsed();
+                    unsafe { libc::close(frame.fd); }
+                    if result.is_ok() {
+                        notify_frame_presented_vsync();
+                    }
+                    if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
+                        let now = input_trace_now_ms();
+                        eprintln!(
+                            "[gleshim:async] ts={now} frame={} success={} touch_seq={} kind={} touch_to_present_ms={} fence_wait_us={} present_us={}",
+                            frame.frame, result.is_ok(), frame.touch_seq, frame.touch_kind,
+                            now.saturating_sub(frame.touch_recv_ms),
+                            wait_elapsed.as_micros(), present_elapsed.as_micros(),
+                        );
+                    }
+                    if let Err(error) = result {
+                        eprintln!("[gleshim:gralloc] async present failed: {error}");
+                    }
+                    let (lock, ready) = async_outstanding();
+                    let mut outstanding = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(count) = outstanding.counts.get_mut(&frame.surface) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 { outstanding.counts.remove(&frame.surface); }
+                    }
+                    ready.notify_all();
+                }
+            })
+            .expect("spawn async gralloc presenter");
+        tx
+    })
+}
+
+/// Wait before reusing an output buffer. This must run before the Y-flip, not
+/// after it: with two outstanding frames the third flip would otherwise
+/// overwrite the oldest buffer before the presenter had fenced it off.
+fn wait_gralloc_async_slot(surface: EGLSurface) {
+    let (lock, ready) = async_outstanding();
+    let mut outstanding = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while outstanding.counts.get(&(surface as usize)).copied().unwrap_or(0) >= 2 {
+        outstanding = ready.wait(outstanding).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Queue a flipped buffer behind a real host EGL fence. No SurfaceRec pointer
+/// crosses to the worker: surface destruction cannot leave it with a raw
+/// reference, and all connection access remains serialized by State's mutex.
+unsafe fn queue_gralloc_async(surface: EGLSurface, host: &Host) -> Result<(), String> {
+    let create = host.create_sync.ok_or("eglCreateSync is unavailable")?;
+    if host.client_wait_sync.is_none() || host.destroy_sync.is_none() {
+        return Err("EGL fence wait/destroy is unavailable".into());
+    }
+    let rec = &mut *(surface as *mut SurfaceRec);
+    let target = rec.targets.iter().rev().find_map(|target| target.flip.as_ref())
+        .ok_or("surface has no gralloc flip target")?;
+    if target.buffers.len() < 2 {
+        return Err("async double buffering needs two output buffers".into());
+    }
+    let output = &target.buffers[target.last].target;
+    let fd = libc::dup(output.fd);
+    if fd < 0 {
+        return Err(format!("cannot duplicate async gralloc fd: {}", std::io::Error::last_os_error()));
+    }
+    let (width, height, stride) = (rec.w, rec.h, output.stride * 4);
+    let display = lock_state().display;
+    let sync = create(display as EGLDisplay, 0x30F9, std::ptr::null()); // EGL_SYNC_FENCE_KHR
+    if sync.is_null() {
+        libc::close(fd);
+        return Err(format!("async eglCreateSync failed: {}", host_error(host)));
+    }
+    if let Some(flush) = host.gl_flush { flush(); }
+    let mut st = lock_state();
+    let surface_id = match ensure_surface_id(&mut st, rec) {
+        Ok(id) => id,
+        Err(error) => {
+            drop(st);
+            if let Some(destroy) = host.destroy_sync { destroy(display as EGLDisplay, sync); }
+            libc::close(fd);
+            return Err(error);
+        }
+    };
+    drop(st);
+    let (frame, touch_seq, touch_kind, touch_recv_ms) = {
+        let state = FRAME_TRACE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        (state.frame, state.touch_seq, state.touch_kind, state.touch_recv_ms)
+    };
+    let pending = PendingGrallocFrame {
+        surface: surface as usize, surface_id, width, height, stride, fd,
+        display, sync: sync as usize, frame, touch_seq, touch_kind, touch_recv_ms,
+    };
+    let (lock, ready) = async_outstanding();
+    let mut outstanding = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while outstanding.counts.get(&(surface as usize)).copied().unwrap_or(0) >= 2 {
+        outstanding = ready.wait(outstanding).unwrap_or_else(|e| e.into_inner());
+    }
+    *outstanding.counts.entry(surface as usize).or_insert(0) += 1;
+    drop(outstanding);
+    if let Err(error) = async_presenter().send(pending) {
+        let pending = error.0;
+        if let Some(destroy) = host.destroy_sync {
+            destroy(pending.display as EGLDisplay, pending.sync as EGLSync);
+        }
+        libc::close(pending.fd);
+        let mut outstanding = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = outstanding.counts.get_mut(&(surface as usize)) {
+            *count = count.saturating_sub(1);
+            if *count == 0 { outstanding.counts.remove(&(surface as usize)); }
+        }
+        ready.notify_all();
+        return Err("async presenter queue is disconnected".into());
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -2857,8 +3083,8 @@ unsafe fn attach_gralloc_texture(
     Ok(target)
 }
 
-/// Allocate a second native buffer and its FBO for the GPU Y-flip blit.
-unsafe fn create_gralloc_flip(host: &Host, width: u32, height: u32) -> Result<GrallocFlip, String> {
+/// Allocate a native output buffer and its FBO for the GPU Y-flip blit.
+unsafe fn create_gralloc_flip_buffer(host: &Host, width: u32, height: u32) -> Result<GrallocFlipBuffer, String> {
     let started = std::time::Instant::now();
     let gen_texture = host.gl_gen_textures.ok_or("glGenTextures unavailable")?;
     let bind_texture = host.gl_bind_texture.ok_or("glBindTexture unavailable")?;
@@ -2889,7 +3115,15 @@ unsafe fn create_gralloc_flip(host: &Host, width: u32, height: u32) -> Result<Gr
     if std::env::var_os("PENGUDROID_PROFILE_GRALLOC").is_some() {
         eprintln!("[gleshim:gralloc:setup] flip buffer+FBO={:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
     }
-    Ok(GrallocFlip { target, fbo })
+    Ok(GrallocFlipBuffer { target, fbo })
+}
+
+unsafe fn create_gralloc_flip(host: &Host, width: u32, height: u32) -> Result<GrallocFlip, String> {
+    Ok(GrallocFlip {
+        buffers: vec![create_gralloc_flip_buffer(host, width, height)?],
+        next: 0,
+        last: 0,
+    })
 }
 
 /// Opt-in host gralloc probe. It does not replace the normal present path:
@@ -5022,9 +5256,22 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
     trace_touch_swap();
     draw_mangohud_overlay(surface, host);
     draw_touch_debug_overlay(surface, host);
+    let async_gralloc = std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_some()
+        && std::env::var_os("PENGUDROID_GRALLOC").is_some()
+        && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some();
+    if async_gralloc {
+        wait_gralloc_async_slot(surface);
+    }
     let finish_started = std::time::Instant::now();
-    if let Some(finish) = host.gl_finish {
-        finish();
+    // Diagnostic readback still requires synchronous source pixels. Normal
+    // async swaps instead use a real host fence after the output flip.
+    if !async_gralloc
+        || std::env::var_os("PENGUDROID_TRACE_CONTENT").is_some()
+        || std::env::var_os("PENGUDROID_DUMP_FRAME").is_some()
+    {
+        if let Some(finish) = host.gl_finish {
+            finish();
+        }
     }
     let finish_elapsed = finish_started.elapsed();
     trace_content_hash(surface, host);
@@ -5038,7 +5285,18 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some()
     {
         let present_started = std::time::Instant::now();
-        let presented = present_gralloc_shm(surface);
+        let presented = if async_gralloc {
+            match queue_gralloc_async(surface, host) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    eprintln!("[gleshim:gralloc] async queue failed, using synchronous fence fallback: {error}");
+                    if let Some(finish) = host.gl_finish { finish(); }
+                    present_gralloc_shm(surface)
+                }
+            }
+        } else {
+            present_gralloc_shm(surface)
+        };
         let present_elapsed = present_started.elapsed();
         let gralloc_presented = presented.is_ok();
         let pace_started = std::time::Instant::now();
@@ -5048,7 +5306,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         let pace_elapsed = pace_started.elapsed();
         let outcome = match presented {
             Ok(()) => EGL_TRUE,
-            Err(error) => {
+            Err(error) if !async_gralloc => {
                 static LOGGED_SHM_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !LOGGED_SHM_FALLBACK.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!("[gleshim:gralloc] wl_shm present failed, using readback fallback: {error}");
@@ -5061,13 +5319,19 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
                     }
                 }
             }
+            Err(error) => {
+                eprintln!("[gleshim:gralloc] async synchronous fallback failed: {error}");
+                EGL_FALSE
+            }
         };
-        trace_touch_present(
-            if gralloc_presented { "gralloc-shm" } else { "gralloc-readback" },
-            outcome == EGL_TRUE, finish_elapsed, flip_elapsed, present_elapsed,
-        );
-        if outcome == EGL_TRUE {
-            notify_frame_presented_vsync();
+        if !async_gralloc {
+            trace_touch_present(
+                if gralloc_presented { "gralloc-shm" } else { "gralloc-readback" },
+                outcome == EGL_TRUE, finish_elapsed, flip_elapsed, present_elapsed,
+            );
+            if outcome == EGL_TRUE {
+                notify_frame_presented_vsync();
+            }
         }
         if std::env::var_os("PENGUDROID_PROFILE_GRALLOC").is_some() {
             profile_gralloc(
