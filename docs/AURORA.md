@@ -615,15 +615,17 @@ launcher sizes. A previous unconditional `maxnext.png` input was the reason all
 three installed icons looked identical. `target/aurora/icons-home-after-fix.png`
 shows the distinct MAX, PSB and Sberbank icons on their application covers.
 
-The current MAX desktop entry deliberately keeps a per-application
-`--density 320` compatibility override. At 420 dpi its country BottomSheet can be
-logically created while remaining visually stuck with only the drag handle;
-Activity, system and MAX `eng.a()` resources were separately checked and all
-reported consistent 420-dpi metrics. At 320 dpi the real desktop launch opens the
-country list correctly with the 132-px statusbar inset. PSB and Sberbank retain
-the theme-derived density. This is a workaround, not proof that the generic
-420-dpi rendering failure is fixed. Evidence:
-`target/aurora/maxnext-final320-flags.png`.
+MAX now uses the same theme-derived density as PSB and Sberbank; the temporary
+`--density 320` override is removed. The former 420-dpi country route was created
+correctly (visible, laid-out country views with alpha 1 and zero translation),
+but its pixels remained stale only in the gralloc path. HWUI leaves its dirty
+rectangle scissor enabled on some frames, and `glBlitFramebuffer` honors it.
+The GPU Y-flip therefore copied only part of the frame. The flip now disables
+`GL_SCISSOR_TEST` for its full-surface blit and restores the prior state; no CPU
+readback is used. A real 420-dpi flag tap opens the populated country list with
+correct flags and the 132-px statusbar/923-px IME safe areas. Evidence:
+`target/aurora/maxnext-route420-realtap-open.png` and
+`target/aurora/maxnext-route420-gralloc-fixed.log`.
 
 Hardware evdev contacts which start inside the visible Maliit panel (the lower
 3/8 of the display, with `PENGUDROID_IME_PANEL_TOP_PX` as an explicit override)

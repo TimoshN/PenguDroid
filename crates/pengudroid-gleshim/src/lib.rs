@@ -1389,11 +1389,22 @@ unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
     }
     if !flipped {
         let Some(blit) = host.gl_blit_framebuffer else { return };
+        // HWUI leaves its dirty-rectangle scissor enabled on some frames. The
+        // flip is a separate full-surface operation, not part of that damage:
+        // glBlitFramebuffer honors scissor, so leaving it enabled can preserve
+        // stale pixels in the gralloc target (notably MAX's 420-dpi route).
+        let scissor = host.gl_is_enabled.map(|is_enabled| is_enabled(GL_SCISSOR_TEST) != 0);
+        if scissor == Some(true) {
+            if let Some(disable) = host.gl_disable { disable(GL_SCISSOR_TEST); }
+        }
         blit(
             0, 0, rec.w as i32, rec.h as i32,
             0, rec.h as i32, rec.w as i32, 0,
             GL_COLOR_BUFFER_BIT, GL_NEAREST as u32,
         );
+        if scissor == Some(true) {
+            if let Some(enable) = host.gl_enable { enable(GL_SCISSOR_TEST); }
+        }
     }
     if let Some(finish) = host.gl_finish { finish(); }
     bind(GL_FRAMEBUFFER, read_fbo);
