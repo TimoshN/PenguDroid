@@ -407,6 +407,18 @@ control text. Actual device tests entered `123` and then verified Backspace
 `target/aurora/maxnext-textinput-backspace-verified.png`. Preedit is implemented
 but was not exercised by this numeric keyboard test.
 
+Maliit visibility also updates Android's real `WindowInsets.Type.ime` bottom
+inset and visibility flag. The current portrait panel occupies the lower 3/8
+of the Wayland surface (923 px at 2460 px); `PENGUDROID_IME_PANEL_TOP_PX`
+overrides its top for other layouts. After app layout, only unconsumed bottom
+space is added to DecorView and the host-added amount is removed on hide.
+Status-bar dispatch remains root-initial only: repeating it with every IME
+update made Compose add a second top inset. Device verification showed MAX
+search ending at y=1537 immediately above Maliit without extra top space, then
+returning to full-height content after Back. Evidence:
+`target/aurora/maxnext-safearea3-ime.png` and
+`target/aurora/maxnext-safearea3-hidden2.png`.
+
 Kernel touchscreen slots are mapped to stable Android MotionEvent pointer IDs
 1..31 (ID 0 remains the compositor/mouse pointer) and recycled after ACTION_UP.
 The previous `100 + slot` mapping produced pointer ID 101 and aborted

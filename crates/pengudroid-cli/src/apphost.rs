@@ -3803,6 +3803,7 @@ impl ActivityHostWaker {
                     let activity = unsafe { pending() };
                     let ime = !IME_TEXT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
                         || STATUSBAR_INSET_PENDING.load(std::sync::atomic::Ordering::Acquire)
+                        || IME_INSET_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || STATUSBAR_LAYOUT_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || CLIPBOARD_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
                         || NETWORK_SMOKE_PENDING.load(std::sync::atomic::Ordering::Acquire)
@@ -5013,6 +5014,7 @@ fn spawn_input_pump(env: &JniEnv) {
             if unsafe { set_ime(i32::from(accepts)) } == 1 {
                 ime_visible.set(accepts);
                 IME_PANEL_VISIBLE.store(accepts, std::sync::atomic::Ordering::Release);
+                IME_INSET_PENDING.store(true, std::sync::atomic::Ordering::Release);
                 println!("apphost: text input focus={accepts}");
             }
         };
@@ -5319,6 +5321,7 @@ fn spawn_input_pump(env: &JniEnv) {
                                 if unsafe { set_ime(1) } == 1 {
                                     ime_visible.set(true);
                                     IME_PANEL_VISIBLE.store(true, std::sync::atomic::Ordering::Release);
+                                    IME_INSET_PENDING.store(true, std::sync::atomic::Ordering::Release);
                                     println!("apphost: requested IME show for focused editor tap");
                                 }
                             }
@@ -5748,6 +5751,7 @@ fn spawn_input_pump(env: &JniEnv) {
                     // those states separate so the next app tap is not treated
                     // as a Maliit key and the keyboard is not auto-resurrected.
                     IME_PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::Release);
+                    IME_INSET_PENDING.store(true, std::sync::atomic::Ordering::Release);
                 }
                 let mut text = String::new();
                 if tag == 8 {
@@ -6378,13 +6382,25 @@ fn trace_key_target(env: &JniEnv, root: JObject, root_class: JClass) {
     })();
 }
 
-/// Apply the host status-bar/cutout height once per root View. Lipstick draws
-/// the bar; Android still needs an explicit inset because the gralloc surface
-/// remains full-screen. Zero disables the inset for non-Lipstick hosts.
-fn apply_statusbar_insets(env: &JniEnv, root: JObject) -> Option<()> {
-    let height = std::env::var("PENGUDROID_STATUSBAR_HEIGHT").ok()
-        .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0);
-    if height <= 0 { return Some(()); }
+fn ime_inset_height() -> i32 {
+    if !IME_PANEL_VISIBLE.load(std::sync::atomic::Ordering::Acquire) { return 0; }
+    let surface_height = std::env::var("PENGUDROID_SURFACE_H").ok()
+        .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(2460);
+    let top = std::env::var("PENGUDROID_IME_PANEL_TOP_PX").ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(surface_height * 5 / 8);
+    (surface_height - top).clamp(0, surface_height)
+}
+
+/// Apply host safe-area insets to the real Android window. Lipstick draws the
+/// status bar and Maliit overlays the fullscreen gralloc surface, so Android
+/// needs both the status-bar and IME contracts. A zero IME inset removes the
+/// keyboard reservation when Maliit hides.
+fn apply_safe_area_insets(env: &JniEnv, root: JObject, include_status: bool) -> Option<()> {
+    let height = if include_status {
+        std::env::var("PENGUDROID_STATUSBAR_HEIGHT").ok()
+            .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0)
+    } else { 0 };
     let root_class = env.find_class("android/view/ViewRootImpl")?;
     let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
     let view = env.object_field(root, m_view);
@@ -6399,12 +6415,18 @@ fn apply_statusbar_insets(env: &JniEnv, root: JObject) -> Option<()> {
     let of = env.static_method_id(
         insets_class, "of", "(IIII)Landroid/graphics/Insets;",
     )?;
-    let insets = env.call_static_object(insets_class, of, &[
+    let status_insets = env.call_static_object(insets_class, of, &[
         JValue { i: 0 }, JValue { i: height }, JValue { i: 0 }, JValue { i: 0 },
+    ])?;
+    let ime_height = ime_inset_height();
+    let ime_insets = env.call_static_object(insets_class, of, &[
+        JValue { i: 0 }, JValue { i: 0 }, JValue { i: 0 }, JValue { i: ime_height },
     ])?;
     let types = env.find_class("android/view/WindowInsets$Type")?;
     let status = env.static_method_id(types, "statusBars", "()I")?;
     let status = env.call_static_int(types, status, &[])?;
+    let ime = env.static_method_id(types, "ime", "()I")?;
+    let ime = env.call_static_int(types, ime, &[])?;
     let (_, builder) = new_instance(env, "android/view/WindowInsets$Builder")?;
     let builder_class = env.find_class("android/view/WindowInsets$Builder")?;
     let set = env.method_id(
@@ -6412,33 +6434,48 @@ fn apply_statusbar_insets(env: &JniEnv, root: JObject) -> Option<()> {
         "setInsets",
         "(ILandroid/graphics/Insets;)Landroid/view/WindowInsets$Builder;",
     )?;
-    let builder = env.call_object(builder, set, &[JValue { i: status }, JValue { l: insets }])?;
+    let builder = if include_status {
+        env.call_object(builder, set, &[
+            JValue { i: status }, JValue { l: status_insets },
+        ])?
+    } else { builder };
+    let builder = env.call_object(builder, set, &[
+        JValue { i: ime }, JValue { l: ime_insets },
+    ])?;
+    let set_visible = env.method_id(
+        builder_class, "setVisible", "(IZ)Landroid/view/WindowInsets$Builder;",
+    )?;
+    let builder = if include_status {
+        env.call_object(builder, set_visible, &[
+            JValue { i: status }, JValue { z: 1 },
+        ])?
+    } else { builder };
+    let builder = env.call_object(builder, set_visible, &[
+        JValue { i: ime }, JValue { z: u8::from(ime_height > 0) },
+    ])?;
     let build = env.method_id(builder_class, "build", "()Landroid/view/WindowInsets;")?;
     let window_insets = env.call_object(builder, build, &[])?;
     env.call_object(view, dispatch, &[JValue { l: window_insets }])?;
 
-    println!("apphost: applied status-bar inset {height}px");
+    println!("apphost: applied safe-area insets top={height}px ime={ime_height}px");
     Some(())
 }
 
-/// After the app-driven layout has completed, check where its content actually
-/// landed. A manual WindowInsets dispatch alone does not reserve physical
-/// space for edge-to-edge Compose. Conversely, traditional Views may apply the
-/// same inset during the following traversal, so checking padding immediately
-/// after dispatch would incorrectly inset them twice.
-fn ensure_statusbar_layout_inset(env: &JniEnv, root: JObject) -> Option<()> {
+/// After the app-driven layout has completed, reserve only safe-area space the
+/// app did not consume itself. In particular, do not add a second IME inset to
+/// an app that already honored WindowInsets. The tracked bottom addition is
+/// removed when Maliit hides; unrelated app padding is left untouched.
+fn ensure_safe_area_layout_insets(env: &JniEnv, root: JObject) -> Option<()> {
     let height = std::env::var("PENGUDROID_STATUSBAR_HEIGHT").ok()
         .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0);
-    if height <= 0 { return Some(()); }
+    let ime_height = ime_inset_height();
     let root_class = env.find_class("android/view/ViewRootImpl")?;
     let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
     let view = env.object_field(root, m_view);
     if view.is_null() { return None; }
     let view_class = env.find_class("android/view/View")?;
     let layout_requested = env.method_id(view_class, "isLayoutRequested", "()Z")?;
-    if env.call_boolean(view, layout_requested, &[])? {
-        return None;
-    }
+    let layout_pending = env.call_boolean(view, layout_requested, &[])?;
     let find_by_id = env.method_id(
         view_class,
         "findViewById",
@@ -6457,7 +6494,37 @@ fn ensure_statusbar_layout_inset(env: &JniEnv, root: JObject) -> Option<()> {
     }
     let rect_class = env.find_class("android/graphics/Rect")?;
     let content_top = env.int_field(rect, env.field_id(rect_class, "top", "I")?);
-    if content_top >= height { return Some(()); }
+    let content_bottom = env.int_field(rect, env.field_id(rect_class, "bottom", "I")?);
+    let get_height = env.method_id(view_class, "getHeight", "()I")?;
+    let root_height = env.call_int(view, get_height, &[])?;
+
+    let old_bottom_added = {
+        let mut states = SAFE_AREA_BOTTOM_ADDITIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = states.iter().position(|state| {
+            env.is_same_object(state.content as JObject, content)
+        }) {
+            states[index].added
+        } else {
+            let global = env.new_global_ref(content)? as usize;
+            states.push(SafeAreaBottomAddition { content: global, added: 0 });
+            0
+        }
+    };
+    // Hiding Maliit must not leave our old bottom padding behind when an app
+    // keeps a layout request pending without performing another traversal.
+    if layout_pending && !(ime_height == 0 && old_bottom_added > 0) {
+        return None;
+    }
+    let top_delta = if height > 0 && content_top < height {
+        height - content_top.max(0)
+    } else { 0 };
+    let bottom_delta = if ime_height > 0 || old_bottom_added > 0 {
+        let desired_bottom = root_height - ime_height;
+        let measured_delta = desired_bottom - content_bottom;
+        let new_added = (old_bottom_added - measured_delta).max(0);
+        old_bottom_added - new_added
+    } else { 0 };
+    if top_delta == 0 && bottom_delta == 0 { return Some(()); }
 
     let padding_top = env.method_id(view_class, "getPaddingTop", "()I")?;
     let left = env.method_id(view_class, "getPaddingLeft", "()I")?;
@@ -6467,17 +6534,25 @@ fn ensure_statusbar_layout_inset(env: &JniEnv, root: JObject) -> Option<()> {
     let request_layout = env.method_id(view_class, "requestLayout", "()V")?;
     let values = [
         env.call_int(view, left, &[])?,
-        env.call_int(view, padding_top, &[])? + height - content_top.max(0),
+        env.call_int(view, padding_top, &[])? + top_delta,
         env.call_int(view, right, &[])?,
-        env.call_int(view, bottom, &[])?,
+        (env.call_int(view, bottom, &[])? + bottom_delta).max(0),
     ];
     env.call_void(view, set_padding, &[
         JValue { i: values[0] }, JValue { i: values[1] },
         JValue { i: values[2] }, JValue { i: values[3] },
     ]);
     env.call_void(view, request_layout, &[]);
+    let new_bottom_added = old_bottom_added - bottom_delta;
+    let mut states = SAFE_AREA_BOTTOM_ADDITIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(state) = states.iter_mut().find(|state| {
+        env.is_same_object(state.content as JObject, content)
+    }) {
+        state.added = new_bottom_added;
+    }
     println!(
-        "apphost: reserved missing status-bar space after layout: {content_top}px -> {height}px"
+        "apphost: reserved missing safe-area space after layout: top {content_top}px -> {}px, bottom {content_bottom}px -> {}px",
+        content_top + top_delta, content_bottom + bottom_delta,
     );
     Some(())
 }
@@ -6788,6 +6863,14 @@ static IME_TEXT_EVENTS: std::sync::Mutex<std::collections::VecDeque<(String, i32
 // Actual Maliit panel visibility is independent from Android editor focus.
 static IME_PANEL_VISIBLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static IME_INSET_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+struct SafeAreaBottomAddition {
+    content: usize,
+    added: i32,
+}
+static SAFE_AREA_BOTTOM_ADDITIONS: std::sync::Mutex<Vec<SafeAreaBottomAddition>> =
+    std::sync::Mutex::new(Vec::new());
 static STATUSBAR_INSET_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static STATUSBAR_LAYOUT_PENDING: std::sync::atomic::AtomicBool =
@@ -6873,6 +6956,7 @@ fn request_editor_focus_on_main(env: &JniEnv) {
                 unsafe { std::mem::transmute(symbol) };
             if unsafe { set_ime(1) } == 1 {
                 IME_PANEL_VISIBLE.store(true, std::sync::atomic::Ordering::Release);
+                IME_INSET_PENDING.store(true, std::sync::atomic::Ordering::Release);
             }
         }
         println!("apphost: restored Android editor focus and requested IME show");
@@ -6931,7 +7015,10 @@ fn clear_outside_text_focus_on_main(env: &JniEnv) {
     env.call_void(focused, clear_focus, &[]);
     if let Some(symbol) = shim_symbol("pengudroid_set_ime_state") {
         let set_ime: unsafe extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(symbol) };
-        unsafe { set_ime(0) };
+        if unsafe { set_ime(0) } == 1 {
+            IME_PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::Release);
+            IME_INSET_PENDING.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
     println!("apphost: cleared text focus after outside tap");
 }
@@ -6972,6 +7059,7 @@ fn current_keyboard_root(env: &JniEnv) -> Option<JObject> {
 fn apply_deferred_window_updates(env: &JniEnv) {
     use std::sync::atomic::Ordering;
     if !STATUSBAR_INSET_PENDING.load(Ordering::Acquire)
+        && !IME_INSET_PENDING.load(Ordering::Acquire)
         && !STATUSBAR_LAYOUT_PENDING.load(Ordering::Acquire)
         && !CLIPBOARD_SMOKE_PENDING.load(Ordering::Acquire)
         && !NETWORK_SMOKE_PENDING.load(Ordering::Acquire)
@@ -6985,13 +7073,15 @@ fn apply_deferred_window_updates(env: &JniEnv) {
         clear_outside_text_focus_on_main(env);
     }
     let Some(root) = current_keyboard_root(env) else { return };
-    if STATUSBAR_INSET_PENDING.swap(false, Ordering::AcqRel)
-        && apply_statusbar_insets(env, root).is_some()
+    let status_update = STATUSBAR_INSET_PENDING.swap(false, Ordering::AcqRel);
+    let ime_update = IME_INSET_PENDING.swap(false, Ordering::AcqRel);
+    if (status_update || ime_update)
+        && apply_safe_area_insets(env, root, status_update).is_some()
     {
         STATUSBAR_LAYOUT_PENDING.store(true, Ordering::Release);
     }
     if STATUSBAR_LAYOUT_PENDING.load(Ordering::Acquire)
-        && ensure_statusbar_layout_inset(env, root).is_some()
+        && ensure_safe_area_layout_insets(env, root).is_some()
     {
         STATUSBAR_LAYOUT_PENDING.store(false, Ordering::Release);
     }
