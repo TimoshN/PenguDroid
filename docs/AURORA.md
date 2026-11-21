@@ -510,6 +510,24 @@ zero. `PENGUDROID_TRACE_NTERP=1` enables recovery diagnostics. Evidence:
 `target/aurora/maxnext-jit-fixed.log`, and
 `target/aurora/maxnext-jit-fixed-repeat.log`.
 
+A controlled Chats-list scroll comparison used the same four 600 ms swipes on
+the device. Interpreter-only execution delivered 30.2 swaps/s with a 34 ms
+median frame gap; JIT delivered 33.2 swaps/s with a 30 ms median gap. JIT also
+kept median touch-to-PresentShm near 31–35 ms. During scrolling RenderThread
+used about 81% of one CPU core, main 56%, and a Mali worker 33%. In the
+presentation part of the frame, glFinish took about 12 ms, full-surface Y-flip
+3.4–3.6 ms, and PresentShm IPC about 1 ms. Raising the requested vsync rate to
+60 Hz, using present-driven compatibility mode, and replacing the blit with
+the existing shader flip did not produce a material FPS increase; those
+experiments were removed. The clean JIT configuration remains at the normal
+request-driven default. Evidence: `target/aurora/maxnext-chat-xint.log`,
+`target/aurora/maxnext-chat-vsync60.log`,
+`target/aurora/maxnext-chat-present-mode.log`,
+`target/aurora/maxnext-chat-shader-flip.log`, and
+`target/aurora/maxnext-chat-thread-cpu.raw`. Swap counts are not claimed as
+unique visual frames; the opt-in content probe confirmed changing pixels but
+its narrow readback strip is not a full-surface visual-FPS meter.
+
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI
 pipeline rendered about 30 FPS. Surplus events left Compose processing stale
