@@ -519,6 +519,27 @@ free-running modes, idle presentation no longer generates an independent vsync
 backlog. Evidence: `target/aurora/maxnext-vsync-present.log` and
 `target/aurora/maxnext-present-auto.log`.
 
+The remaining PIN/static-page stall was later traced to a more fundamental
+LIBGUI interposition bug: gleshim exported `BpDisplayEventConnection::
+requestNextVsync` and `setVsyncRate` as aliases of a Status-only no-op stub.
+Because libgui vtables are preemptible, native scheduling returned success
+without sending `IDisplayEventConnection` request code 3. The hosted request
+implementation now returns a real `binder::Status` and asks the PenguDroid
+broker for a one-shot DisplayEvent directly. This avoids entering an
+IPCThreadState on RenderThread after Hybris EGL has used the colliding Bionic/
+glibc TLS slot. `PENGUDROID_VSYNC_ON_PRESENT=0` is the Aurora default; 1 retains
+the previous present-pulse compatibility mode. On the device the hosted run
+remained alive, PIN digits appeared without a second tap, and disabling the
+very noisy vsync/gleshim traces restored the observed HUD rate from about 3
+to 44 FPS. This verifies rendering and scheduling, not completion of MAX
+authentication. A separate video-backed path can still corrupt an
+`IPCThreadState` and crash in `OneVideoRenderT → flushCommands`; that is not
+solved by the scheduler fix and requires isolating Hybris from ART at a
+process boundary rather than another guest-key workaround.
+Evidence: `target/aurora/maxnext-hosted-request.log`,
+`target/aurora/maxnext-hosted-page-4s.png`, and
+`target/aurora/maxnext-hosted-no-trace.png`.
+
 A later Lipstick remap exposed a recovery case: the process stayed alive but
 the last frame was old and the screen became black because pure on-present
 had no producer to restart the loop. A bounded

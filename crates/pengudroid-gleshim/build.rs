@@ -124,8 +124,30 @@ unsafe fn init_host_gl_forwarders(
          br x16\n\
          .size __pd_hosted_supported_frame_timestamps, .-__pd_hosted_supported_frame_timestamps\n\
          .symver __pd_hosted_supported_frame_timestamps, _ZN7android3gui17BpSurfaceComposer27getSupportedFrameTimestampsEPNSt3__16vectorINS0_10FrameEventENS2_9allocatorIS4_EEEE@@LIBGUI\n\
-         .symver __pd_hosted_supported_frame_timestamps, _ZN7android3gui24BpDisplayEventConnection16requestNextVsyncEv@@LIBGUI\n\
          .symver __pd_hosted_supported_frame_timestamps, _ZN7android3gui24BpDisplayEventConnection12setVsyncRateEi@@LIBGUI\n",
+    );
+    // A real hosted scheduler operation, not the former no-op alias. Avoid
+    // entering RenderThread's IPCThreadState after Hybris EGL has used the
+    // colliding Bionic/glibc TLS slot; the broker still supplies a one-shot
+    // DisplayEvent and HWUI continues through its normal Choreographer path.
+    assembly.push_str(
+        ".globl __pd_hosted_request_next_vsync\n\
+         .type __pd_hosted_request_next_vsync, %function\n\
+         __pd_hosted_request_next_vsync:\n\
+         stp x29, x30, [sp, #-32]!\n\
+         mov x29, sp\n\
+         str x8, [sp, #16]\n\
+         bl __pengudroid_vsync_request\n\
+         bl __pengudroid_status_ctor\n\
+         mov x16, x0\n\
+         ldr x8, [sp, #16]\n\
+         ldp x29, x30, [sp], #32\n\
+         mov x0, x8\n\
+         mov w1, wzr\n\
+         mov w2, wzr\n\
+         br x16\n\
+         .size __pd_hosted_request_next_vsync, .-__pd_hosted_request_next_vsync\n\
+         .symver __pd_hosted_request_next_vsync, _ZN7android3gui24BpDisplayEventConnection16requestNextVsyncEv@@LIBGUI\n",
     );
 
     // Keep one contiguous, writable pointer table. The first label is exposed
@@ -155,7 +177,7 @@ unsafe fn init_host_gl_forwarders(
     let version_path = out.join("gl_forwarders.map");
     std::fs::write(
         &version_path,
-        "LIBGLESV2 { global: __pd_forward_*; };\nLIBGUI { global: __pd_hosted_supported_frame_timestamps; };\n",
+        "LIBGLESV2 { global: __pd_forward_*; };\nLIBGUI { global: __pd_hosted_supported_frame_timestamps; __pd_hosted_request_next_vsync; };\n",
     )
         .expect("write GL version script");
     println!(

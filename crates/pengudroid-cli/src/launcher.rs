@@ -901,11 +901,11 @@ fn apply_aurora_package_env(
     if hybris {
         configure_aurora_hybris_properties();
         if !overridden("PENGUDROID_VSYNC_ON_PRESENT") {
-            // Apply backpressure at the real boundary: one successfully
-            // presented frame produces one following DisplayEvent. A
-            // free-running producer otherwise outpaces Compose and queues
-            // stale frame timelines seconds after the gesture.
-            cmd.env("PENGUDROID_VSYNC_ON_PRESENT", "1");
+            // Hosted IDisplayEventConnection.requestNextVsync is now a real
+            // one-shot scheduler operation. Do not also emit a second pulse
+            // from every present. Setting 1 retains the old recovery/
+            // compatibility behavior as an explicit override.
+            cmd.env("PENGUDROID_VSYNC_ON_PRESENT", "0");
         }
         if !overridden("PENGUDROID_VSYNC_INTERVAL_US") {
             cmd.env("PENGUDROID_VSYNC_INTERVAL_US", "33333");

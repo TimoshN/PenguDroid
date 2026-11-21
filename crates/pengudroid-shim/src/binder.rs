@@ -2332,17 +2332,37 @@ fn send_vsync_impl(enforce_interval: bool) -> Result<(), String> {
 static LAST_PRESENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_INPUT_WAKEUP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Emit the next pulse only after the guest successfully presented a frame.
-/// This is a backpressure boundary: Compose can never accumulate a queue of
-/// free-running pulses faster than it produces real frames.
+/// Hosted `IDisplayEventConnection.requestNextVsync`: return through LIBGUI
+/// after asking our broker for a real one-shot DisplayEvent. This deliberately
+/// avoids RenderThread's IPCThreadState after Hybris EGL has shared its TLS
+/// slot with Android; it does not invalidate views or force a redraw.
+#[no_mangle]
+pub extern "C" fn __pengudroid_vsync_request() {
+    if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
+        unsafe { diag("[binder]   <- hosted display requestNextVsync\n") };
+    }
+    if let Err(error) = send_requested_vsync() {
+        unsafe { diag(&format!("[binder] hosted display request failed: {error}\n")) };
+    }
+}
+
+/// Optional compatibility pulse after a successfully presented frame.
+/// Aurora now defaults to 0: hosted requestNextVsync supplies the one-shot
+/// event, so also sending on present would duplicate every DisplayEvent.
 #[no_mangle]
 pub extern "C" fn __pengudroid_vsync_frame_presented() {
-    if std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT").is_none() {
+    let mode = std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT");
+    if mode.is_none() {
         return;
     }
     LAST_PRESENT_MS.store(monotonic_ms() as u64, Ordering::Relaxed);
     if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
         unsafe { diag("[binder]   <- frame presented\n") };
+    }
+    // Zero selects true one-shot delivery. One retains the previous
+    // present-driven compatibility mode for recovery and regression testing.
+    if mode.as_deref() == Some(std::ffi::OsStr::new("0")) {
+        return;
     }
     if let Err(error) = send_requested_vsync() {
         unsafe { diag(&format!("[binder] on-present vsync failed: {error}\n")) };
