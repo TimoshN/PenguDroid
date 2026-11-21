@@ -552,6 +552,20 @@ pixel-checked without a wake-up tap. Evidence:
 `target/aurora/maxnext-async88-settings-final.png`, and
 `target/aurora/maxnext-async88-chats-static.png`.
 
+Follow-up latency checks used Settings specifically because it has no Chats-like
+background redraw stream. With opt-in content readback (which itself perturbs
+timing), two async/default-30 Hz gestures reached their first changed content
+after 103 ms and 60 ms; the synchronous comparison took 103 ms and 188 ms.
+Android input dispatch itself remained about 1–3 ms. A 60 Hz request timeline
+was slower in this test (184/175 ms), and present-driven mode was decisively
+rejected: it produced 1794 DisplayEventDispatcher errors and an 1892 ms
+content response. Production therefore retains request-driven 30 Hz timing,
+not the 60/120 Hz or present-mode experiments. Evidence:
+`target/aurora/maxnext-settings-async30.log`,
+`target/aurora/maxnext-settings-sync30.log`,
+`target/aurora/maxnext-settings-async60.log`, and
+`target/aurora/maxnext-settings-async-present.log`.
+
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI
 pipeline rendered about 30 FPS. Surplus events left Compose processing stale
