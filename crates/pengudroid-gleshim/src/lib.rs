@@ -478,6 +478,9 @@ extern "C" fn gleshim_init() {
 }
 
 fn hybris_host() -> bool {
+    if std::env::var_os("PENGUDROID_DISABLE_HYBRIS").is_some() {
+        return false;
+    }
     cfg!(target_arch = "aarch64")
         && std::path::Path::new("/usr/lib/libhybris-common.so.1").is_file()
         && std::path::Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file()
@@ -485,6 +488,90 @@ fn hybris_host() -> bool {
 
 fn host() -> Result<&'static Host, String> {
     HOST.get_or_init(Host::load).as_ref().map_err(Clone::clone)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn mapped_elf_base(path: &str) -> Option<usize> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let range = fields.next()?;
+        let _permissions = fields.next()?;
+        let offset = fields.next()?;
+        if offset != "00000000" || !line.ends_with(path) { continue; }
+        let start = range.split('-').next()?;
+        return usize::from_str_radix(start, 16).ok();
+    }
+    None
+}
+
+/// Move Hybris EGL's Bionic TLS key away from guest ART's low glibc keys.
+/// The internal Hybris linker does not expose this DSO through dlmopen, so use
+/// its existing mapping and call the real Bionic pthread functions directly.
+#[cfg(target_arch = "aarch64")]
+fn rekey_hybris_egl() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) { return; }
+    let Some(egl) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libEGL.so") else {
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: internal libEGL mapping is absent");
+        }
+        return;
+    };
+    let Some(bionic) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libc.so") else {
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: Hybris Bionic libc mapping is absent");
+        }
+        return;
+    };
+    type KeyCreate = unsafe extern "C" fn(*mut u32, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
+    type GetSpecific = unsafe extern "C" fn(u32) -> *mut c_void;
+    type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
+    // These offsets are valid only for the verified Aurora Dialog-S Hybris
+    // build. Check the actual mapped instructions before calling or writing.
+    let signatures = [
+        (bionic + 0xbf920, 0xaa1f03eab0002b48u64),
+        (bionic + 0xbfbf0, 0x72b0000852801028u64),
+        (bionic + 0xbfc50, 0x72b0000852801028u64),
+        (egl + 0x1cb40, 0x910003fda9bf7bfdu64),
+    ];
+    if signatures.iter().any(|(address, expected)| unsafe {
+        std::ptr::read_unaligned(*address as *const u64) != *expected
+    }) {
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: Hybris ELF signatures do not match");
+        }
+        return;
+    }
+    let key = (egl + 0x31a40) as *mut u32;
+    let old = unsafe { *key };
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] rekey: egl={egl:#x} bionic={bionic:#x} old key={old}");
+    }
+    if old == u32::MAX { return; }
+    let current = unsafe {
+        let get: GetSpecific = std::mem::transmute(bionic + 0xbfbf0);
+        get(old)
+    };
+    let mut new = 0u32;
+    unsafe {
+        let create: KeyCreate = std::mem::transmute(bionic + 0xbf920);
+        // Bionic encodes the allocation flag in the high bit; the actual TLS
+        // index is in the low 31 bits. Keep EGL above ART's low guest keys.
+        while (new & 0x7fff_ffff) < 16 {
+            if create(&mut new, None) != 0 { return; }
+        }
+        if !current.is_null() {
+            let set: SetSpecific = std::mem::transmute(bionic + 0xbfc50);
+            if set(new, current) != 0 { return; }
+            let _ = set(old, std::ptr::null_mut());
+        }
+        *key = new;
+    }
+    DONE.store(true, Ordering::Relaxed);
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] moved Hybris EGL Bionic TLS key {old} -> {new}");
+    }
 }
 
 /// Publish the hosted SDR configuration before loading Hybris EGL. Loading
@@ -3010,6 +3097,8 @@ pub unsafe extern "C" fn eglInitialize(
     // real configstore over hwbinder from inside this call.
     let _host_call = HostCallGuard::enter();
     let ok = (host.initialize)(dpy, major, minor);
+    #[cfg(target_arch = "aarch64")]
+    if hybris_host() { rekey_hybris_egl(); }
     if ok == EGL_TRUE {
         lock_state().display = dpy as usize;
     }
@@ -3491,6 +3580,8 @@ pub unsafe extern "C" fn eglCreateContext(
         // SAFETY: forwarded verbatim.
         Ok(host) => {
             let context = (host.create_context)(dpy, config, share_context, attribs);
+            #[cfg(target_arch = "aarch64")]
+            if hybris_host() { rekey_hybris_egl(); }
             register_context(context as usize, share_context as usize);
             if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
                 eprintln!("[gleshim] eglCreateContext share={share_context:p} -> {context:p} thread={}", thread_label());
@@ -3552,6 +3643,8 @@ pub unsafe extern "C" fn eglMakeCurrent(
         std::ptr::null_mut(),
         ctx,
     );
+    #[cfg(target_arch = "aarch64")]
+    if hybris_host() { rekey_hybris_egl(); }
     if ok != EGL_TRUE {
         // A failed eglMakeCurrent leaves the previous binding in place.
         return EGL_FALSE;

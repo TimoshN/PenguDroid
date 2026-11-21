@@ -532,10 +532,14 @@ the previous present-pulse compatibility mode. On the device the hosted run
 remained alive, PIN digits appeared without a second tap, and disabling the
 very noisy vsync/gleshim traces restored the observed HUD rate from about 3
 to 44 FPS. This verifies rendering and scheduling, not completion of MAX
-authentication. A separate video-backed path can still corrupt an
-`IPCThreadState` and crash in `OneVideoRenderT → flushCommands`; that is not
-solved by the scheduler fix and requires isolating Hybris from ART at a
-process boundary rather than another guest-key workaround.
+authentication. The related `OneVideoRenderT → flushCommands` crash was the
+same TLS collision. Since Hybris' internal DSO is not visible through the
+wrapper's dlmopen handle, gleshim now finds the existing mappings through
+`/proc/self/maps`, calls the real Bionic pthread functions by their verified
+ELF offsets, and moves only libEGL's key to a separate Bionic slot (masked
+index >= 16), migrating the current thread value. Android's key is unchanged.
+The device accepted key 2 → 0x80000010, reached MAX's main UI and survived a
+clean no-trace relaunch with ongoing frames and no new fatal signal.
 Evidence: `target/aurora/maxnext-hosted-request.log`,
 `target/aurora/maxnext-hosted-page-4s.png`, and
 `target/aurora/maxnext-hosted-no-trace.png`.
