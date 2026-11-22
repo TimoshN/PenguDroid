@@ -603,6 +603,20 @@ context's stale fd. Release 110 retains the 60 Hz reservation pacer and
 repeated Chats gestures stay around 58–60 FPS. Evidence:
 `target/aurora/maxnext-fbo110-final.png`.
 
+Release 111 also fixes an accidentally enabled FPS widget: the launcher used
+to export a non-empty `MANGOHUD_CONFIG` even when the meter was not requested,
+and gleshim treats that configuration as enabling MangoHud. Configuration is
+now exported only for an explicit `PENGUDROID_FPS_METER`/`MANGOHUD` request.
+A device screenshot confirms that the normal launcher no longer draws it.
+Evidence: `target/aurora/maxnext-no-fps111.png`.
+
+A separate release-110 failure was a real ART process exit, not a stalled
+renderer. A tap near the Settings tab was followed by
+`Primitive char conversion on invalid type 3600`, `Runtime aborting`, and a
+SIG11 helper exit on native `Thread-20`; it was not the recovered nterp null
+check. The exact conversion call remains under investigation. Evidence:
+`target/aurora/maxnext-crash110.log`.
+
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI
 pipeline rendered about 30 FPS. Surplus events left Compose processing stale

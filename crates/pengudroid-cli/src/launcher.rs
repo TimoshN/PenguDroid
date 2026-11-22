@@ -661,13 +661,19 @@ pub fn launch(args: &[String]) -> i32 {
                 "PENGUDROID_KEYMAP_PATH",
                 pengudroid_input::keymap::keymap_path(&info.package),
             );
-            // Export MangoHud configuration to the guest runtime when enabled.
+            // Export MangoHud configuration only when the overlay was
+            // explicitly requested. A non-empty MANGOHUD_CONFIG itself enables
+            // the in-frame overlay, so setting it unconditionally enabled the
+            // FPS widget for every production launcher invocation.
+            let fps_requested = std::env::var("PENGUDROID_FPS_METER")
+                .is_ok_and(|v| v == "1" || v == "true")
+                || std::env::var("MANGOHUD").is_ok_and(|v| v == "1" || v == "true");
             if std::env::var_os("MANGOHUD").is_none()
                 && std::env::var("PENGUDROID_FPS_METER").is_ok_and(|v| v == "1" || v == "true")
             {
                 cmd.env("MANGOHUD", "1");
             }
-            if std::env::var_os("MANGOHUD_CONFIG").is_none() {
+            if fps_requested && std::env::var_os("MANGOHUD_CONFIG").is_none() {
                 cmd.env("MANGOHUD_CONFIG", "fps,frametime,gpu_stats,position=top-left");
             }
             // Same for app data: resolved against the host's HOME, before the
