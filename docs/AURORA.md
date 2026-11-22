@@ -591,6 +591,18 @@ clean run stays capped at about 60 with no fatal errors. Evidence:
 `target/aurora/maxnext-pacer103-scroll.log`, and
 `target/aurora/maxnext-pacer103-final.png`.
 
+An experimental wl_surface.frame feedback path and latest-frame cancellation
+were rejected on device: aggressive cancellation starved presentation, and the
+current compositor feedback loop reduced throughput. Cancellation was removed
+so native output buffers remain strictly FIFO. A separate target mismatch was
+fixed: flip selects its read FBO by current GL context/share group, and both
+async and synchronous gralloc present now select the output target by that
+same group and its `flip.last` index rather than the last target in the list.
+This prevents partial HWUI rendering in one context from presenting another
+context's stale fd. Release 110 retains the 60 Hz reservation pacer and
+repeated Chats gestures stay around 58–60 FPS. Evidence:
+`target/aurora/maxnext-fbo110-final.png`.
+
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI
 pipeline rendered about 30 FPS. Surplus events left Compose processing stale

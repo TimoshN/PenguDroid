@@ -2603,10 +2603,14 @@ unsafe fn present_shm(surface: EGLSurface) -> Result<(), String> {
 /// Present the native gralloc allocation through wl_shm. Unlike PresentDmabuf
 /// this needs no compositor dma-buf global; wl_shm accepts any mmap-able fd.
 unsafe fn present_gralloc_shm(surface: EGLSurface) -> Result<(), String> {
+    let host = host()?;
     let rec = &mut *(surface as *mut SurfaceRec);
-    let target = rec.targets.iter().rev().find_map(|target|
-        target.flip.as_ref().map(|flip| &flip.buffers[flip.last].target).or(target.gralloc.as_ref()))
-        .ok_or_else(|| "surface has no gralloc target".to_string())?;
+    let current = host.get_current_context.map(|f| f() as usize).filter(|c| *c != 0)
+        .unwrap_or_else(|| CURRENT_CONTEXT.with(|c| c.get()));
+    let info = context_info(current);
+    let target = rec.targets.iter().rev().find(|target| target.group == info.group)
+        .and_then(|target| target.flip.as_ref().map(|flip| &flip.buffers[flip.last].target).or(target.gralloc.as_ref()))
+        .ok_or_else(|| "surface has no gralloc target for the current context".to_string())?;
     let fd = libc::dup(target.fd);
     if fd < 0 {
         return Err(format!("cannot duplicate gralloc fd: {}", std::io::Error::last_os_error()));
@@ -2782,8 +2786,13 @@ unsafe fn queue_gralloc_async(surface: EGLSurface, host: &Host) -> Result<(), St
         return Err("EGL fence wait/destroy is unavailable".into());
     }
     let rec = &mut *(surface as *mut SurfaceRec);
-    let target = rec.targets.iter().rev().find_map(|target| target.flip.as_ref())
-        .ok_or("surface has no gralloc flip target")?;
+    let current = host.get_current_context.map(|f| f() as usize).filter(|c| *c != 0)
+        .unwrap_or_else(|| CURRENT_CONTEXT.with(|c| c.get()));
+    let info = context_info(current);
+    let target = rec.targets.iter().rev()
+        .find(|target| target.group == info.group)
+        .and_then(|target| target.flip.as_ref())
+        .ok_or("surface has no gralloc flip target for the current context")?;
     if target.buffers.len() < 2 {
         return Err("async double buffering needs two output buffers".into());
     }
