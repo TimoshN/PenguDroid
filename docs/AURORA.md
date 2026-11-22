@@ -578,6 +578,19 @@ Evidence: `target/aurora/maxnext-settings-main91.log`,
 `target/aurora/maxnext-settings-targeted100.log`, and
 `target/aurora/maxnext-final101-settings.png`.
 
+The original swap limiter also let concurrent RenderThreads compute sleeps from
+the same last-call timestamp outside its mutex, so nominal 60 Hz pacing still
+produced about 70 accepted buffers/s. Pacing now reserves monotonically ordered
+frame slots while holding the map lock (`max(now, previous_next) + budget`),
+then sleeps until the caller's reserved slot. Gralloc producers sharing a
+Wayland surface id use one budget even if HWUI replaces its EGLSurface. After
+idle the reservation is immediately due. Release 103 reports 59.5–60.3 FPS in
+the sustained profile and 55.6–60.5 FPS during repeated Chats gestures; the
+clean run stays capped at about 60 with no fatal errors. Evidence:
+`target/aurora/maxnext-pacer103.log`,
+`target/aurora/maxnext-pacer103-scroll.log`, and
+`target/aurora/maxnext-pacer103-final.png`.
+
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI
 pipeline rendered about 30 FPS. Surplus events left Compose processing stale

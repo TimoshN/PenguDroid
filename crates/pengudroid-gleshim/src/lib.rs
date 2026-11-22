@@ -5333,7 +5333,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         let gralloc_presented = presented.is_ok();
         let pace_started = std::time::Instant::now();
         if presented.is_ok() {
-            pace_swap(surface as usize);
+            pace_gralloc_swap(surface);
         }
         let pace_elapsed = pace_started.elapsed();
         let outcome = match presented {
@@ -5471,6 +5471,30 @@ fn micros_to_sleep(last_us: u64, now_us: u64, gap_us: u64) -> u64 {
     }
 }
 
+/// Reserve the next frame slot before releasing the map lock. Concurrent
+/// RenderThreads must not both compute a sleep from the same last-call time:
+/// doing so lets their wakeups interleave inside one vsync interval.
+fn reserve_frame_slot(previous_next: Option<u64>, now_us: u64, gap_us: u64) -> (u64, u64) {
+    let scheduled = previous_next.map(|next| next.max(now_us)).unwrap_or(now_us);
+    let next = scheduled.checked_add(gap_us).unwrap_or(now_us);
+    (scheduled.saturating_sub(now_us), next)
+}
+
+/// Pace all Android EGL windows attached to one Wayland surface together.
+/// HWUI can replace its EGLSurface during navigation; keying the limiter by
+/// that short-lived pointer let their frame budgets add up and produced a
+/// nominal 70 Hz stream with a 60 Hz cap. The daemon surface id is stable and
+/// is also the object on which the visual frame counter is reported.
+fn pace_gralloc_swap(surface: EGLSurface) {
+    let id = unsafe { (*(surface as *const SurfaceRec)).surface_id };
+    let key = if id == 0 {
+        surface as usize
+    } else {
+        usize::MAX - id as usize
+    };
+    pace_swap(key);
+}
+
 /// Cap the guest's swap rate.
 ///
 /// `present_dmabuf` is synchronous — it waits for the daemon's ack — but the
@@ -5510,8 +5534,9 @@ fn pace_swap(surface: usize) {
         // costs at most one frame budget, and the map stays as small as the
         // number of surfaces ever swapped.
         if last.len() > 256 { last.clear(); }
-        let previous = last.insert(surface, now_us);
-        previous.map_or(0, |previous| micros_to_sleep(previous, now_us, gap))
+        let (sleep, next) = reserve_frame_slot(last.get(&surface).copied(), now_us, gap);
+        last.insert(surface, next);
+        sleep
     };
     if sleep > 0 {
         std::thread::sleep(Duration::from_micros(sleep));
@@ -5746,6 +5771,11 @@ mod tests {
         assert_eq!(micros_to_sleep(1_000, 2_000, 16_667), 15_667);
         // u64 underflow must not panic on a huge `last`.
         assert_eq!(micros_to_sleep(u64::MAX, 0, 10), 0);
+        // Concurrent callers reserve different slots instead of both sleeping
+        // against the same timestamp; an idle producer remains immediate.
+        assert_eq!(reserve_frame_slot(None, 10_000, 16_667), (0, 26_667));
+        assert_eq!(reserve_frame_slot(Some(26_667), 11_000, 16_667), (15_667, 43_334));
+        assert_eq!(reserve_frame_slot(Some(26_667), 50_000, 16_667), (0, 66_667));
     }
 
     #[test]
