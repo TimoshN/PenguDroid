@@ -1023,8 +1023,22 @@ const IDEC_STEAL_RECEIVE_CHANNEL: u32 = 1;
 ///
 /// They are kept open for the life of the process: closing the send end would
 /// make the client's `recv` see EOF and tear the `Choreographer` down.
-static VSYNC_SEND_FDS: std::sync::LazyLock<std::sync::Mutex<Vec<RawFd>>> =
+static VSYNC_SEND_FDS: std::sync::LazyLock<std::sync::Mutex<Vec<(u32, RawFd)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+static DISPLAY_EVENT_HANDLES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
+    std::sync::LazyLock::new(Default::default);
+static NEXT_DISPLAY_EVENT_HANDLE: AtomicU32 = AtomicU32::new(0x10000);
+
+fn create_display_event_handle() -> u32 {
+    let handle = NEXT_DISPLAY_EVENT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    DISPLAY_EVENT_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).insert(handle);
+    handle
+}
+
+fn is_display_event_connection(handle: u32) -> bool {
+    handle == handle_for("display_event_connection")
+        || DISPLAY_EVENT_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).contains(&handle)
+}
 
 /// `IWindowManager` transaction code for `openSession`.
 const IWM_OPEN_SESSION: u32 = 4;
@@ -2243,17 +2257,69 @@ fn vsync_event(vsync_time: i64, frame: u32) -> [u8; DISPLAY_EVENT_SIZE] {
 /// and divides the byte count by `sizeof(Event)`, so each `send` has to be
 /// exactly one whole event.
 fn send_vsync() -> Result<(), String> {
-    send_vsync_impl(true)
+    send_vsync_impl(true, None)
 }
 
 /// An explicit DisplayEventConnection request must never be discarded by the
 /// producer's rate limiter. Present-driven mode uses the same event encoder,
 /// but completes only the currently outstanding request.
 fn send_requested_vsync() -> Result<(), String> {
-    send_vsync_impl(false)
+    send_vsync_impl(false, None)
 }
 
-fn send_vsync_impl(enforce_interval: bool) -> Result<(), String> {
+fn send_requested_vsync_to(connection: u32) -> Result<(), String> {
+    static LAST_REQUEST: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, i64>>> =
+        std::sync::LazyLock::new(Default::default);
+    static LAST_SEND: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, i64>>> =
+        std::sync::LazyLock::new(Default::default);
+    static DELAYED: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
+        std::sync::LazyLock::new(Default::default);
+    let now = monotonic_ns();
+    let previous = LAST_REQUEST.lock().unwrap_or_else(|e| e.into_inner())
+        .get(&connection).copied();
+    if let Some(previous) = previous {
+        let elapsed = now.saturating_sub(previous);
+        let minimum = frame_interval_ns() / 2;
+        if elapsed < minimum {
+            // DisplayEventReceiver requests the next event while dispatching
+            // the current one. An immediate answer would recurse as fast as
+            // Binder allows. Delay this request to the next short frame edge,
+            // but never drop it: after idle the first request above is always
+            // immediate, and every duplicate gets its own targeted fallback.
+            let deliver_at = now + minimum - elapsed;
+            let mut delayed = DELAYED.lock().unwrap_or_else(|e| e.into_inner());
+            if delayed.insert(connection) {
+                drop(delayed);
+                std::thread::spawn(move || {
+                    let remaining = deliver_at.saturating_sub(monotonic_ns());
+                    if remaining > 0 {
+                        std::thread::sleep(std::time::Duration::from_nanos(remaining as u64));
+                    }
+                    let covered = LAST_SEND.lock().unwrap_or_else(|e| e.into_inner())
+                        .get(&connection).is_some_and(|sent| *sent >= deliver_at);
+                    if !covered {
+                        if let Err(error) = send_vsync_impl(false, Some(connection)) {
+                            unsafe { diag(&format!("[binder] delayed targeted display request failed: {error}\n")) };
+                        } else {
+                            LAST_SEND.lock().unwrap_or_else(|e| e.into_inner())
+                                .insert(connection, monotonic_ns());
+                        }
+                    }
+                    DELAYED.lock().unwrap_or_else(|e| e.into_inner()).remove(&connection);
+                });
+            }
+            return Ok(());
+        }
+    }
+    LAST_REQUEST.lock().unwrap_or_else(|e| e.into_inner()).insert(connection, now);
+    let result = send_vsync_impl(false, Some(connection));
+    if result.is_ok() {
+        LAST_SEND.lock().unwrap_or_else(|e| e.into_inner()).insert(connection, monotonic_ns());
+    }
+    result
+}
+
+fn send_vsync_impl(enforce_interval: bool, connection: Option<u32>) -> Result<(), String> {
     require_api37()?;
 
     // `Header.timestamp` is the *vsync* time: the moment the frame started. It
@@ -2297,8 +2363,9 @@ fn send_vsync_impl(enforce_interval: bool) -> Result<(), String> {
     let event = vsync_event(vsync_time, frame);
 
     let fds = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
+    let channels = fds.iter().filter(|(owner, _)| connection.is_none_or(|h| *owner == h)).count();
     let mut dropped = 0usize;
-    for fd in fds.iter() {
+    for (_, fd) in fds.iter().filter(|(owner, _)| connection.is_none_or(|h| *owner == h)) {
         // SAFETY: `event` is a valid buffer and `fd` is a socket we own.
         // `MSG_DONTWAIT` keeps a client that stopped reading from blocking the
         // frame clock; a full socket just drops the pulse.
@@ -2322,7 +2389,7 @@ fn send_vsync_impl(enforce_interval: bool) -> Result<(), String> {
         unsafe {
             diag(&format!(
                 "[binder]   -> vsync frame {frame} ts={vsync_time} dropped={dropped} channels={}\n",
-                fds.len()
+                channels
             ))
         };
     }
@@ -2337,7 +2404,7 @@ static LAST_INPUT_WAKEUP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// avoids RenderThread's IPCThreadState after Hybris EGL has shared its TLS
 /// slot with Android; it does not invalidate views or force a redraw.
 #[no_mangle]
-pub extern "C" fn __pengudroid_vsync_request() {
+pub extern "C" fn __pengudroid_vsync_request(_connection: usize) {
     if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
         unsafe { diag("[binder]   <- hosted display requestNextVsync\n") };
     }
@@ -2394,36 +2461,11 @@ pub extern "C" fn __pengudroid_vsync_input_wakeup() {
     }
 }
 
-/// Start the configured-rate frame clock, once per process.
-///
-/// A real compositor emits vsync continuously; the app's `Choreographer` only
-/// asks for the *next* pulse, so answering just that one request leaves the
-/// frame loop stalled as soon as a traversal is skipped. A steady clock is also
-/// what Roblox's engine expects once it starts drawing.
-fn start_frame_clock() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        std::thread::spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_micros((frame_interval_ns() / 1_000) as u64));
-            if !VSYNC_SEND_FDS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-            {
-                if let Err(error) = send_vsync() {
-                    unsafe { diag(&format!("[binder] frame clock stopped: {error}\n")) };
-                    break;
-                }
-            }
-        });
-    });
-}
-
 /// Create the socket pair behind a `BitTube`.
 ///
 /// `BitTube` is an `AF_UNIX` `SOCK_SEQPACKET` pair; the client keeps the receive
 /// end and the broker keeps the send end so it can deliver vsync events later.
-fn vsync_channel() -> Option<(RawFd, RawFd)> {
+fn vsync_channel(connection: u32) -> Option<(RawFd, RawFd)> {
     let mut fds = [0 as RawFd; 2];
     // SAFETY: `fds` is a valid two-element array for `socketpair` to fill.
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) } != 0 {
@@ -2449,9 +2491,9 @@ fn vsync_channel() -> Option<(RawFd, RawFd)> {
     let ours0 = unsafe { libc::dup(fds[0]) };
     {
         let mut fds_lock = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
-        fds_lock.push(ours);
+        fds_lock.push((connection, ours));
         if ours0 >= 0 {
-            fds_lock.push(ours0);
+            fds_lock.push((connection, ours0));
         }
     }
     Some((fds[0], fds[1]))
@@ -2534,6 +2576,9 @@ fn parcel_contains_string16(data: &[u8], value: &str) -> bool {
 
 /// Reverse lookup of a handle, for diagnostics and service aliases.
 fn name_for_handle(handle: u32) -> Option<String> {
+    if DISPLAY_EVENT_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).contains(&handle) {
+        return Some("display_event_connection".into());
+    }
     let map = SERVICE_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
     map.iter().find(|(_, h)| **h == handle).map(|(n, _)| n.clone())
 }
@@ -3138,7 +3183,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
         parcel.extend_from_slice(&0u32.to_ne_bytes()); // AIDL Status
         match tr.code {
-            ISC_CREATE_DISPLAY_EVENT_CONNECTION => push_flat_handle(&mut parcel, &mut objects, handle_for("display_event_connection")),
+            ISC_CREATE_DISPLAY_EVENT_CONNECTION => push_flat_handle(&mut parcel, &mut objects, create_display_event_handle()),
             ISC_CREATE_CONNECTION => push_flat_handle(&mut parcel, &mut objects, handle_for("surface_composer_client")),
             ISC_GET_PHYSICAL_DISPLAY_IDS => { // one hosted display
                 parcel.extend_from_slice(&1i32.to_ne_bytes());
@@ -3946,7 +3991,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
 
-    if tr.target_handle == handle_for("display_event_connection") {
+    if is_display_event_connection(tr.target_handle) {
         if let Err(error) = require_api37() {
             return Reply::unknown_transaction(tr, &error);
         }
@@ -3956,7 +4001,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             return Reply::unknown_transaction(tr, "unimplemented IDisplayEventConnection method");
         }
     }
-    if tr.target_handle == handle_for("display_event_connection")
+    if is_display_event_connection(tr.target_handle)
         && tr.code == IDEC_STEAL_RECEIVE_CHANNEL
     {
         // `[present=1][BitTube]` — the status word was already written above.
@@ -3966,13 +4011,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // and reads it back here, so it is part of the wire format even though
         // `BitTube` itself only serialises two descriptors.
         parcel.extend_from_slice(&1u32.to_ne_bytes());
-        match vsync_channel() {
+        match vsync_channel(tr.target_handle) {
             Some((recv, send)) => {
                 push_flat_fd(&mut parcel, &mut objects, recv);
                 push_flat_fd(&mut parcel, &mut objects, send);
-                if std::env::var_os("PENGUDROID_VSYNC_ON_PRESENT").is_none() {
-                    start_frame_clock();
-                }
                 if trace_enabled() {
                     diag(&format!("[binder]   -> BitTube fds {recv},{send}\n"));
                 }
@@ -3986,7 +4028,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
-    if tr.target_handle == handle_for("display_event_connection")
+    if is_display_event_connection(tr.target_handle)
         && tr.code == IDEC_GET_LATEST_VSYNC_EVENT_DATA
     {
         // `VsyncEventData` wire layout, from `ParcelableVsyncEventData::
@@ -4009,7 +4051,14 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag(&format!("[binder]   -> VsyncEventData deadline={deadline}\n"));
         }
     }
-    if tr.target_handle == handle_for("display_event_connection") {
+    if is_display_event_connection(tr.target_handle)
+        && tr.code == IDEC_REQUEST_NEXT_VSYNC
+    {
+        if let Err(error) = send_requested_vsync_to(tr.target_handle) {
+            unsafe { diag(&format!("[binder] targeted display request failed: {error}\n")) };
+        }
+    }
+    if is_display_event_connection(tr.target_handle) {
         // Only the measured setVsyncRate/requestNextVsync operations are known.
         // Other methods must not receive a fabricated empty success reply.
         if tr.code != IDEC_STEAL_RECEIVE_CHANNEL && tr.code != IDEC_GET_LATEST_VSYNC_EVENT_DATA {
@@ -4019,15 +4068,13 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
                 unsafe { diag(&format!("[binder]   <- display event code={}\n", tr.code)) };
             }
-            if tr.code == IDEC_REQUEST_NEXT_VSYNC {
-                // Never discard the explicit request just because a present
-                // pulse was sent in the same half-interval.
-                if let Err(error) = send_requested_vsync() {
+            if tr.code != IDEC_REQUEST_NEXT_VSYNC {
+                if let Err(error) = send_vsync() {
                     return Reply::unknown_transaction(tr, &error);
                 }
-            } else if let Err(error) = send_vsync() {
-                return Reply::unknown_transaction(tr, &error);
             }
+            // requestNextVsync was already answered through its unique target
+            // handle above; never repeat it as a broadcast here.
         }
     }
     if tr.target_handle == handle_for("window") && tr.code == IWM_OPEN_SESSION {
@@ -5856,7 +5903,14 @@ mod tests {
             for (code, result) in [(2, "display_event_connection"),
                 (3, "surface_composer_client"), (7, "display_token")] {
                 assert!(reply_has_status(target, code));
-                assert_handle_reply(unsafe { make_reply(&transaction(target, code, &data), 1) }, result);
+                let reply = unsafe { make_reply(&transaction(target, code, &data), 1) };
+                if code == 2 {
+                    let handle = u32::from_ne_bytes(reply.parcel[12..16].try_into().unwrap());
+                    assert_ne!(handle, handle_for("display_event_connection"));
+                    assert!(is_display_event_connection(handle));
+                } else {
+                    assert_handle_reply(reply, result);
+                }
             }
             let reply = unsafe { make_reply(&transaction(target, 6, &data), 1) };
             assert_eq!(reply.flags, 0);

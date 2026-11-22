@@ -4879,6 +4879,14 @@ fn spawn_input_pump(env: &JniEnv) {
         }
         type Poll = unsafe extern "C" fn(*mut u8) -> i32;
         let poll: Poll = unsafe { std::mem::transmute(sym) };
+        let wait_sym = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                b"pengudroid_input_wait\0".as_ptr() as *const libc::c_char,
+            )
+        };
+        type Wait = unsafe extern "C" fn(u32);
+        let wait: Option<Wait> = (!wait_sym.is_null()).then(|| unsafe { std::mem::transmute(wait_sym) });
         let Some(env) = attach_current_thread(vm) else {
             eprintln!("apphost: input pump: cannot attach the thread");
             return;
@@ -5448,7 +5456,7 @@ fn spawn_input_pump(env: &JniEnv) {
         let mut drain_kernel_touches = || {
             let (sw, sh) = (surface_w().max(1) as f32, surface_h().max(1) as f32);
             for (reader_index, (reader, _is_virtual)) in kernel_touch_readers.iter_mut().enumerate() {
-                let Ok(events) = reader.drain() else { continue };
+                let Ok(events) = reader.drain_coalesced() else { continue };
                 for kev in events {
                     let id = match kev.phase {
                         pengudroid_input::KernelTouchPhase::Down => {
@@ -5730,7 +5738,11 @@ fn spawn_input_pump(env: &JniEnv) {
                         );
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(8));
+                if let Some(wait) = wait {
+                    unsafe { wait(2) };
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
                 continue;
             }
             let Some(_local_frame) = env.local_frame(64) else {

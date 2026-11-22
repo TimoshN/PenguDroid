@@ -553,18 +553,30 @@ pixel-checked without a wake-up tap. Evidence:
 `target/aurora/maxnext-async88-chats-static.png`.
 
 Follow-up latency checks used Settings specifically because it has no Chats-like
-background redraw stream. With opt-in content readback (which itself perturbs
-timing), two async/default-30 Hz gestures reached their first changed content
-after 103 ms and 60 ms; the synchronous comparison took 103 ms and 188 ms.
-Android input dispatch itself remained about 1–3 ms. A 60 Hz request timeline
-was slower in this test (184/175 ms), and present-driven mode was decisively
-rejected: it produced 1794 DisplayEventDispatcher errors and an 1892 ms
-content response. Production therefore retains request-driven 30 Hz timing,
-not the 60/120 Hz or present-mode experiments. Evidence:
-`target/aurora/maxnext-settings-async30.log`,
-`target/aurora/maxnext-settings-sync30.log`,
-`target/aurora/maxnext-settings-async60.log`, and
-`target/aurora/maxnext-settings-async-present.log`.
+background redraw stream. A main-Looper marker showed that the background
+pump's dispatchInputEvent return only posts MSG_DISPATCH_INPUT_EVENT; actual
+View/Compose processing happens later on main. Early messages took 2–10 ms,
+while individual MOVE messages could wait 40–84 ms during rendering. Kernel
+SYN_REPORT samples were not batched by Android's native receiver: each became
+a separate Handler message. The input pump now coalesces only accumulated MOVE
+samples per slot while preserving DOWN/UP order, and uses a VecDeque plus a
+Condvar wakeup instead of remove(0) plus an 8 ms empty-queue sleep.
+
+The larger remaining scheduler defect was in the broker: explicit one-shot
+requests were broadcast to every BitTube, while a free-running frame clock was
+also active. This produced request/broadcast feedback loops. Each
+createDisplayEventConnection now returns a unique Binder handle, the hosted
+requestNextVsync override is removed, and the real transaction answers only
+its own channel. The first request after idle is immediate. A request arriving
+inside half a frame interval gets a guaranteed delayed targeted event rather
+than being dropped; a newer sent event covers it. There is no production
+free-running timer. Present-driven compatibility and 120 Hz experiments were
+rejected; MAX currently uses 16666 us with async presentation. Clean release
+101 survived idle → Settings and repeated gestures without fatal errors.
+Evidence: `target/aurora/maxnext-settings-main91.log`,
+`target/aurora/maxnext-settings-targeted99.log`,
+`target/aurora/maxnext-settings-targeted100.log`, and
+`target/aurora/maxnext-final101-settings.png`.
 
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI

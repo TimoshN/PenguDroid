@@ -1048,6 +1048,13 @@ impl KernelTouchReader {
         }
     }
 
+    /// Drain complete SYN_REPORT samples and coalesce motion accumulated while
+    /// the Android main thread was busy. DOWN/UP boundaries remain ordered;
+    /// only the newest MOVE per slot in each contiguous motion run survives.
+    pub fn drain_coalesced(&mut self) -> io::Result<Vec<KernelTouchEvent>> {
+        self.drain().map(coalesce_kernel_motion)
+    }
+
     pub fn drain(&mut self) -> io::Result<Vec<KernelTouchEvent>> {
         use std::io::Read;
         let mut out = Vec::new();
@@ -1066,9 +1073,56 @@ impl KernelTouchReader {
     }
 }
 
+fn coalesce_kernel_motion(events: Vec<KernelTouchEvent>) -> Vec<KernelTouchEvent> {
+    let mut out = Vec::with_capacity(events.len());
+    let mut pending: Vec<KernelTouchEvent> = Vec::new();
+    let flush = |out: &mut Vec<KernelTouchEvent>, pending: &mut Vec<KernelTouchEvent>| {
+        out.append(pending);
+    };
+    for event in events {
+        if event.phase == KernelTouchPhase::Move {
+            if let Some(old) = pending.iter_mut().find(|old| old.slot == event.slot) {
+                *old = event;
+            } else {
+                pending.push(event);
+            }
+        } else {
+            flush(&mut out, &mut pending);
+            out.push(event);
+        }
+    }
+    flush(&mut out, &mut pending);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_motion_coalesces_without_reordering_gesture_boundaries() {
+        let event = |slot, phase, x| KernelTouchEvent {
+            slot, phase, norm_x: x, norm_y: 0.5,
+        };
+        let input = vec![
+            event(0, KernelTouchPhase::Down, 0.0),
+            event(0, KernelTouchPhase::Move, 0.1),
+            event(0, KernelTouchPhase::Move, 0.2),
+            event(1, KernelTouchPhase::Move, 0.3),
+            event(0, KernelTouchPhase::Move, 0.4),
+            event(1, KernelTouchPhase::Up, 0.5),
+            event(0, KernelTouchPhase::Move, 0.6),
+            event(0, KernelTouchPhase::Up, 0.7),
+        ];
+        assert_eq!(coalesce_kernel_motion(input), vec![
+            event(0, KernelTouchPhase::Down, 0.0),
+            event(0, KernelTouchPhase::Move, 0.4),
+            event(1, KernelTouchPhase::Move, 0.3),
+            event(1, KernelTouchPhase::Up, 0.5),
+            event(0, KernelTouchPhase::Move, 0.6),
+            event(0, KernelTouchPhase::Up, 0.7),
+        ]);
+    }
 
     #[test]
     fn idle_input_timeout_and_repeat_filtering_allow_mapper_shutdown() {

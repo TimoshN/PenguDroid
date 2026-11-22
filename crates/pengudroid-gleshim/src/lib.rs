@@ -1915,7 +1915,9 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
 }
 
 /// Input events forwarded by the daemon, waiting for the host to pick them up.
-static INPUT_QUEUE: Mutex<Vec<(u32, pengudroid_proto::InputKind)>> = Mutex::new(Vec::new());
+static INPUT_QUEUE: Mutex<std::collections::VecDeque<(u32, pengudroid_proto::InputKind)>> =
+    Mutex::new(std::collections::VecDeque::new());
+static INPUT_AVAILABLE: Condvar = Condvar::new();
 
 #[derive(Clone, Copy)]
 struct TouchDebugState {
@@ -2137,7 +2139,8 @@ static TEXT_INPUT_QUEUE: Mutex<std::collections::VecDeque<String>> =
 #[no_mangle]
 pub extern "C" fn pengudroid_input_inject_key(keycode: u32, pressed: i32) {
     INPUT_QUEUE.lock().unwrap_or_else(|e| e.into_inner())
-        .push((0, pengudroid_proto::InputKind::Key { keycode, pressed: pressed != 0 }));
+        .push_back((0, pengudroid_proto::InputKind::Key { keycode, pressed: pressed != 0 }));
+    INPUT_AVAILABLE.notify_one();
 }
 
 /// Subscribe to the compositor's input for `surface_id` on a second connection.
@@ -2199,7 +2202,24 @@ fn subscribe_input(surface_id: u32) {
                     }
                     let mut q = INPUT_QUEUE.lock().unwrap();
                     if q.len() < 256 {
-                        q.push((surface_id, event));
+                        // Wayland pointer motion is coalesced only when it is
+                        // the newest queued event; enter/button/up boundaries
+                        // remain ordered. Hardware evdev is coalesced in its
+                        // own SYN_REPORT drain before Android dispatch.
+                        if let Some((last_surface, last_event)) = q.back_mut() {
+                            if *last_surface == surface_id
+                                && matches!(last_event, pengudroid_proto::InputKind::PointerMotion { .. })
+                                && matches!(&event, pengudroid_proto::InputKind::PointerMotion { .. })
+                            {
+                                *last_event = event;
+                            } else {
+                                q.push_back((surface_id, event));
+                            }
+                        } else {
+                            q.push_back((surface_id, event));
+                        }
+                        drop(q);
+                        INPUT_AVAILABLE.notify_one();
                     }
                 }
                 Ok((other, fds)) => {
@@ -2301,6 +2321,18 @@ pub extern "C" fn pengudroid_pointer_lock(locked: i32) -> i32 {
     }
 }
 
+/// Wake the input pump as soon as a reader thread queues an event. The timeout
+/// still lets the same loop poll non-blocking hardware evdev and gamepads.
+#[no_mangle]
+pub extern "C" fn pengudroid_input_wait(timeout_ms: u32) {
+    let queue = INPUT_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.is_empty() {
+        let _ = INPUT_AVAILABLE.wait_timeout(
+            queue, Duration::from_millis(timeout_ms as u64),
+        ).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 /// Pop one queued input event into `out`.
 ///
 /// Layout (all little-endian, 16 bytes): `[u32 surface_id][u32 kind]
@@ -2318,7 +2350,7 @@ pub unsafe extern "C" fn pengudroid_input_poll(out: *mut u8) -> i32 {
         if q.is_empty() {
             return 0;
         }
-        q.remove(0)
+        q.pop_front().unwrap()
     };
     let (surface_id, kind) = event;
     if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
