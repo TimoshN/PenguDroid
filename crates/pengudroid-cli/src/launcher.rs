@@ -637,7 +637,7 @@ pub fn launch(args: &[String]) -> i32 {
                         );
                     }
                     cmd.env("PENGUDROID_SURFACE_ID", id.to_string());
-                    Some(client)
+                    Some((client, id, output_size))
                 }
                 Err(error) => {
                     eprintln!("pengudroid launch: loading surface unavailable: {error}");
@@ -776,7 +776,31 @@ pub fn launch(args: &[String]) -> i32 {
             if let Some(dir) = asset_root(&app_path, &prefix, &split_paths) {
                 cmd.current_dir(dir);
             }
-            run_child(cmd)
+            let status = run_child(cmd);
+            finish_art_application(status, &_loading_surface);
+            status
+        }
+    }
+}
+
+/// ART owns the Android lifecycle. Once it exits, do not leave the early
+/// Wayland surface (or a last black buffer) looking like a live application.
+/// Standalone Aurora packages own their daemon, so terminate that process too;
+/// on a regular shared desktop daemon only this application's surface is
+/// destroyed.
+fn finish_art_application(
+    status: i32,
+    loading_surface: &Option<(crate::Client, u32, (u32, u32))>,
+) {
+    eprintln!("pengudroid launch: ART exited; closing the application (status {status})");
+    let Some((client, surface_id, _)) = loading_surface else { return };
+    if let Err(error) = client.request(&pengudroid_proto::Message::DestroySurface { surface_id: *surface_id }) {
+        eprintln!("pengudroid launch: cannot destroy ART surface: {error}");
+        return;
+    }
+    if aurora_package_data_dir().is_some() {
+        if let Err(error) = crate::client::stop() {
+            eprintln!("pengudroid launch: cannot stop application daemon: {error}");
         }
     }
 }

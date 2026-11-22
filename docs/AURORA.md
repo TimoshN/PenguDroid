@@ -617,6 +617,14 @@ SIG11 helper exit on native `Thread-20`; it was not the recovered nterp null
 check. The exact conversion call remains under investigation. Evidence:
 `target/aurora/maxnext-crash110.log`.
 
+Release 112 makes every ART exit terminate the complete standalone
+application lifecycle. The launcher explicitly destroys the early/Wayland
+surface, stops its package-owned daemon, and preserves a non-zero status for
+an abnormal ART exit instead of leaving a black desktop window. A device test
+terminated ART with SIGTERM: ART, daemon, and Firejail all disappeared and
+Lipstick returned to the home screen. Evidence:
+`target/aurora/maxnext-exit112-after.png`; 118 CLI tests passed.
+
 The larger scroll-latency root cause was the vsync producer/consumer mismatch:
 the broker emitted free-running 60 Hz DisplayEvents while the hosted HWUI
 pipeline rendered about 30 FPS. Surplus events left Compose processing stale
