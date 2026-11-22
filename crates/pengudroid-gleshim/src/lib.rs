@@ -904,6 +904,9 @@ struct SurfaceRec {
     surface_id: u32,
     /// Only surfaces created here may be destroyed here; injected ids are borrowed.
     owns_surface: bool,
+    native_window: usize,
+    layer_resolved: bool,
+    child_of_early: bool,
 }
 
 struct GrallocTarget {
@@ -1824,8 +1827,55 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
         st.conn = Some(conn);
     }
 
-    if let Ok(value) = std::env::var("PENGUDROID_SURFACE_ID") {
-        if let Ok(id) = value.trim().parse::<u32>() {
+    if env_truthy("PENGUDROID_ANDROID_LAYERS") && !rec.layer_resolved && rec.native_window != 0 {
+        rec.layer_resolved = true;
+        let native_window = rec.native_window as u64;
+        let query = |native_window| -> Result<Message, String> {
+            let conn = st.conn.as_ref().ok_or("daemon is unavailable")?;
+            conn.send_message(&Message::ResolveWindowLayer { native_window }, &[])
+                .map_err(|e| e.to_string())?;
+            let (reply, fds) = conn.recv_message().map_err(|e| e.to_string())?;
+            close_fds(&fds);
+            Ok(reply)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let mut result;
+        loop {
+            result = query(native_window);
+            // Android 17's Surface.mNativeObject addresses the containing native
+            // Surface; HWUI passes the ANativeWindow base 16 bytes into it. This
+            // is only a metadata-key fallback, never a pointer dereference.
+            if native_window >= 16 && matches!(&result,
+                Ok(Message::WindowLayer { window_type: 0, .. }))
+            {
+                result = query(native_window - 16);
+            }
+            let pending = matches!(&result, Ok(Message::WindowLayer { window_type: 0, .. }));
+            if !pending || std::time::Instant::now() >= deadline { break; }
+            // The main Looper remains free to finish traversal and publish the
+            // real ViewRoot metadata. Never spin a free-running frame producer.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match result {
+            Ok(Message::WindowLayer { window_type, visible, root_id, .. }) => {
+                eprintln!("[gleshim] Android layer native={native_window:#x} root={root_id} type={window_type} visible={visible}");
+                if window_type > 1 && visible {
+                    rec.child_of_early = true;
+                    rec.surface_id = 0;
+                }
+            }
+            Ok(other) => return Err(format!("unexpected WindowLayer reply: {other:?}")),
+            Err(error) => {
+                st.conn = None;
+                st.connect_attempted = false;
+                return Err(format!("ResolveWindowLayer failed: {error}"));
+            }
+        }
+    }
+
+    if rec.surface_id != 0 {
+        let id = rec.surface_id;
+        {
             rec.surface_id = id;
             // The launcher may have created an early loading surface. Attach
             // input and preferences just as for a guest-created surface.
@@ -1846,10 +1896,21 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
     }
 
     let (w, h) = (rec.w, rec.h);
-    let request = Message::CreateSurface {
-        width: w,
-        height: h,
-        title: std::env::var("PENGUDROID_APP_LABEL").unwrap_or_else(|_| "PenguDroid".into()),
+    let request = if rec.child_of_early {
+        Message::CreateSubsurface {
+            parent_pid: std::process::id() as i32,
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+            native_window: rec.native_window as u64,
+        }
+    } else {
+        Message::CreateSurface {
+            width: w,
+            height: h,
+            title: std::env::var("PENGUDROID_APP_LABEL").unwrap_or_else(|_| "PenguDroid".into()),
+        }
     };
     let send_result = match st.conn.as_ref() {
         Some(conn) => conn.send_message(&request, &[]),
@@ -1875,7 +1936,8 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
     };
     close_fds(&fds);
     match reply {
-        Message::SurfaceCreated { surface_id, .. } => {
+        Message::SurfaceCreated { surface_id, .. }
+        | Message::SubsurfaceCreated { surface_id } => {
             rec.surface_id = surface_id;
             rec.owns_surface = true;
             // The host's resize follower lives in this same process and has to
@@ -1885,7 +1947,9 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
             // writing it here would alias a game's second window onto its first.
             // The newest window wins because that is the one that stays: a game
             // creates a splash surface and destroys it when the real one appears.
-            std::env::set_var("PENGUDROID_LAST_SURFACE_ID", surface_id.to_string());
+            if !rec.child_of_early {
+                std::env::set_var("PENGUDROID_LAST_SURFACE_ID", surface_id.to_string());
+            }
             if let Some(conn) = st.conn.as_ref() {
                 let fps_meter = mangohud_enabled();
                 if let Err(e) = conn.send_message(&Message::SetSurfaceOptions { surface_id, fps_meter }, &[]) {
@@ -1904,7 +1968,7 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
                 close_fds(&fds);
                 if let Message::Error { message, .. } = reply { return Err(message); }
             }
-            subscribe_input(surface_id);
+            if !rec.child_of_early { subscribe_input(surface_id); }
             Ok(surface_id)
         }
         Message::Error { code, message } => Err(format!(
@@ -4363,6 +4427,9 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
         targets: Vec::new(),
         surface_id: early_surface.unwrap_or(0),
         owns_surface: false,
+        native_window: native_window as usize,
+        layer_resolved: false,
+        child_of_early: false,
     });
     let surface = Box::into_raw(rec) as EGLSurface;
     live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).insert(surface as usize);
@@ -4455,7 +4522,10 @@ pub unsafe extern "C" fn eglCreatePbufferSurface(
             }
         }
     }
-    let rec = Box::new(SurfaceRec { w, h, targets: Vec::new(), surface_id: 0, owns_surface: false });
+    let rec = Box::new(SurfaceRec {
+        w, h, targets: Vec::new(), surface_id: 0, owns_surface: false,
+        native_window: 0, layer_resolved: true, child_of_early: false,
+    });
     let surface = Box::into_raw(rec) as EGLSurface;
     live_surfaces().lock().unwrap_or_else(|e| e.into_inner()).insert(surface as usize);
     surface

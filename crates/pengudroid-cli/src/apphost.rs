@@ -3743,6 +3743,7 @@ pub fn loop_forever(env: &JniEnv) {
         drain_activity_requests(env, &mut scratch);
         webview::probe_tick(env);
         attach_new_windows(env);
+        register_window_layers(env);
         apply_deferred_window_updates(env);
         drain_ime_text_events(env);
         match env.call_static_boolean(
@@ -8831,6 +8832,99 @@ fn attach_new_windows(env: &JniEnv) {
     })();
 }
 
+/// Publish real ViewRoot/Surface identities for gleshim. This observer runs on
+/// the main Looper, so type/visibility and Surface.mNativeObject are read at
+/// Android's ownership boundary rather than guessed from EGL creation order.
+fn register_window_layers(env: &JniEnv) {
+    use std::collections::HashMap;
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static REGISTERED: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, (u64, i32, bool)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(50)) { return; }
+        *last = Some(std::time::Instant::now());
+    }
+    fn send(message: pengudroid_proto::Message) -> bool {
+        static CLIENT: std::sync::OnceLock<std::sync::Mutex<Option<crate::Client>>> =
+            std::sync::OnceLock::new();
+        let mut slot = CLIENT.get_or_init(|| std::sync::Mutex::new(None))
+            .lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let Ok(client) = crate::Client::connect() else { return false };
+            if client.handshake(pengudroid_proto::Role::Guest).is_err() { return false; }
+            *slot = Some(client);
+        }
+        let result = slot.as_ref().unwrap().request(&message);
+        if result.is_err() { *slot = None; }
+        result.is_ok()
+    }
+    let _ = (|| -> Option<()> {
+        let _frame = env.local_frame(128)?;
+        let wmg_class = env.find_class("android/view/WindowManagerGlobal")?;
+        let get_instance = env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;")?;
+        let wmg = env.call_static_object(wmg_class, get_instance, &[])?;
+        let roots = env.object_field(wmg, env.field_id(wmg_class, "mRoots", "Ljava/util/ArrayList;")?);
+        let list_class = env.find_class("java/util/ArrayList")?;
+        let size = env.method_id(list_class, "size", "()I")?;
+        let get = env.method_id(list_class, "get", "(I)Ljava/lang/Object;")?;
+        let root_class = env.find_class("android/view/ViewRootImpl")?;
+        let params_field = env.field_id(root_class, "mWindowAttributes", "Landroid/view/WindowManager$LayoutParams;")?;
+        let surface_field = env.field_id(root_class, "mSurface", "Landroid/view/Surface;")?;
+        let added = env.field_id(root_class, "mAdded", "Z")?;
+        let stopped = env.field_id(root_class, "mStopped", "Z")?;
+        let view_field = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+        let params_class = env.find_class("android/view/WindowManager$LayoutParams")?;
+        let type_field = env.field_id(params_class, "type", "I")?;
+        let surface_class = env.find_class("android/view/Surface")?;
+        let native_field = env.field_id(surface_class, "mNativeObject", "J")?;
+        let view_class = env.find_class("android/view/View")?;
+        let visibility = env.method_id(view_class, "getVisibility", "()I")?;
+        let system = env.find_class("java/lang/System")?;
+        let identity = env.static_method_id(system, "identityHashCode", "(Ljava/lang/Object;)I")?;
+        let mut current = Vec::new();
+        for i in 0..env.call_int(roots, size, &[])? {
+            let Some(root) = env.call_object(roots, get, &[JValue { i }]) else { continue };
+            if root.is_null() { continue; }
+            let surface = env.object_field(root, surface_field);
+            if surface.is_null() { continue; }
+            let native = env.long_field(surface, native_field) as u64;
+            if native == 0 { continue; }
+            let params = env.object_field(root, params_field);
+            if params.is_null() { continue; }
+            let window_type = env.int_field(params, type_field);
+            let view = env.object_field(root, view_field);
+            let visible = env.boolean_field(root, added) && !env.boolean_field(root, stopped)
+                && !view.is_null() && env.call_int(view, visibility, &[]) == Some(0);
+            let root_id = env.call_static_int(system, identity, &[JValue { l: root }]).unwrap_or(0) as u32 as u64;
+            current.push((native, root_id, window_type, visible));
+        }
+        let mut registered = REGISTERED.lock().unwrap_or_else(|e| e.into_inner());
+        for &(native, root_id, window_type, visible) in &current {
+            if registered.get(&native) == Some(&(root_id, window_type, visible)) { continue; }
+            if send(pengudroid_proto::Message::RegisterWindowLayer {
+                native_window: native, root_id, window_type, visible,
+            }) {
+                println!("apphost: layer native={native:#x} root={root_id} type={window_type} visible={visible}");
+                registered.insert(native, (root_id, window_type, visible));
+            }
+        }
+        let retired: Vec<_> = registered.keys().copied()
+            .filter(|native| !current.iter().any(|(n, ..)| n == native)).collect();
+        for native in retired {
+            if let Some((root_id, window_type, _)) = registered.get(&native).copied() {
+                if send(pengudroid_proto::Message::RegisterWindowLayer {
+                    native_window: native, root_id, window_type, visible: false,
+                }) {
+                    println!("apphost: layer native={native:#x} root={root_id} retired");
+                }
+            }
+            registered.remove(&native);
+        }
+        Some(())
+    })();
+}
+
 /// What the window manager does for a window that is added: make it visible,
 /// give it a valid surface and a frame, and schedule its first traversal.
 /// Activities get this on resume; dialogs and popups added later get it from
@@ -8926,6 +9020,25 @@ fn surface_window(env: &JniEnv, root_class: JClass, root: JObject, index: usize)
     // first traversal never completes and mFirst/drawingTime never change.
     if let Some(field) = env.field_id(root_class, "mViewVisibility", "I") {
         env.set_int_field(root, field, 0);
+    }
+    // A window added without WindowManager can also retain GONE in AttachInfo
+    // even after its View and app are visible; performTraversals then never
+    // reaches HWUI and no EGL surface is created at all.
+    if let Some(attach_field) = env.field_id(root_class, "mAttachInfo", "Landroid/view/View$AttachInfo;") {
+        let attach = env.object_field(root, attach_field);
+        if !attach.is_null() {
+            if let Some(attach_class) = env.find_class("android/view/View$AttachInfo") {
+                if let Some(field) = env.field_id(attach_class, "mWindowVisibility", "I") {
+                    env.set_int_field(attach, field, 0);
+                }
+            }
+        }
+    }
+    // This root may already have attempted its first traversal while it had no
+    // Surface. Recreate the first-traversal contract so ThreadedRenderer is
+    // initialized instead of remaining disabled with mFirst=false.
+    if let Some(field) = env.field_id(root_class, "mFirst", "Z") {
+        env.set_boolean_field(root, field, true);
     }
     if let Some(field) = env.field_id(root_class, "mFullRedrawNeeded", "Z") {
         env.set_boolean_field(root, field, true);

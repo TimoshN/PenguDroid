@@ -53,6 +53,15 @@ const GUEST_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// daemon.
 const INBOX_POLL: Duration = Duration::from_millis(5);
 
+#[derive(Clone, Copy, Default)]
+struct WindowLayerState {
+    root_id: u64,
+    window_type: i32,
+    visible: bool,
+    pid: i32,
+    surface_id: u32,
+}
+
 pub struct Daemon {
     pub start: Instant,
     props: Mutex<Props>,
@@ -77,6 +86,8 @@ pub struct Daemon {
     /// of "its" window without knowing the surface id (the GL shim owns that).
     surface_owner: Mutex<std::collections::HashMap<u32, i32>>,
     surface_processes: Mutex<std::collections::HashMap<i32, crate::lifecycle::GuestProcess>>,
+    /// Real ViewRoot metadata, keyed by the native Surface consumed by HWUI.
+    window_layers: Mutex<std::collections::HashMap<u64, WindowLayerState>>,
 }
 
 pub(crate) struct SpawnedRun {
@@ -137,6 +148,7 @@ impl Daemon {
             input_sinks: Mutex::new(std::collections::HashMap::new()),
             surface_owner: Mutex::new(std::collections::HashMap::new()),
             surface_processes: Mutex::new(std::collections::HashMap::new()),
+            window_layers: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -230,6 +242,7 @@ impl Daemon {
             owners.retain(|id, _| gfx.contains_surface(*id));
         }
         self.input_sinks.lock().unwrap().retain(|_, (owner, _, _)| *owner != pid);
+        self.window_layers.lock().unwrap().retain(|_, layer| layer.pid != pid);
     }
 
     /// Notice surfaces whose `xdg_toplevel` was closed by the compositor and ask
@@ -713,7 +726,7 @@ fn handle(
             }
         }
 
-        Message::CreateSubsurface { parent_pid, x, y, width, height } => {
+        Message::CreateSubsurface { parent_pid, x, y, width, height, native_window } => {
             // The GL shim creates the window surface, so the guest asking for a
             // child layer only knows its own pid. Pick the most recent live
             // toplevel, never another video layer belonging to that pid.
@@ -744,6 +757,11 @@ fn handle(
             match created {
                 Some(surface_id) => {
                     daemon.remember_surface_owner(surface_id, parent_pid);
+                    if native_window != 0 {
+                        if let Some(layer) = daemon.window_layers.lock().unwrap().get_mut(&native_window) {
+                            if layer.pid == parent_pid { layer.surface_id = surface_id; }
+                        }
+                    }
                     (Some(Message::SubsurfaceCreated { surface_id }), vec![], false)
                 }
                 None => (
@@ -752,6 +770,38 @@ fn handle(
                     false,
                 ),
             }
+        }
+
+        Message::RegisterWindowLayer { native_window, root_id, window_type, visible } => {
+            if native_window == 0 {
+                return (Some(Message::Error { code: -22, message: "native window is null".into() }), vec![], false);
+            }
+            let previous = daemon.window_layers.lock().unwrap().insert(native_window, WindowLayerState {
+                root_id, window_type, visible, pid: peer.pid,
+                surface_id: 0,
+            }).unwrap_or_default();
+            // Preserve the gleshim binding when apphost republishes unchanged
+            // metadata from its main-loop observer.
+            daemon.window_layers.lock().unwrap().get_mut(&native_window).unwrap().surface_id = previous.surface_id;
+            if !visible && window_type > 1 && previous.surface_id != 0 {
+                if let Some(gfx) = daemon.graphics.lock().unwrap().as_mut() {
+                    gfx.destroy_surface(previous.surface_id);
+                }
+                daemon.input_sinks.lock().unwrap().remove(&previous.surface_id);
+                crate::info!("Android popup surface {} retired with its ViewRoot", previous.surface_id);
+            }
+            (Some(Message::Ack), vec![], false)
+        }
+
+        Message::ResolveWindowLayer { native_window } => {
+            let layer = daemon.window_layers.lock().unwrap().get(&native_window).copied()
+                .filter(|layer| layer.pid == peer.pid);
+            (Some(Message::WindowLayer {
+                native_window,
+                root_id: layer.map(|l| l.root_id).unwrap_or(0),
+                window_type: layer.map(|l| l.window_type).unwrap_or(0),
+                visible: layer.map(|l| l.visible).unwrap_or(false),
+            }), vec![], false)
         }
 
         Message::SetSurfaceOptions { surface_id, fps_meter } => {
@@ -913,7 +963,10 @@ fn handle(
             daemon.surface_owner.lock().unwrap().retain(|id, _| {
                 guard.as_ref().is_some_and(|gfx| gfx.contains_surface(*id))
             });
-            let _ = destroyed;
+            if destroyed {
+                daemon.input_sinks.lock().unwrap().remove(&surface_id);
+                daemon.window_layers.lock().unwrap().retain(|_, layer| layer.surface_id != surface_id);
+            }
             (Some(Message::Ack), vec![], false)
         }
 
@@ -1040,6 +1093,7 @@ fn handle(
         | Message::BinderReply { .. }
         | Message::SurfaceCreated { .. }
         | Message::SubsurfaceCreated { .. }
+        | Message::WindowLayer { .. }
         | Message::PropValue { .. }
         | Message::PropList { .. }
         | Message::ServiceList { .. }
@@ -1305,6 +1359,24 @@ mod tests {
         let (reply, fds, close) = call(&d, &p, Message::Ping);
         assert_eq!(reply, Some(Message::Pong));
         assert!(fds.is_empty() && !close);
+    }
+
+    #[test]
+    fn android_window_metadata_roundtrips_per_guest() {
+        let d = test_daemon();
+        let (p, _tx) = peer(pengudroid_proto::Role::Guest);
+        let (reply, _, _) = call(&d, &p, Message::RegisterWindowLayer {
+            native_window: 0x1234, root_id: 99, window_type: 1000, visible: true,
+        });
+        assert_eq!(reply, Some(Message::Ack));
+        let (reply, _, _) = call(&d, &p, Message::ResolveWindowLayer { native_window: 0x1234 });
+        assert_eq!(reply, Some(Message::WindowLayer {
+            native_window: 0x1234, root_id: 99, window_type: 1000, visible: true,
+        }));
+        let (reply, _, _) = call(&d, &p, Message::ResolveWindowLayer { native_window: 0x9999 });
+        assert_eq!(reply, Some(Message::WindowLayer {
+            native_window: 0x9999, root_id: 0, window_type: 0, visible: false,
+        }));
     }
 
     #[test]

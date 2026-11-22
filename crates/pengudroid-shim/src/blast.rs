@@ -815,7 +815,7 @@ impl VideoLayer {
         self.retire(conn)?;
         conn.send_message(&Message::CreateSubsurface {
             parent_pid: std::process::id() as i32, x, y,
-            width: layout.0, height: layout.1,
+            width: layout.0, height: layout.1, native_window: 0,
         }, &[]).map_err(|e| e.to_string())?;
         match conn.recv_message().map_err(|e| e.to_string())?.0 {
             Message::SubsurfaceCreated { surface_id } => {
@@ -1411,10 +1411,10 @@ mod tests {
         let peer = std::thread::spawn(move || {
             for (expected, response) in [
                 (Message::CreateSubsurface { parent_pid: std::process::id() as i32,
-                    x: 3, y: 4, width: 720, height: 405 }, Message::SubsurfaceCreated { surface_id: 10 }),
+                    x: 3, y: 4, width: 720, height: 405, native_window: 0 }, Message::SubsurfaceCreated { surface_id: 10 }),
                 (Message::DestroySurface { surface_id: 10 }, Message::Ack),
                 (Message::CreateSubsurface { parent_pid: std::process::id() as i32,
-                    x: 3, y: 4, width: 1280, height: 720 }, Message::SubsurfaceCreated { surface_id: 11 }),
+                    x: 3, y: 4, width: 1280, height: 720, native_window: 0 }, Message::SubsurfaceCreated { surface_id: 11 }),
                 (Message::DestroySurface { surface_id: 11 }, Message::Ack),
             ] {
                 assert_eq!(server.recv_message().unwrap().0, expected);

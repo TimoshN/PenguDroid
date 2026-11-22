@@ -169,7 +169,7 @@ fn software_video_frames_keep_wayland_connection_alive() {
     let parent = request(Message::CreateSurface { width: 64, height: 64, title: "Software video test".into() }, &[]);
     let Message::SurfaceCreated { surface_id: parent_id, .. } = parent else { panic!("{parent:?}") };
     let child = request(Message::CreateSubsurface {
-        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16,
+        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16, native_window: 0,
     }, &[]);
     let Message::SubsurfaceCreated { surface_id } = child else { panic!("{child:?}") };
     assert_eq!(request(Message::SetSurfaceOptions { surface_id: parent_id, fps_meter: true }, &[]), Message::Ack);
@@ -187,7 +187,7 @@ fn software_video_frames_keep_wayland_connection_alive() {
     // Two video queues in one window must be siblings, never nested under the
     // newest video layer. Retiring the first queue must not retire the second.
     let sibling = request(Message::CreateSubsurface {
-        parent_pid: std::process::id() as i32, x: 16, y: 0, width: 16, height: 16,
+        parent_pid: std::process::id() as i32, x: 16, y: 0, width: 16, height: 16, native_window: 0,
     }, &[]);
     let Message::SubsurfaceCreated { surface_id: sibling_id } = sibling else { panic!("{sibling:?}") };
     assert_eq!(request(Message::DestroySurface { surface_id }, &[]), Message::Ack);
@@ -203,7 +203,7 @@ fn software_video_frames_keep_wayland_connection_alive() {
         crop: pengudroid_proto::BufferCrop::full(32, 32),
     }, &[fd.as_raw_fd()]), Message::Error { .. }));
     assert!(matches!(request(Message::CreateSubsurface {
-        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16,
+        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16, native_window: 0,
     }, &[]), Message::Error { .. }));
     // Creating another toplevel forces a compositor roundtrip. A bogus
     // linux-dmabuf import can appear Acked before its fatal protocol error is
@@ -211,7 +211,7 @@ fn software_video_frames_keep_wayland_connection_alive() {
     let after = request(Message::CreateSurface { width: 64, height: 64, title: "After software frames".into() }, &[]);
     assert!(matches!(after, Message::SurfaceCreated { .. }), "compositor connection was lost: {after:?}");
     let child = request(Message::CreateSubsurface {
-        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16,
+        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16, native_window: 0,
     }, &[]);
     let Message::SubsurfaceCreated { surface_id: replacement } = child else { panic!("{child:?}") };
     assert_eq!(request(Message::PresentShm {

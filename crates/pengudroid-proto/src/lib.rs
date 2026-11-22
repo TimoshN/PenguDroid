@@ -40,7 +40,8 @@ use std::fmt;
 /// v9 adds Maliit commit/preedit text events and finish-composing.
 /// v10 adds plain-text clipboard set/get/clear through Wayland data-device.
 /// v11 adds explicit Maliit Copy/Cut/Paste actions.
-pub const PROTO_VERSION: u16 = 12;
+/// v13 adds Android ViewRoot/native-Surface layer metadata.
+pub const PROTO_VERSION: u16 = 13;
 
 /// Marker used by the daemon's pid/heartbeat file.
 pub const PROTO_MAGIC: u32 = 0x5044_5247; // "PDRG"
@@ -121,6 +122,9 @@ pub enum MsgKind {
     ClipboardGet = 108,
     ClipboardClear = 109,
     ClipboardText = 110,
+    RegisterWindowLayer = 111,
+    ResolveWindowLayer = 112,
+    WindowLayer = 113,
 
     Ack = 80,
 
@@ -194,6 +198,9 @@ impl MsgKind {
             108 => ClipboardGet,
             109 => ClipboardClear,
             110 => ClipboardText,
+            111 => RegisterWindowLayer,
+            112 => ResolveWindowLayer,
+            113 => WindowLayer,
             80 => Ack,
             90 => Shutdown,
             91 => Goodbye,
@@ -373,8 +380,12 @@ pub enum Message {
     /// This is how a `SurfaceView`'s video output reaches the screen: Android
     /// composites it as a separate layer under the window, and the closest
     /// Wayland equivalent is a `wl_subsurface` positioned inside the parent.
-    CreateSubsurface { parent_pid: i32, x: i32, y: i32, width: u32, height: u32 },
+    CreateSubsurface { parent_pid: i32, x: i32, y: i32, width: u32, height: u32, native_window: u64 },
     SubsurfaceCreated { surface_id: u32 },
+    /// Associate the native Surface used by HWUI with its real ViewRoot type.
+    RegisterWindowLayer { native_window: u64, root_id: u64, window_type: i32, visible: bool },
+    ResolveWindowLayer { native_window: u64 },
+    WindowLayer { native_window: u64, root_id: u64, window_type: i32, visible: bool },
     SetSubsurfacePosition { surface_id: u32, x: i32, y: i32 },
     DestroySurface { surface_id: u32 },
     SetSurfaceOptions { surface_id: u32, fps_meter: bool },
@@ -532,6 +543,9 @@ impl Message {
             PresentFrame { .. } => MsgKind::PresentFrame,
             CreateSubsurface { .. } => MsgKind::CreateSubsurface,
             SubsurfaceCreated { .. } => MsgKind::SubsurfaceCreated,
+            RegisterWindowLayer { .. } => MsgKind::RegisterWindowLayer,
+            ResolveWindowLayer { .. } => MsgKind::ResolveWindowLayer,
+            WindowLayer { .. } => MsgKind::WindowLayer,
             SetSubsurfacePosition { .. } => MsgKind::SetSubsurfacePosition,
             DestroySurface { .. } => MsgKind::DestroySurface,
             SetSurfaceOptions { .. } => MsgKind::SetSurfaceOptions,
@@ -670,14 +684,23 @@ impl Message {
                 e.u32(*format);
             }
             PresentFrame { surface_id } => e.u32(*surface_id),
-            CreateSubsurface { parent_pid, x, y, width, height } => {
+            CreateSubsurface { parent_pid, x, y, width, height, native_window } => {
                 e.i32(*parent_pid);
                 e.i32(*x);
                 e.i32(*y);
                 e.u32(*width);
                 e.u32(*height);
+                e.u64(*native_window);
             }
             SubsurfaceCreated { surface_id } => e.u32(*surface_id),
+            RegisterWindowLayer { native_window, root_id, window_type, visible }
+            | WindowLayer { native_window, root_id, window_type, visible } => {
+                e.u64(*native_window);
+                e.u64(*root_id);
+                e.i32(*window_type);
+                e.u8(u8::from(*visible));
+            }
+            ResolveWindowLayer { native_window } => e.u64(*native_window),
             SetSubsurfacePosition { surface_id, x, y } => {
                 e.u32(*surface_id);
                 e.i32(*x);
@@ -913,8 +936,16 @@ impl Message {
                 y: d.i32()?,
                 width: d.u32()?,
                 height: d.u32()?,
+                native_window: d.u64()?,
             },
             K::SubsurfaceCreated => SubsurfaceCreated { surface_id: d.u32()? },
+            K::RegisterWindowLayer => RegisterWindowLayer {
+                native_window: d.u64()?, root_id: d.u64()?, window_type: d.i32()?, visible: d.u8()? != 0,
+            },
+            K::ResolveWindowLayer => ResolveWindowLayer { native_window: d.u64()? },
+            K::WindowLayer => WindowLayer {
+                native_window: d.u64()?, root_id: d.u64()?, window_type: d.i32()?, visible: d.u8()? != 0,
+            },
             K::SetSubsurfacePosition => SetSubsurfacePosition {
                 surface_id: d.u32()?,
                 x: d.i32()?,
@@ -1441,6 +1472,16 @@ mod tests {
             crop: BufferCrop::full(426, 240) });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: true });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: false });
+        roundtrip(Message::RegisterWindowLayer {
+            native_window: 0x1234_5678, root_id: 77, window_type: 1000, visible: true,
+        });
+        roundtrip(Message::ResolveWindowLayer { native_window: 0x1234_5678 });
+        roundtrip(Message::WindowLayer {
+            native_window: 0x1234_5678, root_id: 77, window_type: 1, visible: false,
+        });
+        roundtrip(Message::CreateSubsurface {
+            parent_pid: 42, x: -2, y: 9, width: 640, height: 360, native_window: 0x1234_5678,
+        });
         roundtrip(Message::SurfaceGeometry {
             surface_id: 4,
             width: 720,

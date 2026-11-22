@@ -1455,8 +1455,9 @@ mod imp {
         }
 
         pub fn is_toplevel(&self, id: u32) -> bool {
+            // Lipstick uses wl_shell rather than xdg_toplevel.
             self.state.surfaces.get(&id)
-                .is_some_and(|s| s.xdg_toplevel.is_some() && !s.closed)
+                .is_some_and(|s| s.parent_id.is_none() && !s.closed)
         }
 
         /// Destroy a surface and its Wayland objects (the compositor closed the
@@ -1690,9 +1691,11 @@ mod imp {
             let shm = self.state.shm.as_ref().ok_or("no wl_shm")?;
             let qh = self.queue.handle();
             let pool = shm.create_pool(fd.as_fd(), pool_size as i32, &qh, ());
+            let is_subsurface = self.state.surfaces.get(&id)
+                .is_some_and(|surface| surface.subsurface.is_some());
             let buffer = pool.create_buffer(
                 0, width as i32, height as i32, stride as i32,
-                wl_shm::Format::Xrgb8888,
+                if is_subsurface { wl_shm::Format::Argb8888 } else { wl_shm::Format::Xrgb8888 },
                 &qh, FrameBuffer::default(),
             );
             pool.destroy();
