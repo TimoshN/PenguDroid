@@ -2632,6 +2632,7 @@ unsafe fn present_shm(surface: EGLSurface) -> Result<(), String> {
                 height: rec.h,
                 stride: rec.w * 4,
                 format: ANDROID_RGBA_8888,
+                native_window: if env_truthy("PENGUDROID_ANDROID_LAYERS") { rec.native_window as u64 } else { 0 },
                 crop: BufferCrop::full(rec.w as i32, rec.h as i32),
             };
             conn.send_message(&message, &[fd]).map_err(|e| format!("PresentShm send failed: {e}"))?;
@@ -2690,7 +2691,8 @@ fn present_gralloc_fd(fd: RawFd, rec: &mut SurfaceRec, stride: u32) -> Result<()
     let mut st = lock_state();
     let surface_id = ensure_surface_id(&mut st, rec)?;
     let mut conn = st.conn.take().ok_or_else(|| "daemon is unavailable".to_string())?;
-    let result = transmit_gralloc(&mut conn, surface_id, rec.w, rec.h, stride, fd);
+    let native_window = if env_truthy("PENGUDROID_ANDROID_LAYERS") { rec.native_window as u64 } else { 0 };
+    let result = transmit_gralloc(&mut conn, surface_id, rec.w, rec.h, stride, fd, native_window);
     if result.is_err() {
         st.conn = None;
         st.connect_attempted = false;
@@ -2707,10 +2709,11 @@ fn present_gralloc_metadata(
     height: u32,
     stride: u32,
     fd: RawFd,
+    native_window: u64,
 ) -> Result<(), String> {
     let mut st = lock_state();
     let mut conn = st.conn.take().ok_or_else(|| "daemon is unavailable".to_string())?;
-    let result = transmit_gralloc(&mut conn, surface_id, width, height, stride, fd);
+    let result = transmit_gralloc(&mut conn, surface_id, width, height, stride, fd, native_window);
     if result.is_err() {
         st.conn = None;
         st.connect_attempted = false;
@@ -2727,6 +2730,7 @@ fn transmit_gralloc(
     height: u32,
     stride: u32,
     fd: RawFd,
+    native_window: u64,
 ) -> Result<(), String> {
     let message = Message::PresentShm {
         surface_id,
@@ -2734,6 +2738,7 @@ fn transmit_gralloc(
         height,
         stride,
         format: ANDROID_RGBA_8888 | NATIVE_FD_FLAG,
+        native_window,
         crop: BufferCrop::full(width as i32, height as i32),
     };
     conn.send_message(&message, &[fd]).map_err(|e| format!("gralloc wl_shm send failed: {e}"))?;
@@ -2753,6 +2758,7 @@ struct PendingGrallocFrame {
     height: u32,
     stride: u32,
     fd: RawFd,
+    native_window: u64,
     display: usize,
     sync: usize,
     frame: u64,
@@ -2795,6 +2801,7 @@ fn async_presenter() -> &'static std::sync::mpsc::Sender<PendingGrallocFrame> {
                     let result = if waited == Some(EGL_CONDITION_SATISFIED_KHR) {
                         present_gralloc_metadata(
                             frame.surface_id, frame.width, frame.height, frame.stride, frame.fd,
+                            frame.native_window,
                         )
                     } else {
                         Err(format!("async GPU fence did not signal: {waited:?}"))
@@ -2890,6 +2897,7 @@ unsafe fn queue_gralloc_async(surface: EGLSurface, host: &Host) -> Result<(), St
     };
     let pending = PendingGrallocFrame {
         surface: surface as usize, surface_id, width, height, stride, fd,
+        native_window: if env_truthy("PENGUDROID_ANDROID_LAYERS") { rec.native_window as u64 } else { 0 },
         display, sync: sync as usize, frame, touch_seq, touch_kind, touch_recv_ms,
     };
     let (lock, ready) = async_outstanding();

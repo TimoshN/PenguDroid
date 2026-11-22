@@ -956,7 +956,7 @@ fn consumer_loop(addr: usize) {
                         // the compositor connection. Snapshot via wl_shm instead.
                         let msg = Message::PresentShm {
                             surface_id, width, height, stride: stride * bpp,
-                            format: format as u32, crop,
+                            format: format as u32, native_window: 0, crop,
                         };
                         match conn.send_message(&msg, &[fd]).and_then(|_| conn.recv_message()) {
                             Ok((Message::Ack, _)) => {

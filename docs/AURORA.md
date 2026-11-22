@@ -617,6 +617,27 @@ SIG11 helper exit on native `Thread-20`; it was not the recovered nterp null
 check. The exact conversion call remains under investigation. Evidence:
 `target/aurora/maxnext-crash110.log`.
 
+Protocol v13 adds real ViewRoot/Surface metadata for Android windows. Apphost
+publishes `mWindowAttributes.type`, visibility, root identity, and
+`Surface.mNativeObject`; gleshim resolves the corresponding ANativeWindow (the
+current runtime's ANativeWindow base is 16 bytes into the containing Surface).
+New subwindows restore AttachInfo window visibility and the first-traversal
+contract, then use one persistent ARGB wl_subsurface. Opaque Activity roots
+retain the shared base surface. Unknown metadata is briefly awaited rather
+than racing the first present. PresentShm carries the native window identity,
+and the daemon rejects frames only from invisible or superseded application
+roots. Calls → menu passed ten consecutive open/dismiss cycles and another
+open after Calls → Chats → Calls without old-tab textures or fatal errors.
+Evidence: `target/aurora/maxnext-layers126-menu-10.png`,
+`target/aurora/maxnext-layers126-after-navigation.png`.
+
+A separate MAX route-content issue remains: labels/icons can be absent from a
+new Chats root until a later redraw. It reproduces with both synchronous and
+fenced async presentation; changing EGL_BUFFER_AGE_EXT did not fix it and was
+not retained. This is not covered by the popup fix. Diagnostic screenshots:
+`target/aurora/maxnext-text-sync-chats-2.png` and
+`target/aurora/maxnext-text127-chats-2.png`.
+
 Release 112 makes every ART exit terminate the complete standalone
 application lifecycle. The launcher explicitly destroys the early/Wayland
 surface, stops its package-owned daemon, and preserves a non-zero status for

@@ -60,6 +60,7 @@ struct WindowLayerState {
     visible: bool,
     pid: i32,
     surface_id: u32,
+    generation: u64,
 }
 
 pub struct Daemon {
@@ -88,6 +89,7 @@ pub struct Daemon {
     surface_processes: Mutex<std::collections::HashMap<i32, crate::lifecycle::GuestProcess>>,
     /// Real ViewRoot metadata, keyed by the native Surface consumed by HWUI.
     window_layers: Mutex<std::collections::HashMap<u64, WindowLayerState>>,
+    next_window_generation: AtomicU64,
 }
 
 pub(crate) struct SpawnedRun {
@@ -149,6 +151,7 @@ impl Daemon {
             surface_owner: Mutex::new(std::collections::HashMap::new()),
             surface_processes: Mutex::new(std::collections::HashMap::new()),
             window_layers: Mutex::new(std::collections::HashMap::new()),
+            next_window_generation: AtomicU64::new(1),
         }
     }
 
@@ -231,6 +234,20 @@ impl Daemon {
             }
         }
         self.surface_owner.lock().unwrap().insert(surface, pid);
+    }
+
+    /// Reject only frames from a retired/invisible ViewRoot, never merely an
+    /// older frame of the current root. A newer visible application root owns
+    /// the shared base surface; an old async fence must not bring it back.
+    fn stale_window_frame(&self, native_window: u64, pid: i32) -> bool {
+        if native_window == 0 { return false; }
+        let layers = self.window_layers.lock().unwrap();
+        let Some(layer) = layers.get(&native_window) else { return false };
+        if layer.pid != pid || !layer.visible { return true; }
+        layer.window_type <= 1 && layers.values().any(|other| {
+            other.pid == pid && other.window_type <= 1 && other.visible
+                && other.generation > layer.generation
+        })
     }
 
     fn remove_guest_surfaces(&self, pid: i32) {
@@ -433,13 +450,18 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
         };
         let (msg, raw_fds) = received;
         let (reply, out_fds, close) = match msg {
-            Message::PresentShm { surface_id, width, height, stride, format, crop } => {
+            Message::PresentShm { surface_id, width, height, stride, format, native_window, crop } => {
                 let owned: Vec<OwnedFd> = raw_fds.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
                 let mut fds = owned.into_iter();
-                let result = match (fds.next(), daemon.graphics.lock().unwrap().as_mut()) {
-                    (Some(fd), Some(gfx)) => gfx.present_shm(surface_id, fd, width, height, stride, format, crop),
-                    (None, _) => Err("PresentShm: no fd attached".into()),
-                    (_, None) => Err("graphics unavailable".into()),
+                let result = if daemon.stale_window_frame(native_window, pid) {
+                    crate::debug!("retired Android root frame dropped: native={native_window:#x} surface={surface_id}");
+                    Ok(())
+                } else {
+                    match (fds.next(), daemon.graphics.lock().unwrap().as_mut()) {
+                        (Some(fd), Some(gfx)) => gfx.present_shm(surface_id, fd, width, height, stride, format, crop),
+                        (None, _) => Err("PresentShm: no fd attached".into()),
+                        (_, None) => Err("graphics unavailable".into()),
+                    }
                 };
                 let reply = match result {
                     Ok(()) => Message::Ack,
@@ -776,9 +798,10 @@ fn handle(
             if native_window == 0 {
                 return (Some(Message::Error { code: -22, message: "native window is null".into() }), vec![], false);
             }
+            let generation = daemon.next_window_generation.fetch_add(1, Ordering::Relaxed);
             let previous = daemon.window_layers.lock().unwrap().insert(native_window, WindowLayerState {
                 root_id, window_type, visible, pid: peer.pid,
-                surface_id: 0,
+                surface_id: 0, generation,
             }).unwrap_or_default();
             // Preserve the gleshim binding when apphost republishes unchanged
             // metadata from its main-loop observer.
@@ -1373,6 +1396,20 @@ mod tests {
         assert_eq!(reply, Some(Message::WindowLayer {
             native_window: 0x1234, root_id: 99, window_type: 1000, visible: true,
         }));
+        assert!(!d.stale_window_frame(0x1234, p.pid));
+        for native_window in [0x2000, 0x3000] {
+            let (reply, _, _) = call(&d, &p, Message::RegisterWindowLayer {
+                native_window, root_id: native_window, window_type: 1, visible: true,
+            });
+            assert_eq!(reply, Some(Message::Ack));
+        }
+        assert!(d.stale_window_frame(0x2000, p.pid));
+        assert!(!d.stale_window_frame(0x3000, p.pid));
+        let (reply, _, _) = call(&d, &p, Message::RegisterWindowLayer {
+            native_window: 0x3000, root_id: 0x3000, window_type: 1, visible: false,
+        });
+        assert_eq!(reply, Some(Message::Ack));
+        assert!(d.stale_window_frame(0x3000, p.pid));
         let (reply, _, _) = call(&d, &p, Message::ResolveWindowLayer { native_window: 0x9999 });
         assert_eq!(reply, Some(Message::WindowLayer {
             native_window: 0x9999, root_id: 0, window_type: 0, visible: false,

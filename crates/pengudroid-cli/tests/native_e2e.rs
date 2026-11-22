@@ -181,7 +181,7 @@ fn software_video_frames_keep_wayland_connection_alive() {
     let pixels = [0, 0xf8].repeat(32 * 32);
     assert_eq!(unsafe { libc::write(fd.as_raw_fd(), pixels.as_ptr().cast(), pixels.len()) }, pixels.len() as isize);
     for _ in 0..8 {
-        assert_eq!(request(Message::PresentShm { surface_id, width: 32, height: 32, stride: 64, format: 4,
+        assert_eq!(request(Message::PresentShm { surface_id, width: 32, height: 32, stride: 64, format: 4, native_window: 0,
             crop: pengudroid_proto::BufferCrop::full(32, 32) }, &[fd.as_raw_fd()]), Message::Ack);
     }
     // Two video queues in one window must be siblings, never nested under the
@@ -192,14 +192,14 @@ fn software_video_frames_keep_wayland_connection_alive() {
     let Message::SubsurfaceCreated { surface_id: sibling_id } = sibling else { panic!("{sibling:?}") };
     assert_eq!(request(Message::DestroySurface { surface_id }, &[]), Message::Ack);
     assert_eq!(request(Message::PresentShm {
-        surface_id: sibling_id, width: 32, height: 32, stride: 64, format: 4,
+        surface_id: sibling_id, width: 32, height: 32, stride: 64, format: 4, native_window: 0,
         crop: pengudroid_proto::BufferCrop::full(32, 32),
     }, &[fd.as_raw_fd()]), Message::Ack);
     // EGL window destruction must invalidate its video layers. Acking frames
     // on an orphan would keep the BLAST consumer stuck on an invisible layer.
     assert_eq!(request(Message::DestroySurface { surface_id: parent_id }, &[]), Message::Ack);
     assert!(matches!(request(Message::PresentShm {
-        surface_id: sibling_id, width: 32, height: 32, stride: 64, format: 4,
+        surface_id: sibling_id, width: 32, height: 32, stride: 64, format: 4, native_window: 0,
         crop: pengudroid_proto::BufferCrop::full(32, 32),
     }, &[fd.as_raw_fd()]), Message::Error { .. }));
     assert!(matches!(request(Message::CreateSubsurface {
@@ -215,7 +215,7 @@ fn software_video_frames_keep_wayland_connection_alive() {
     }, &[]);
     let Message::SubsurfaceCreated { surface_id: replacement } = child else { panic!("{child:?}") };
     assert_eq!(request(Message::PresentShm {
-        surface_id: replacement, width: 32, height: 32, stride: 64, format: 4,
+        surface_id: replacement, width: 32, height: 32, stride: 64, format: 4, native_window: 0,
         crop: pengudroid_proto::BufferCrop::full(32, 32),
     }, &[fd.as_raw_fd()]), Message::Ack);
     assert_eq!(request(Message::Shutdown, &[]), Message::Goodbye);

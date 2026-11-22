@@ -401,7 +401,7 @@ pub enum Message {
     /// `width`/`height` describe the allocation, `stride` is bytes per row, and
     /// `format` is an Android HAL pixel format. Only `crop` is displayed; even
     /// full-frame callers must supply explicit bounds for this submission.
-    PresentShm { surface_id: u32, width: u32, height: u32, stride: u32, format: u32, crop: BufferCrop },
+    PresentShm { surface_id: u32, width: u32, height: u32, stride: u32, format: u32, native_window: u64, crop: BufferCrop },
     /// Present a dma-buf (fd passed out-of-band) on an existing surface.
     PresentDmabuf {
         surface_id: u32,
@@ -716,12 +716,13 @@ impl Message {
                 e.u32(*display_height);
             }
             SetWindowState { surface_id, state } => { e.u32(*surface_id); e.u32(*state); }
-            PresentShm { surface_id, width, height, stride, format, crop } => {
+            PresentShm { surface_id, width, height, stride, format, native_window, crop } => {
                 e.u32(*surface_id);
                 e.u32(*width);
                 e.u32(*height);
                 e.u32(*stride);
                 e.u32(*format);
+                e.u64(*native_window);
                 e.i32(crop.left);
                 e.i32(crop.top);
                 e.i32(crop.right);
@@ -963,7 +964,7 @@ impl Message {
             K::SetWindowState => SetWindowState { surface_id: d.u32()?, state: d.u32()? },
             K::PresentShm => PresentShm {
                 surface_id: d.u32()?, width: d.u32()?, height: d.u32()?,
-                stride: d.u32()?, format: d.u32()?,
+                stride: d.u32()?, format: d.u32()?, native_window: d.u64()?,
                 crop: BufferCrop { left: d.i32()?, top: d.i32()?, right: d.i32()?, bottom: d.i32()? },
             },
             K::PresentDmabuf => PresentDmabuf {
@@ -1436,7 +1437,7 @@ mod tests {
             BufferCrop { left: 3, top: 5, right: 129, bottom: 117 },
             BufferCrop { left: i32::MIN, top: -1, right: i32::MAX, bottom: 0 }] {
             let message = Message::PresentShm { surface_id: 4, width: 512, height: 240,
-                stride: 512, format: 0x3231_5659, crop };
+                stride: 512, format: 0x3231_5659, native_window: 0x1234, crop };
             roundtrip(message.clone());
             let frame = message.to_frame();
             // A v2 PresentShm body ended after the original five u32 fields.
@@ -1469,7 +1470,7 @@ mod tests {
     #[test]
     fn roundtrip_complex() {
         roundtrip(Message::PresentShm { surface_id: 4, width: 426, height: 240, stride: 852, format: 4,
-            crop: BufferCrop::full(426, 240) });
+            native_window: 0x1234, crop: BufferCrop::full(426, 240) });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: true });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: false });
         roundtrip(Message::RegisterWindowLayer {
