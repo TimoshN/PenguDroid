@@ -379,7 +379,7 @@ pub unsafe extern "C" fn AAudioStream_getTimestamp(s: *mut c_void, clock: i32, p
     // Everything queued ahead of real time has not been heard yet.
     let ahead = (AHEAD.as_nanos() as i64 * stream.rate as i64) / 1_000_000_000;
     if !position.is_null() { *position = (stream.written.load(Ordering::Acquire) - ahead).max(0); }
-    if !time.is_null() { *time = now.tv_sec * 1_000_000_000 + now.tv_nsec; }
+    if !time.is_null() { *time = i64::from(now.tv_sec) * 1_000_000_000 + i64::from(now.tv_nsec); }
     AAUDIO_OK
 }
 

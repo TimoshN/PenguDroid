@@ -481,9 +481,14 @@ fn hybris_host() -> bool {
     if std::env::var_os("PENGUDROID_DISABLE_HYBRIS").is_some() {
         return false;
     }
-    cfg!(target_arch = "aarch64")
+    let egl = if cfg!(target_arch = "arm") {
+        "/usr/libexec/droid-hybris/system/lib/libEGL.so"
+    } else {
+        "/usr/libexec/droid-hybris/system/lib64/libEGL.so"
+    };
+    cfg!(any(target_arch = "aarch64", target_arch = "arm"))
         && std::path::Path::new("/usr/lib/libhybris-common.so.1").is_file()
-        && std::path::Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file()
+        && std::path::Path::new(egl).is_file()
 }
 
 fn host() -> Result<&'static Host, String> {
@@ -574,9 +579,15 @@ fn rekey_hybris_egl() {
     }
 }
 
+#[cfg(target_arch = "arm")]
+fn rekey_hybris_egl() {
+    // The isolated ARM32 namespace uses libpengudroid_hybris_pthread.so's
+    // explicit LIBC/GLIBC boundary, so no build-specific EGL key rewrite.
+}
+
 /// Publish the hosted SDR configuration before loading Hybris EGL. Loading
 /// libhybris-common first also gives EGL/GLES the same isolated namespace.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 fn configure_hybris_sdr_properties(namespace: &mut libc::Lmid_t) {
     // Hybris brings its own Bionic libc into this isolated namespace. Without
     // this bridge, Bionic and glibc independently allocate identical pthread
@@ -653,7 +664,7 @@ fn configure_hybris_sdr_properties(namespace: &mut libc::Lmid_t) {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
 fn configure_hybris_sdr_properties(_namespace: &mut libc::Lmid_t) {}
 
 fn open_first(names: &[&str], isolated: bool, namespace: libc::Lmid_t) -> Option<*mut c_void> {
@@ -687,7 +698,7 @@ fn open_first(names: &[&str], isolated: bool, namespace: libc::Lmid_t) -> Option
             // shim wraps. Making the host driver's symbols global lets those
             // resolve directly; the shim's own exports still interpose first
             // because it is preloaded.
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
             let flags = if isolated {
                 // glibc rejects RTLD_DEEPBIND in dlmopen mode. A separate
                 // namespace already supplies the isolation we need here.
@@ -695,7 +706,7 @@ fn open_first(names: &[&str], isolated: bool, namespace: libc::Lmid_t) -> Option
             } else {
                 libc::RTLD_NOW | libc::RTLD_GLOBAL | libc::RTLD_DEEPBIND
             };
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
             let flags = libc::RTLD_NOW | libc::RTLD_GLOBAL;
             // SAFETY: `c_name` is a valid NUL-terminated soname/path. dlmopen
             // keeps Hybris' android_dlopen and public EGL references out of the
@@ -1050,7 +1061,7 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
             }
             bind_texture(GL_TEXTURE_2D, tex);
             let mut plain_texture = true;
-            if host.gl_isolated && std::env::var_os("PENGUDROID_GRALLOC").is_some() {
+            if std::env::var_os("PENGUDROID_GRALLOC").is_some() {
                 match attach_gralloc_texture(host, tex, rec.w, rec.h) {
                     Ok(target) => {
                         eprintln!(
@@ -2596,7 +2607,7 @@ unsafe fn present_shm(surface: EGLSurface) -> Result<(), String> {
     }
     let mut copy_done = read_done;
     let result = (|| -> Result<(), String> {
-        if libc::ftruncate(fd, len as i64) != 0 {
+        if libc::ftruncate(fd, len as libc::off_t) != 0 {
             return Err(format!("ftruncate failed: {}", std::io::Error::last_os_error()));
         }
         let mapping = libc::mmap(
@@ -3051,16 +3062,34 @@ struct GrallocApi {
     deinitialize: GrallocDeinitialize,
 }
 
-unsafe fn gralloc_api(host: &Host) -> Result<GrallocApi, String> {
-    let mut handle = libc::dlmopen(
-        host.gl_namespace,
-        c"/lib64/libgralloc.so.1".as_ptr(),
-        libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NOLOAD,
-    );
+unsafe fn open_host_gralloc(host: &Host) -> *mut c_void {
+    let path: &[u8] = if cfg!(target_arch = "arm") {
+        b"/usr/lib/libgralloc.so.1\0"
+    } else {
+        b"/lib64/libgralloc.so.1\0"
+    };
+    let name = path.as_ptr() as *const c_char;
+    let mut handle = if host.gl_isolated {
+        libc::dlmopen(
+            host.gl_namespace,
+            name,
+            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NOLOAD,
+        )
+    } else {
+        libc::dlopen(name, libc::RTLD_NOW | libc::RTLD_GLOBAL | libc::RTLD_NOLOAD)
+    };
     if handle.is_null() {
-        handle = open_first(&["/lib64/libgralloc.so.1", "libgralloc.so.1"], true, host.gl_namespace)
-            .unwrap_or(std::ptr::null_mut());
+        handle = if host.gl_isolated {
+            libc::dlmopen(host.gl_namespace, name, libc::RTLD_NOW | libc::RTLD_LOCAL)
+        } else {
+            libc::dlopen(name, libc::RTLD_NOW | libc::RTLD_GLOBAL)
+        };
     }
+    handle
+}
+
+unsafe fn gralloc_api(host: &Host) -> Result<GrallocApi, String> {
+    let handle = open_host_gralloc(host);
     if handle.is_null() {
         return Err("cannot load host libgralloc.so.1".into());
     }
@@ -3259,17 +3288,7 @@ unsafe fn probe_gralloc() -> Result<(), String> {
     if !host.gl_isolated {
         return Ok(()); // Mesa already has the normal dma-buf export path.
     }
-    let mut gralloc = unsafe {
-        libc::dlmopen(
-            host.gl_namespace,
-            c"/lib64/libgralloc.so.1".as_ptr(),
-            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NOLOAD,
-        )
-    };
-    if gralloc.is_null() {
-        gralloc = open_first(&["/lib64/libgralloc.so.1", "libgralloc.so.1"], true, host.gl_namespace)
-            .unwrap_or(std::ptr::null_mut());
-    }
+    let gralloc = open_host_gralloc(host);
     let gralloc = if gralloc.is_null() { None } else { Some(gralloc) }
         .ok_or_else(|| {
             let error = unsafe { libc::dlerror() };
@@ -5747,7 +5766,8 @@ pub unsafe extern "C" fn glClear(mask: u32) {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "arm"), no_mangle)]
+#[cfg_attr(target_arch = "arm", export_name = "__pengudroid_rust_glClearColor")]
 pub unsafe extern "C" fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32) {
     if let Some(f) = host().ok().and_then(|h| h.gl_clear_color) {
         // SAFETY: forwarded verbatim.

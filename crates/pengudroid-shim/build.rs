@@ -23,6 +23,7 @@
 //! warning). The x86_64 GNU/Linux jump boundary requires an assembler driver;
 //! silently omitting it or substituting glibc's saves would be unsafe.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -34,6 +35,8 @@ mod pathshim;
 mod jump;
 #[path = "src/jump_aarch64.rs"]
 mod jump_aarch64;
+#[path = "src/jump_arm.rs"]
+mod jump_arm;
 #[path = "src/syscall_paths.rs"]
 mod syscall_paths;
 
@@ -41,6 +44,7 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     compile_c_shims(&out_dir);
     compile_jump_shim(&out_dir);
+    compile_math_shim(&out_dir);
     compile_syscall_paths(&out_dir);
     write_version_script(&out_dir);
 
@@ -50,6 +54,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/pathshim.rs");
     println!("cargo:rerun-if-changed=src/jump.rs");
     println!("cargo:rerun-if-changed=src/jump_aarch64.rs");
+    println!("cargo:rerun-if-changed=src/jump_arm.rs");
     println!("cargo:rerun-if-changed=src/syscall_paths.rs");
 }
 
@@ -73,7 +78,7 @@ fn bionic_pthread_symbols() -> &'static [&'static str] {
 }
 
 fn host_pthread_symbols() -> &'static [&'static str] {
-    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
+    if !matches!(std::env::var("CARGO_CFG_TARGET_ARCH").as_deref(), Ok("aarch64") | Ok("arm")) {
         return &[];
     }
     &[
@@ -93,14 +98,14 @@ fn host_pthread_symbols() -> &'static [&'static str] {
 
 fn jump_symbols() -> &'static [&'static str] {
     let gnu_linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
-        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
-        && std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64");
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
     if !gnu_linux {
         return &[];
     }
     match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
         Ok("x86_64") => jump::SYMBOLS,
         Ok("aarch64") => jump_aarch64::SYMBOLS,
+        Ok("arm") => jump_arm::SYMBOLS,
         _ => &[],
     }
 }
@@ -111,14 +116,16 @@ fn compile_jump_shim(out_dir: &PathBuf) {
     if jump_symbols().is_empty() {
         return;
     }
-    let aarch64 = std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64");
-    let source = out_dir.join(if aarch64 { "jump_aarch64.S" } else { "jump.S" });
-    let object = out_dir.join(if aarch64 { "jump_aarch64.o" } else { "jump.o" });
-    std::fs::write(
-        &source,
-        if aarch64 { jump_aarch64::ASSEMBLY } else { jump::ASSEMBLY },
-    )
-    .expect("write jump boundary");
+    let architecture = std::env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture");
+    let (stem, assembly) = match architecture.as_str() {
+        "x86_64" => ("jump", jump::ASSEMBLY),
+        "aarch64" => ("jump_aarch64", jump_aarch64::ASSEMBLY),
+        "arm" => ("jump_arm", jump_arm::ASSEMBLY),
+        _ => return,
+    };
+    let source = out_dir.join(format!("{stem}.S"));
+    let object = out_dir.join(format!("{stem}.o"));
+    std::fs::write(&source, assembly).expect("write jump boundary");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let mut command = Command::new(cc);
     command.args(["-c", "-O2", "-fPIC", "-fvisibility=default", "-x"]);
@@ -134,6 +141,99 @@ fn compile_jump_shim(out_dir: &PathBuf) {
     for sym in jump_symbols().iter().chain(host_pthread_symbols()) {
         println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined={sym}");
     }
+}
+
+fn compile_math_shim(out_dir: &PathBuf) {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("arm") {
+        return;
+    }
+    const UNARY_DOUBLE: &[&str] = &[
+        "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+        "asinh", "acosh", "atanh", "exp", "exp2", "expm1", "log", "log2", "log10",
+        "log1p", "sqrt", "cbrt", "floor", "ceil", "trunc", "round", "nearbyint",
+        "rint", "fabs",
+    ];
+    const BINARY_DOUBLE: &[&str] = &[
+        "pow", "atan2", "fmod", "hypot", "remainder", "fdim", "fmin", "fmax", "copysign",
+    ];
+    const UNARY_FLOAT: &[&str] = &[
+        "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "sinhf", "coshf", "tanhf",
+        "asinhf", "acoshf", "atanhf", "expf", "exp2f", "expm1f", "logf", "log2f", "log10f",
+        "log1pf", "sqrtf", "cbrtf", "floorf", "ceilf", "truncf", "roundf", "nearbyintf",
+        "rintf", "fabsf",
+    ];
+    const BINARY_FLOAT: &[&str] = &[
+        "powf", "atan2f", "fmodf", "hypotf", "remainderf", "fdimf", "fminf", "fmaxf", "copysignf",
+    ];
+
+    let mut assembly = String::from(".syntax unified\n.arch armv7-a\n.fpu vfpv3-d16\n.arm\n.text\n");
+    let mut rust = String::from(
+        "static MATH_NAMES: &[&str] = &[\n",
+    );
+    let mut index = 0usize;
+    for (names, kind) in [
+        (UNARY_DOUBLE, 0u8), (BINARY_DOUBLE, 1u8),
+        (UNARY_FLOAT, 2u8), (BINARY_FLOAT, 3u8),
+    ] {
+        for name in names {
+            writeln!(rust, "    \"{name}\",").unwrap();
+            let internal = format!("__pengudroid_math_{name}");
+            writeln!(assembly, ".globl {internal}\n.type {internal}, %function\n{internal}:").unwrap();
+            assembly.push_str("    sub sp, sp, #24\n    stmia sp, {r0-r3}\n    str lr, [sp, #16]\n");
+            writeln!(assembly, "    movw r0, #{index}").unwrap();
+            assembly.push_str("    blx __pengudroid_math_lookup\n    mov r12, r0\n    cmp r12, #0\n    beq 1f\n");
+            match kind {
+                0 => assembly.push_str("    vldr d0, [sp, #0]\n"),
+                1 => assembly.push_str("    vldr d0, [sp, #0]\n    vldr d1, [sp, #8]\n"),
+                2 => assembly.push_str("    vldr s0, [sp, #0]\n"),
+                3 => assembly.push_str("    vldr s0, [sp, #0]\n    vldr s1, [sp, #4]\n"),
+                _ => unreachable!(),
+            }
+            assembly.push_str("    blx r12\n");
+            if kind < 2 {
+                assembly.push_str("    vmov r0, r1, d0\n");
+            } else {
+                assembly.push_str("    vmov r0, s0\n");
+            }
+            assembly.push_str("    b 2f\n1:\n    mov r0, #0\n    mov r1, #0\n2:\n    ldr lr, [sp, #16]\n    add sp, sp, #24\n    bx lr\n");
+            writeln!(assembly, ".size {internal}, .-{internal}").unwrap();
+            writeln!(assembly, ".symver {internal}, {name}@@LIBM\n").unwrap();
+            index += 1;
+        }
+    }
+    rust.push_str(
+        "];
+static MATH_HOSTS: [std::sync::atomic::AtomicUsize; MATH_NAMES.len()] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; MATH_NAMES.len()];
+
+#[no_mangle]
+unsafe extern \"C\" fn __pengudroid_math_lookup(index: usize) -> *mut c_void {
+    use std::sync::atomic::Ordering;
+    let cached = MATH_HOSTS[index].load(Ordering::Acquire);
+    if cached != 0 { return cached as *mut c_void; }
+    let next = -1isize as *mut c_void;
+    let name = std::ffi::CString::new(MATH_NAMES[index]).unwrap();
+    let pointer = libc::dlsym(next, name.as_ptr());
+    if !pointer.is_null() {
+        MATH_HOSTS[index].store(pointer as usize, Ordering::Release);
+    }
+    pointer
+}
+",
+    );
+    let source = out_dir.join("math_arm.S");
+    let object = out_dir.join("math_arm.o");
+    std::fs::write(&source, assembly).expect("write ARM math boundary");
+    std::fs::write(out_dir.join("math_arm.rs"), rust).expect("write ARM math lookup");
+    let status = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-c", "-O2", "-fPIC", "-x", "assembler-with-cpp"])
+        .arg(&source).arg("-o").arg(&object).status()
+        .expect("working compiler for ARM math boundary");
+    assert!(status.success(), "failed to compile ARM math boundary");
+    let map = out_dir.join("math_arm.map");
+    std::fs::write(&map, "LIBM { global: __pengudroid_math_*; };\n").unwrap();
+    println!("cargo:rustc-cdylib-link-arg={}", object.display());
+    println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script={}", map.display());
 }
 
 fn syscall_path_symbols() -> &'static [&'static str] {
@@ -293,7 +393,7 @@ fn write_version_script(out_dir: &PathBuf) {
         "ZLIB_1.2.0", "ZLIB_1.2.2", "ZLIB_NDK",
         // Host DSOs retain these versions. Their pthread entry points are
         // direct glibc aliases; unversioned Android calls use the Bionic shim.
-        "GLIBC_2.17", "GLIBC_2.30", "GLIBC_2.34",
+        "GLIBC_2.4", "GLIBC_2.17", "GLIBC_2.30", "GLIBC_2.34",
     ];
     let mut script = String::new();
     for node in NODES {

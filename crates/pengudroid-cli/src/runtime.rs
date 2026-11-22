@@ -17,23 +17,32 @@ use std::process::Command;
 pub enum RuntimeArch {
     X86_64,
     Arm64,
+    Arm,
 }
 
 impl RuntimeArch {
     pub const fn cli_name(self) -> &'static str {
-        match self { Self::X86_64 => "x86_64", Self::Arm64 => "arm64" }
+        match self { Self::X86_64 => "x86_64", Self::Arm64 => "arm64", Self::Arm => "arm" }
     }
 
     pub const fn label(self) -> &'static str {
-        match self { Self::X86_64 => "x86_64", Self::Arm64 => "ARM64" }
+        match self { Self::X86_64 => "x86_64", Self::Arm64 => "ARM64", Self::Arm => "ARM32" }
     }
 
     pub const fn boot_dir(self) -> &'static str {
-        match self { Self::X86_64 => "x86_64", Self::Arm64 => "arm64" }
+        match self { Self::X86_64 => "x86_64", Self::Arm64 => "arm64", Self::Arm => "arm" }
+    }
+
+    pub const fn lib_dir(self) -> &'static str {
+        match self { Self::X86_64 | Self::Arm64 => "lib64", Self::Arm => "lib" }
+    }
+
+    pub const fn elf_class(self) -> u8 {
+        match self { Self::X86_64 | Self::Arm64 => 2, Self::Arm => 1 }
     }
 
     pub const fn from_elf_machine(machine: u16) -> Option<Self> {
-        match machine { 62 => Some(Self::X86_64), 183 => Some(Self::Arm64), _ => None }
+        match machine { 62 => Some(Self::X86_64), 183 => Some(Self::Arm64), 40 => Some(Self::Arm), _ => None }
     }
 }
 
@@ -41,12 +50,14 @@ impl RuntimeArch {
 pub const HOST_ARCH: RuntimeArch = RuntimeArch::X86_64;
 #[cfg(target_arch = "aarch64")]
 pub const HOST_ARCH: RuntimeArch = RuntimeArch::Arm64;
+#[cfg(target_arch = "arm")]
+pub const HOST_ARCH: RuntimeArch = RuntimeArch::Arm;
 
 /// Directory name of the prepared runtime inside the cache.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub const RUNTIME_DIR: &str = match HOST_ARCH {
     RuntimeArch::X86_64 => "android17-x86_64",
     RuntimeArch::Arm64 => "android17-arm64",
+    RuntimeArch::Arm => "android17-arm",
 };
 /// Cache directory name this project owns.
 const CACHE_NAME: &str = "pengudroid";
@@ -96,6 +107,7 @@ pub fn locate() -> Option<PathBuf> {
         let checkout = match HOST_ARCH {
             RuntimeArch::X86_64 => ".toolchain/sysroot-android17",
             RuntimeArch::Arm64 => ".toolchain/sysroot-android17-arm64",
+            RuntimeArch::Arm => ".toolchain/sysroot-android17-arm",
         };
         if let Some(tree) = existing(cwd.join(checkout)) {
             return Some(tree);

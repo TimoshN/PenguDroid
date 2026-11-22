@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a pinned API-37 x86_64 or ARM64 runtime without mounts or root.
+"""Prepare a pinned API-37 x86_64, ARM64 or ARM32 runtime without mounts or root.
 
 The GSI is an acquisition archive, never a mounted/booted runtime dependency.
 Only extracted files survive preparation. Review Google's GSI license before
@@ -45,8 +45,11 @@ BUILD = "CP2A.260605.012"
 OWNER = "PenguDroid API-37 runtime preparation"
 DEFAULT_ARCH = "x86_64"
 ARCHITECTURES = {
-    "x86_64": {"boot": "x86_64", "machine": 62, "manifest": "x86_64", "label": "x86_64"},
-    "arm64": {"boot": "arm64", "machine": 183, "manifest": "aarch64", "label": "ARM64"},
+    "x86_64": {"boot": "x86_64", "machine": 62, "manifest": "x86_64", "label": "x86_64", "libdir": "lib64", "class": 2},
+    "arm64": {"boot": "arm64", "machine": 183, "manifest": "aarch64", "label": "ARM64", "libdir": "lib64", "class": 2},
+    # The pinned ARM64 GSI is multilib and ships the matching 32-bit ART,
+    # Bionic, framework boot image and APEX libraries under lib/ and arm/.
+    "arm": {"boot": "arm", "machine": 40, "manifest": "arm", "label": "ARM32", "libdir": "lib", "class": 1},
 }
 MANIFEST = "pengudroid-runtime.json"
 SPARSE_MAGIC = 0xED26FF3A
@@ -96,7 +99,9 @@ def archive_source(arch=DEFAULT_ARCH):
 
 def required(arch=DEFAULT_ARCH):
     boot = architecture(arch)["boot"]
-    return tuple(path.replace("framework/x86_64/", f"framework/{boot}/") for path in REQUIRED)
+    libdir = architecture(arch)["libdir"]
+    return tuple(path.replace("framework/x86_64/", f"framework/{boot}/")
+                 .replace("/lib64/", f"/{libdir}/") for path in REQUIRED)
 
 
 class PreparationError(RuntimeError):
@@ -321,10 +326,13 @@ def validate_runtime(root, arch=DEFAULT_ARCH):
     for key, expected in (("ro.build.version.sdk", "37"), ("ro.build.version.release", "17"), ("ro.build.id", BUILD)):
         if props.get(key) != expected:
             raise PreparationError(f"{key}: expected {expected}, found {props.get(key)!r}; no runtime fallback")
-    with (root / "system/apex/com.android.art/lib64/libart.so").open("rb") as stream:
+    art_path = root / "system/apex/com.android.art" / config["libdir"] / "libart.so"
+    with art_path.open("rb") as stream:
         header = exact(stream, 20)
-    if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != config["machine"]:
-        raise PreparationError(f"ART must be a little-endian ELF64 {config['label']} library")
+    elf_prefix = b"\x7fELF" + bytes((config["class"], 1))
+    if header[:6] != elf_prefix or struct.unpack_from("<H", header, 18)[0] != config["machine"]:
+        raise PreparationError(
+            f"ART must be a little-endian ELF{config['class'] * 32} {config['label']} library")
     return {relative: digest(root / relative) for relative in required_files}
 
 
@@ -413,7 +421,7 @@ def main():
     if args.archive is None:
         args.archive = REPO / ".toolchain/downloads" / filename
     if args.output is None:
-        suffix = "-arm64" if args.arch == "arm64" else ""
+        suffix = "-arm64" if args.arch == "arm64" else "-arm" if args.arch == "arm" else ""
         args.output = REPO / f".toolchain/sysroot-android17{suffix}"
     output = args.output.absolute()
     try:

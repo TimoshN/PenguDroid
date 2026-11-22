@@ -288,7 +288,7 @@ fn push_pcm(track: &Track, bytes: &[u8]) -> i32 {
 pub(super) fn monotonic_ns() -> i64 {
     let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } == 0 {
-        time.tv_sec.saturating_mul(1_000_000_000).saturating_add(time.tv_nsec)
+        i64::from(time.tv_sec).saturating_mul(1_000_000_000).saturating_add(i64::from(time.tv_nsec))
     } else { 0 }
 }
 

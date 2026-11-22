@@ -1224,10 +1224,22 @@ pub mod abi {
     pub const HOST_RUNTIME_ARCH: &str = "x86_64";
     #[cfg(target_arch = "aarch64")]
     pub const HOST_RUNTIME_ARCH: &str = "arm64";
+    #[cfg(target_arch = "arm")]
+    pub const HOST_RUNTIME_ARCH: &str = "arm";
     #[cfg(target_arch = "x86_64")]
     pub const HOST_CPU_ABI: &str = "x86_64";
     #[cfg(target_arch = "aarch64")]
     pub const HOST_CPU_ABI: &str = "arm64-v8a";
+    #[cfg(target_arch = "arm")]
+    pub const HOST_CPU_ABI: &str = "armeabi-v7a";
+    #[cfg(target_arch = "arm")]
+    pub const HOST_CPU_ABI64: &str = "";
+    #[cfg(not(target_arch = "arm"))]
+    pub const HOST_CPU_ABI64: &str = HOST_CPU_ABI;
+    #[cfg(target_arch = "arm")]
+    pub const HOST_CPU_ABI32: &str = HOST_CPU_ABI;
+    #[cfg(not(target_arch = "arm"))]
+    pub const HOST_CPU_ABI32: &str = "";
 
     /// Guard generic overrides against changing an already validated platform
     /// identity. `current` must come from the raw property store, not its
@@ -1255,7 +1267,7 @@ pub mod abi {
 }
 
 /// `ioctl` request numbers are `unsigned long` on Linux.
-pub type Ioctl = u64;
+pub type Ioctl = std::os::raw::c_ulong;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtoError {

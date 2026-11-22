@@ -1,4 +1,4 @@
-//! AArch64 Bionic/glibc mutex compatibility and condition-variable glue.
+//! ARM Bionic/glibc mutex compatibility and condition-variable glue.
 //!
 //! Bionic's LP64 pthread_mutex_t is 40 bytes, while glibc's AArch64 mutex is
 //! 48 bytes. Direct pthread_mutex_init/lock calls therefore overwrite eight
@@ -15,7 +15,10 @@ use super::dlsym_next;
 #[repr(C, align(8))]
 struct HostMutex(libc::pthread_mutex_t);
 
+#[cfg(target_pointer_width = "64")]
 const BIONIC_ATTR_SIZE: usize = 56;
+#[cfg(target_pointer_width = "32")]
+const BIONIC_ATTR_SIZE: usize = 24;
 
 /// Convert the Bionic attribute to glibc's larger AArch64 object without
 /// reading or writing beyond the guest's 56-byte allocation.
@@ -24,11 +27,62 @@ unsafe fn host_attr(guest: *const c_void) -> Option<libc::pthread_attr_t> {
         return None;
     }
     let mut host: libc::pthread_attr_t = std::mem::zeroed();
+    #[cfg(target_pointer_width = "64")]
     std::ptr::copy_nonoverlapping(
         guest as *const u8,
         &mut host as *mut libc::pthread_attr_t as *mut u8,
         BIONIC_ATTR_SIZE,
     );
+    #[cfg(target_pointer_width = "32")]
+    {
+        #[repr(C)]
+        struct GuestAttr {
+            flags: u32,
+            stack_base: *mut c_void,
+            stack_size: usize,
+            guard_size: usize,
+            sched_policy: c_int,
+            sched_priority: c_int,
+        }
+        type AttrInit = unsafe extern "C" fn(*mut libc::pthread_attr_t) -> c_int;
+        type SetState = unsafe extern "C" fn(*mut libc::pthread_attr_t, c_int) -> c_int;
+        type SetSize = unsafe extern "C" fn(*mut libc::pthread_attr_t, usize) -> c_int;
+        type SetParam = unsafe extern "C" fn(*mut libc::pthread_attr_t, *const libc::sched_param) -> c_int;
+        type SetStack = unsafe extern "C" fn(*mut libc::pthread_attr_t, *mut c_void, usize) -> c_int;
+        let init = dlsym_next::<AttrInit>(b"pthread_attr_init\0")?;
+        let set_detach = dlsym_next::<SetState>(b"pthread_attr_setdetachstate\0")?;
+        let set_guard = dlsym_next::<SetSize>(b"pthread_attr_setguardsize\0")?;
+        let set_policy = dlsym_next::<SetState>(b"pthread_attr_setschedpolicy\0")?;
+        let set_param = dlsym_next::<SetParam>(b"pthread_attr_setschedparam\0")?;
+        let set_stack = dlsym_next::<SetStack>(b"pthread_attr_setstack\0")?;
+        let set_stack_size = dlsym_next::<SetSize>(b"pthread_attr_setstacksize\0")?;
+        if init(&mut host) != 0 { return None; }
+        let guest = &*(guest as *const GuestAttr);
+        let detached = if guest.flags & 1 != 0 {
+            libc::PTHREAD_CREATE_DETACHED
+        } else {
+            libc::PTHREAD_CREATE_JOINABLE
+        };
+        if set_detach(&mut host, detached) != 0
+            || set_guard(&mut host, guest.guard_size) != 0
+            || set_policy(&mut host, guest.sched_policy) != 0
+            || set_param(
+                &mut host,
+                &libc::sched_param { sched_priority: guest.sched_priority },
+            ) != 0
+        {
+            return None;
+        }
+        if !guest.stack_base.is_null() && guest.stack_size != 0 {
+            if set_stack(&mut host, guest.stack_base, guest.stack_size) != 0 {
+                return None;
+            }
+        } else if guest.stack_size >= 16384
+            && set_stack_size(&mut host, guest.stack_size) != 0
+        {
+            return None;
+        }
+    }
     Some(host)
 }
 
@@ -44,11 +98,30 @@ pub unsafe extern "C" fn __pengudroid_bionic_pthread_attr_init(guest: *mut c_voi
     let mut host: libc::pthread_attr_t = std::mem::zeroed();
     let result = real(&mut host);
     if result == 0 {
+        #[cfg(target_pointer_width = "64")]
         std::ptr::copy_nonoverlapping(
             &host as *const libc::pthread_attr_t as *const u8,
             guest as *mut u8,
             BIONIC_ATTR_SIZE,
         );
+        #[cfg(target_pointer_width = "32")]
+        {
+            #[repr(C)]
+            struct GuestAttr {
+                flags: u32,
+                stack_base: *mut c_void,
+                stack_size: usize,
+                guard_size: usize,
+                sched_policy: c_int,
+                sched_priority: c_int,
+            }
+            let out = &mut *(guest as *mut GuestAttr);
+            std::ptr::write_bytes(out, 0, 1);
+            // Bionic ILP32 defaults: 1 MiB minus the 16 KiB alternate signal
+            // stack, one-page guard, SCHED_OTHER and joinable.
+            out.stack_size = 1024 * 1024 - 16 * 1024;
+            out.guard_size = 4096;
+        }
     }
     result
 }
@@ -468,7 +541,7 @@ pub unsafe extern "C" fn pthread_cond_timedwait_monotonic_np(
 // Android references are made unversioned by de-bionic, whereas host DSOs keep
 // GLIBC symbol versions. Exporting direct GLIBC aliases gives the loader an
 // exact, ABI-safe boundary without guessing an ABI from a pointer's contents.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 macro_rules! host_mutex_one_arg {
     ($name:ident, $symbol:literal) => {
         #[no_mangle]
@@ -482,16 +555,16 @@ macro_rules! host_mutex_one_arg {
     };
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_mutex_one_arg!(__pengudroid_host_pthread_mutex_lock, b"pthread_mutex_lock\0");
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_mutex_one_arg!(__pengudroid_host_pthread_mutex_unlock, b"pthread_mutex_unlock\0");
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_mutex_one_arg!(__pengudroid_host_pthread_mutex_trylock, b"pthread_mutex_trylock\0");
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_mutex_one_arg!(__pengudroid_host_pthread_mutex_destroy, b"pthread_mutex_destroy\0");
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 #[no_mangle]
 unsafe extern "C" fn __pengudroid_host_pthread_mutex_init(
     mutex: *mut c_void,
@@ -507,7 +580,7 @@ unsafe extern "C" fn __pengudroid_host_pthread_mutex_init(
     real(mutex as *mut libc::pthread_mutex_t, attr as *const libc::pthread_mutexattr_t)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 macro_rules! host_cond_wait {
     ($name:ident, $symbol:literal, $(($arg:ident, $ty:ty)),*) => {
         #[no_mangle]
@@ -533,7 +606,7 @@ macro_rules! host_cond_wait {
     };
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 macro_rules! host_cond_one_arg {
     ($name:ident, $symbol:literal) => {
         #[no_mangle]
@@ -547,14 +620,14 @@ macro_rules! host_cond_one_arg {
     };
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_cond_one_arg!(__pengudroid_host_pthread_cond_signal, b"pthread_cond_signal\0");
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_cond_one_arg!(__pengudroid_host_pthread_cond_broadcast, b"pthread_cond_broadcast\0");
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_cond_one_arg!(__pengudroid_host_pthread_cond_destroy, b"pthread_cond_destroy\0");
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 #[no_mangle]
 unsafe extern "C" fn __pengudroid_host_pthread_cond_init(
     cond: *mut c_void,
@@ -567,15 +640,15 @@ unsafe extern "C" fn __pengudroid_host_pthread_cond_init(
     real(cond as *mut libc::pthread_cond_t, attr)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_cond_wait!(__pengudroid_host_pthread_cond_wait, b"pthread_cond_wait\0",);
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_cond_wait!(
     __pengudroid_host_pthread_cond_timedwait,
     b"pthread_cond_timedwait\0",
     (timeout, *const libc::timespec)
 );
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 host_cond_wait!(
     __pengudroid_host_pthread_cond_clockwait,
     b"pthread_cond_clockwait\0",
@@ -583,7 +656,7 @@ host_cond_wait!(
     (timeout, *const libc::timespec)
 );
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 #[no_mangle]
 unsafe extern "C" fn __pengudroid_host_pthread_attr_init(attr: *mut c_void) -> c_int {
     type Real = unsafe extern "C" fn(*mut libc::pthread_attr_t) -> c_int;
@@ -593,7 +666,7 @@ unsafe extern "C" fn __pengudroid_host_pthread_attr_init(attr: *mut c_void) -> c
     real(attr as *mut libc::pthread_attr_t)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 #[no_mangle]
 unsafe extern "C" fn __pengudroid_host_pthread_attr_destroy(attr: *mut c_void) -> c_int {
     type Real = unsafe extern "C" fn(*mut libc::pthread_attr_t) -> c_int;
@@ -603,7 +676,7 @@ unsafe extern "C" fn __pengudroid_host_pthread_attr_destroy(attr: *mut c_void) -
     real(attr as *mut libc::pthread_attr_t)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 #[no_mangle]
 unsafe extern "C" fn __pengudroid_host_pthread_create(
     thread: *mut libc::pthread_t,
@@ -657,6 +730,30 @@ std::arch::global_asm!(r#"
     .symver __pengudroid_host_pthread_attr_init, pthread_attr_init@GLIBC_2.17
     .symver __pengudroid_host_pthread_attr_destroy, pthread_attr_destroy@GLIBC_2.17
     .symver __pengudroid_host_pthread_create, pthread_create@GLIBC_2.17
+    .symver __pengudroid_host_pthread_create, pthread_create@GLIBC_2.34
+"#);
+
+// ARM32 host libraries use GLIBC_2.4 as their baseline pthread symbol
+// version. Android references remain unversioned after de-bionic and use the
+// plain Rust exports below; host DSOs bind these explicit glibc aliases.
+#[cfg(target_arch = "arm")]
+std::arch::global_asm!(r#"
+    .symver __pengudroid_host_pthread_mutex_lock, pthread_mutex_lock@GLIBC_2.4
+    .symver __pengudroid_host_pthread_mutex_unlock, pthread_mutex_unlock@GLIBC_2.4
+    .symver __pengudroid_host_pthread_mutex_trylock, pthread_mutex_trylock@GLIBC_2.4
+    .symver __pengudroid_host_pthread_mutex_destroy, pthread_mutex_destroy@GLIBC_2.4
+    .symver __pengudroid_host_pthread_mutex_init, pthread_mutex_init@GLIBC_2.4
+    .symver __pengudroid_host_pthread_cond_init, pthread_cond_init@GLIBC_2.4
+    .symver __pengudroid_host_pthread_cond_destroy, pthread_cond_destroy@GLIBC_2.4
+    .symver __pengudroid_host_pthread_cond_signal, pthread_cond_signal@GLIBC_2.4
+    .symver __pengudroid_host_pthread_cond_broadcast, pthread_cond_broadcast@GLIBC_2.4
+    .symver __pengudroid_host_pthread_cond_wait, pthread_cond_wait@GLIBC_2.4
+    .symver __pengudroid_host_pthread_cond_timedwait, pthread_cond_timedwait@GLIBC_2.4
+    .symver __pengudroid_host_pthread_cond_clockwait, pthread_cond_clockwait@GLIBC_2.30
+    .symver __pengudroid_host_pthread_cond_clockwait, pthread_cond_clockwait@GLIBC_2.34
+    .symver __pengudroid_host_pthread_attr_init, pthread_attr_init@GLIBC_2.4
+    .symver __pengudroid_host_pthread_attr_destroy, pthread_attr_destroy@GLIBC_2.4
+    .symver __pengudroid_host_pthread_create, pthread_create@GLIBC_2.4
     .symver __pengudroid_host_pthread_create, pthread_create@GLIBC_2.34
 "#);
 

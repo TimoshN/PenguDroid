@@ -1684,7 +1684,7 @@ mod imp {
             let required = stride as i64 * height as i64;
             // dma-buf commonly reports size 0 through fstat. wl_shm still
             // needs an explicit mapping size, which is known from the layout.
-            let pool_size = if stat.st_size == 0 { required } else { stat.st_size };
+            let pool_size = if stat.st_size == 0 { required } else { stat.st_size as i64 };
             if pool_size < required {
                 return Err(format!("PresentShm: fd is {} bytes, need {required}", stat.st_size));
             }

@@ -106,9 +106,10 @@ class RuntimeTests(unittest.TestCase):
         (root / "system/build.prop").write_text(
             "ro.build.version.sdk=37\nro.build.version.release=17\nro.build.id=" + prepare.BUILD + "\n")
         header = bytearray(20)
-        header[:6] = b"\x7fELF\x02\x01"
+        header[:6] = b"\x7fELF" + bytes((prepare.architecture(arch)["class"], 1))
         struct.pack_into("<H", header, 18, prepare.architecture(arch)["machine"])
-        (root / "system/apex/com.android.art/lib64/libart.so").write_bytes(header)
+        art = root / "system/apex/com.android.art" / prepare.architecture(arch)["libdir"] / "libart.so"
+        art.write_bytes(header)
         return root
 
     def test_identity_and_owned_runtime_reuse_without_archive(self):
@@ -160,6 +161,24 @@ class RuntimeTests(unittest.TestCase):
         art.write_bytes(header)
         with self.assertRaisesRegex(prepare.PreparationError, "ARM64"):
             prepare.validate_runtime(root, "arm64")
+
+    def test_arm32_uses_multilib_gsi_layout_and_elf_identity(self):
+        root = self.fixture("arm")
+        self.assertTrue((root / "system/framework/arm/boot.art").is_file())
+        self.assertTrue((root / "system/apex/com.android.art/lib/libart.so").is_file())
+        hashes = prepare.validate_runtime(root, "arm")
+        self.assertIn("system/lib/libc.so", hashes)
+        art = root / "system/apex/com.android.art/lib/libart.so"
+        header = bytearray(art.read_bytes())
+        struct.pack_into("<H", header, 18, 183)
+        art.write_bytes(header)
+        with self.assertRaisesRegex(prepare.PreparationError, "ARM32"):
+            prepare.validate_runtime(root, "arm")
+
+    def test_arm32_reuses_the_pinned_multilib_arm64_archive(self):
+        archive, output = prepare.cache_paths({"HOME": "/home/nobody"}, arch="arm")
+        self.assertEqual(archive.name, prepare.ARM64_FILENAME)
+        self.assertEqual(output, Path("/home/nobody/.cache/pengudroid/runtime/android17-arm"))
 
     def test_arm64_reuse_cannot_adopt_an_x86_64_manifest(self):
         root = self.fixture("arm64")

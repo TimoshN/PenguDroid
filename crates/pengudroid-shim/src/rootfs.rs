@@ -255,7 +255,7 @@ type Open2Fn = unsafe extern "C" fn(*const c_char, c_int) -> c_int;
 type OpenAt2Fn = unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int;
 
 /// `stat(path, buf)`.
-#[no_mangle]
+#[cfg_attr(not(target_arch = "arm"), no_mangle)]
 pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut c_void) -> c_int {
     match next::<StatFn>(b"stat\0") {
         Some(f) => with_path(path, |p| f(p, buf)),
@@ -264,7 +264,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut c_void) -> c_int {
 }
 
 /// `lstat(path, buf)`.
-#[no_mangle]
+#[cfg_attr(not(target_arch = "arm"), no_mangle)]
 pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut c_void) -> c_int {
     match next::<StatFn>(b"lstat\0") {
         Some(f) => with_path(path, |p| f(p, buf)),
@@ -273,7 +273,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut c_void) -> c_int {
 }
 
 /// `fstatat(dirfd, path, buf, flags)`.
-#[no_mangle]
+#[cfg_attr(not(target_arch = "arm"), no_mangle)]
 pub unsafe extern "C" fn fstatat(
     dirfd: c_int,
     path: *const c_char,
@@ -293,7 +293,7 @@ pub unsafe extern "C" fn fstatat(
 // `/system/...` path looks absent and `FontListParser` rejects every font.
 
 /// `stat64(path, buf)`.
-#[no_mangle]
+#[cfg_attr(not(target_arch = "arm"), no_mangle)]
 pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut c_void) -> c_int {
     match next::<StatFn>(b"stat64\0") {
         Some(f) => with_path(path, |p| f(p, buf)),
@@ -302,7 +302,7 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut c_void) -> c_int 
 }
 
 /// `lstat64(path, buf)`.
-#[no_mangle]
+#[cfg_attr(not(target_arch = "arm"), no_mangle)]
 pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut c_void) -> c_int {
     match next::<StatFn>(b"lstat64\0") {
         Some(f) => with_path(path, |p| f(p, buf)),
@@ -311,7 +311,7 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut c_void) -> c_int
 }
 
 /// `fstatat64(dirfd, path, buf, flags)`.
-#[no_mangle]
+#[cfg_attr(not(target_arch = "arm"), no_mangle)]
 pub unsafe extern "C" fn fstatat64(
     dirfd: c_int,
     path: *const c_char,
@@ -326,7 +326,7 @@ pub unsafe extern "C" fn fstatat64(
 
 /// `fstat64(fd, buf)` — no path, so nothing to rewrite; defined so the symbol
 /// resolves through the shim like its siblings.
-#[no_mangle]
+#[cfg_attr(not(target_arch = "arm"), no_mangle)]
 pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut c_void) -> c_int {
     match next::<unsafe extern "C" fn(c_int, *mut c_void) -> c_int>(b"fstat64\0") {
         Some(f) => f(fd, buf),

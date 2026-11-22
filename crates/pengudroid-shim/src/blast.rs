@@ -106,10 +106,10 @@ unsafe fn jni_new_object(
 
 /// `android::BufferQueue::createBufferQueue(sp<IGraphicBufferProducer>*,
 /// sp<IGraphicBufferConsumer>*, bool consumerIsSurfaceFlinger)`.
-type CreateBufferQueue = unsafe extern "C" fn(*mut [u64; 2], *mut [u64; 2], bool);
+type CreateBufferQueue = unsafe extern "C" fn(*mut [usize; 2], *mut [usize; 2], bool);
 /// `BufferItemConsumer(const sp<IGraphicBufferConsumer>&, uint64_t usage,
 /// int bufferCount, bool controlledByApp)`.
-type ItemConsumerCtor = unsafe extern "C" fn(*mut c_void, *const [u64; 2], u64, i32, bool);
+type ItemConsumerCtor = unsafe extern "C" fn(*mut c_void, *const [usize; 2], u64, i32, bool);
 type BufferItemCtor = unsafe extern "C" fn(*mut c_void);
 type BufferItemDtor = unsafe extern "C" fn(*mut c_void);
 /// `BufferItemConsumer::acquireBuffer(BufferItem*, nsecs_t, bool,
@@ -145,9 +145,11 @@ struct BufferItemPrefix {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<usize>() == 8);
     assert!(std::mem::size_of::<BufferCrop>() == 16);
+    #[cfg(target_pointer_width = "64")]
     assert!(std::mem::size_of::<BufferItemPrefix>() == 48);
+    #[cfg(target_pointer_width = "32")]
+    assert!(std::mem::size_of::<BufferItemPrefix>() == 32);
 };
 
 /// `item` must be a live, acquired API-37 BufferItem. Copy metadata only; the
@@ -179,7 +181,7 @@ type SetConsumerUsage = unsafe extern "C" fn(*mut c_void, u64) -> i32;
 type SetMaxAcquired = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 /// `Surface(const sp<IGraphicBufferProducer>&, bool, const sp<IBinder>&)`.
 type SurfaceCtor =
-    unsafe extern "C" fn(*mut c_void, *const [u64; 2], bool, *const [u64; 2]);
+    unsafe extern "C" fn(*mut c_void, *const [usize; 2], bool, *const [usize; 2]);
 type SurfaceIntSetter = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type SurfaceDimsSetter = unsafe extern "C" fn(*mut c_void, u32, u32) -> i32;
 /// `BLASTBufferQueue::update(const sp<SurfaceControl>&, uint32_t width,
@@ -355,8 +357,8 @@ const OBJECT_SIZE: usize = 8192;
 /// android17-release StrongPointer.h stores one object pointer in `sp<T>`;
 /// `producer`/`consumer` reserve an extra, unused word, not a control block.
 struct Blast {
-    producer: [u64; 2],
-    consumer: [u64; 2],
+    producer: [usize; 2],
+    consumer: [usize; 2],
     /// `android::BufferItemConsumer*` — the consumer end, owned by us.
     item_consumer: *mut c_void,
     /// `android::Surface*` — the native half of the Java `Surface` we hand out.
@@ -428,8 +430,8 @@ unsafe extern "C" fn native_create(
 
     // A real producer/consumer pair. `consumerIsSurfaceFlinger = false` keeps
     // the queue in "app" mode (no SurfaceFlinger-only buffer accounting).
-    let mut producer = [0u64; 2];
-    let mut consumer = [0u64; 2];
+    let mut producer = [0usize; 2];
+    let mut consumer = [0usize; 2];
     (gui.create_buffer_queue)(&mut producer, &mut consumer, false);
     if producer[0] == 0 || consumer[0] == 0 {
         eprintln!("[blast] BufferQueue::createBufferQueue returned nothing");
@@ -1105,7 +1107,7 @@ unsafe fn dump_rgb565(
 }
 
 /// An empty `sp<Fence>`: `releaseBuffer` accepts it and treats it as "no fence".
-static EMPTY_SP: [u64; 2] = [0, 0];
+static EMPTY_SP: [usize; 2] = [0, 0];
 
 // ---------------------------------------------------------------------------
 // Registration

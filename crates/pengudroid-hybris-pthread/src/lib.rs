@@ -32,3 +32,28 @@ __pengudroid_hybris_\name:
     HYBRIS_PTHREAD_FORWARD pthread_setspecific, pthread_setspecific
     HYBRIS_PTHREAD_FORWARD pthread_once, pthread_once
 "#);
+
+#[cfg(target_arch = "arm")]
+std::arch::global_asm!(r#"
+    .syntax unified
+    .arch armv7-a
+    .arm
+    .text
+    .p2align 2
+
+    .macro HYBRIS_PTHREAD_FORWARD name
+    .global __pengudroid_hybris_\name
+    .type __pengudroid_hybris_\name, %function
+    .symver __pengudroid_hybris_\name, \name@LIBC
+    .symver __pengudroid_host_\name, \name@GLIBC_2.4
+__pengudroid_hybris_\name:
+    b __pengudroid_host_\name
+    .size __pengudroid_hybris_\name, .-__pengudroid_hybris_\name
+    .endm
+
+    HYBRIS_PTHREAD_FORWARD pthread_key_create
+    HYBRIS_PTHREAD_FORWARD pthread_key_delete
+    HYBRIS_PTHREAD_FORWARD pthread_getspecific
+    HYBRIS_PTHREAD_FORWARD pthread_setspecific
+    HYBRIS_PTHREAD_FORWARD pthread_once
+"#);

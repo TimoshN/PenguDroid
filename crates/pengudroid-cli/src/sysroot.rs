@@ -10,9 +10,9 @@
 //!   Bionic shim, loads `libart.so`, and calls `JNI_CreateJavaVM`. It prints
 //!   ART's own diagnostic when the runtime cannot start.
 //!
-//! Extracted Android 17 / API 37 x86_64 and ARM64 roots are recognized:
-//! `system/lib64`, `system/apex/com.android.art/lib64`, and
-//! `system/framework/{x86_64,arm64}/boot.art`. The runtime's own
+//! Extracted Android 17 / API 37 x86_64, ARM64 and ARM32 roots are recognized:
+//! `system/lib64` or `system/lib`, the matching ART APEX library directory, and
+//! `system/framework/{x86_64,arm64,arm}/boot.art`. The runtime's own
 //! `system/build.prop` and ART ELF header must identify the target; legacy flat layouts are not
 //! accepted. Framework boot jars come from `system/etc/classpaths/bootclasspath.pb`.
 
@@ -30,7 +30,7 @@ use pengudroid_nativebridge::{RuntimeCallbacks, Shorty, Translator};
 fn validate_runtime(system: &Path) -> Result<RuntimeArch, String> {
     let props_path = system.join("build.prop");
     let props = std::fs::read_to_string(&props_path).map_err(|e| format!(
-        "Android 17 / API 37 x86_64/ARM64 requires {}: {e}", props_path.display()
+        "Android 17 / API 37 x86_64/ARM64/ARM32 requires {}: {e}", props_path.display()
     ))?;
     let sdk: Vec<&str> = props.lines().filter_map(|line| {
         let (key, value) = line.split_once('=')?;
@@ -38,7 +38,7 @@ fn validate_runtime(system: &Path) -> Result<RuntimeArch, String> {
     }).collect();
     if sdk.len() != 1 || sdk[0] != "37" {
         return Err(format!(
-            "unsupported runtime in {}: expected Android 17 / API 37 x86_64 or ARM64 \
+            "unsupported runtime in {}: expected Android 17 / API 37 x86_64, ARM64 or ARM32 \
              (ro.build.version.sdk=37), found {}",
             props_path.display(),
             if sdk.is_empty() { "no SDK property".into() } else { sdk.join(", ") }
@@ -46,24 +46,37 @@ fn validate_runtime(system: &Path) -> Result<RuntimeArch, String> {
     }
 
     // Only identity is needed here, not section headers or dynamic symbols.
-    // A lib64 directory (or a CPU property) does not prove the ELF is x86_64.
-    let art = system.join("apex/com.android.art/lib64/libart.so");
+    // A library directory (or a CPU property) does not prove the ELF identity.
+    let art64 = system.join("apex/com.android.art/lib64/libart.so");
+    let art32 = system.join("apex/com.android.art/lib/libart.so");
+    // A multilib ARM64 GSI contains both views. Prefer the view matching this
+    // host build; the fallback still permits inspecting a foreign runtime.
+    let preferred = if HOST_ARCH.lib_dir() == "lib" { art32.clone() } else { art64.clone() };
+    let art = if preferred.is_file() {
+        preferred
+    } else if art64.is_file() {
+        art64
+    } else {
+        art32
+    };
     let mut header = [0u8; 20];
     std::fs::File::open(&art).and_then(|mut file| file.read_exact(&mut header))
         .map_err(|e| format!(
-            "Android 17 / API 37 x86_64/ARM64 requires an ART ELF header at {}: {e}",
+            "Android 17 / API 37 requires an ART ELF header at {}: {e}",
             art.display()
         ))?;
     if &header[..4] != b"\x7fELF" {
-        return Err(format!("{} is not an ELF file; Android 17 / API 37 x86_64 or ARM64 is required", art.display()));
+        return Err(format!("{} is not an ELF file; Android 17 / API 37 is required", art.display()));
     }
     let machine = u16::from_le_bytes([header[18], header[19]]);
     let arch = RuntimeArch::from_elf_machine(machine);
-    if header[4] != 2 || header[5] != 1 || arch.is_none() {
+    if header[5] != 1 || arch.is_none()
+        || arch.is_some_and(|arch| header[4] != arch.elf_class())
+    {
         return Err(format!(
-            "unsupported ART runtime {}: Android 17 / API 37 requires a 64-bit \
-             little-endian x86_64 ELF or ARM64 ELF (class=2, data=1, machine=62 or 183); \
-             found class={}, data={}, machine={} ({})",
+            "unsupported ART runtime {}: Android 17 / API 37 requires a little-endian \
+             x86_64, ARM64 or ARM32 ELF with its matching class (class=2/machine=62 or 183, \
+             class=1/machine=40); found class={}, data={}, machine={} ({})",
             art.display(), header[4], header[5], machine, pengudroid_elf::machine_name(machine)
         ));
     }
@@ -222,8 +235,8 @@ impl Layout {
             .map_err(|e| format!("cannot resolve sysroot {}: {e}", root.display()))?;
         if !root.join("system").is_dir() {
             return Err(format!(
-                "unsupported sysroot {}: expected an extracted Android 17 / API 37 x86_64 or ARM64 \
-                 root with system/build.prop and system/apex/com.android.art/lib64/libart.so; \
+                "unsupported sysroot {}: expected an extracted Android 17 / API 37 x86_64, ARM64 or ARM32 \
+                 root with system/build.prop and system/apex/com.android.art/lib64/libart.so or lib/libart.so; \
                  legacy flat sysroots are not supported",
                 root.display()
             ));
@@ -236,13 +249,14 @@ impl Layout {
         let arch = validate_runtime(&system)?;
         let art_root = system.join("apex/com.android.art");
         let framework = system.join("framework");
-        // Every APEX ships its own lib64; ART's dependency closure reaches
-        // several of them (statsd, i18n, conscrypt, ...), so all are added.
-        let mut lib_dirs = vec![system.join("lib64"), art_root.join("lib64")];
+        // Every APEX uses the runtime's own lib64/lib directory; ART's
+        // dependency closure reaches several other APEX modules.
+        let libdir = arch.lib_dir();
+        let mut lib_dirs = vec![system.join(libdir), art_root.join(libdir)];
         if let Ok(entries) = std::fs::read_dir(system.join("apex")) {
             let mut apex_libs: Vec<PathBuf> = entries
                 .flatten()
-                .map(|e| e.path().join("lib64"))
+                .map(|e| e.path().join(libdir))
                 .filter(|p| p.is_dir())
                 .collect();
             apex_libs.sort();
@@ -320,11 +334,12 @@ impl Layout {
 
     /// Files ART needs, with a description.
     pub fn required(&self) -> Vec<(String, PathBuf)> {
+        let art_lib = self.arch.lib_dir();
         vec![
-            ("ART runtime".into(), self.art_root.join("lib64/libart.so")),
-            ("ART base".into(), self.art_root.join("lib64/libartbase.so")),
-            ("DEX support".into(), self.art_root.join("lib64/libdexfile.so")),
-            ("JNI helpers".into(), self.art_root.join("lib64/libnativehelper.so")),
+            ("ART runtime".into(), self.art_root.join(art_lib).join("libart.so")),
+            ("ART base".into(), self.art_root.join(art_lib).join("libartbase.so")),
+            ("DEX support".into(), self.art_root.join(art_lib).join("libdexfile.so")),
+            ("JNI helpers".into(), self.art_root.join(art_lib).join("libnativehelper.so")),
             ("Bionic libc".into(), self.lib_dirs[0].join("libc.so")),
             ("boot image".into(), self.boot_images.join("boot.art")),
             ("boot image (oat)".into(), self.boot_images.join("boot.oat")),
@@ -1384,7 +1399,7 @@ pub fn art_main(args: &[String]) -> i32 {
         .as_ref()
         .map(|d| d.join("libart.so"))
         .filter(|p| p.exists())
-        .unwrap_or_else(|| layout.art_root.join("lib64/libart.so"));
+        .unwrap_or_else(|| layout.art_root.join(layout.arch.lib_dir()).join("libart.so"));
     let cpath = match CString::new(lib.to_string_lossy().as_bytes()) {
         Ok(c) => c,
         Err(_) => return 2,
@@ -2787,8 +2802,11 @@ mod tests {
         fn android17_arch(arch: RuntimeArch) -> Self {
             let fixture = Self::empty();
             fixture.write("system/build.prop", b"ro.build.version.sdk=37\nro.build.version.release=17\n");
-            let machine = match arch { RuntimeArch::X86_64 => 0x3e, RuntimeArch::Arm64 => 0xb7 };
-            fixture.write("system/apex/com.android.art/lib64/libart.so", &elf_header(2, 1, machine));
+            let machine = match arch { RuntimeArch::X86_64 => 0x3e, RuntimeArch::Arm64 => 0xb7, RuntimeArch::Arm => 0x28 };
+            fixture.write(
+                &format!("system/apex/com.android.art/{}/libart.so", arch.lib_dir()),
+                &elf_header(arch.elf_class(), 1, machine),
+            );
             for name in ["core-oj", "core-libart", "okhttp", "bouncycastle", "apache-xml"] {
                 fixture.write(&format!("system/apex/com.android.art/javalib/{name}.jar"), b"jar");
             }
@@ -3011,13 +3029,13 @@ mod tests {
         for (class, data, machine) in [(2, 1, 3), (1, 1, 3), (2, 2, 0x3e), (1, 1, 0x3e)] {
             fixture.write("system/apex/com.android.art/lib64/libart.so", &elf_header(class, data, machine));
             let error = fixture.error();
-            assert!(error.contains("x86_64 ELF"), "{error}");
+            assert!(error.contains("x86_64"), "{error}");
             assert!(error.contains(&format!("machine={machine}")), "{error}");
         }
         for bytes in [b"not an ELF".as_slice(), &[0u8; 64]] {
             fixture.write("system/apex/com.android.art/lib64/libart.so", bytes);
             let error = fixture.error();
-            assert!(error.contains("x86_64"), "{error}");
+            assert!(error.contains("Android 17 / API 37"), "{error}");
         }
         fixture.write("lib64/libart.so", &elf_header(2, 1, 0x3e));
         std::fs::remove_file(fixture.0.join("system/apex/com.android.art/lib64/libart.so")).unwrap();
@@ -3031,6 +3049,15 @@ mod tests {
         let android = Layout::detect(&fixture.0).unwrap();
         assert_eq!(android.arch, RuntimeArch::Arm64);
         assert_eq!(android.boot_images, android.android_root.join("framework/arm64"));
+    }
+
+    #[test]
+    fn detects_android17_arm32_layout() {
+        let fixture = Fixture::android17_arch(RuntimeArch::Arm);
+        let android = Layout::detect(&fixture.0).unwrap();
+        assert_eq!(android.arch, RuntimeArch::Arm);
+        assert_eq!(android.boot_images, android.android_root.join("framework/arm"));
+        assert_eq!(android.required()[0].1, android.art_root.join("lib/libart.so"));
     }
 
     #[test]

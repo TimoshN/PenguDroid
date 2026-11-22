@@ -1003,6 +1003,20 @@ pub fn strip_android_versions(d: &[u8]) -> Result<Vec<u8>> {
 
     let mut out = d.to_vec();
 
+    // Android's 32-bit ARM objects carry EF_ARM_ABI_FLOAT_SOFT (softfp),
+    // while Aurora's armv7hl glibc loader accepts only its hard-float ABI
+    // tag. Mark the prepared container with the host tag so glibc will map it.
+    // This does not rewrite instructions: integer/pointer calls keep the same
+    // AAPCS registers, and the hosted boundaries that accept floating-point
+    // arguments must provide their own softfp-to-hard-float forwarding.
+    if !is64 && rd_u16(&out, 18)? == 40 {
+        let flags = rd_u32(&out, 36)?;
+        if flags & 0x0000_0200 != 0 {
+            let host_flags = (flags & !0x0000_0200) | 0x0000_0400;
+            out[36..40].copy_from_slice(&host_flags.to_le_bytes());
+        }
+    }
+
     // Drop per-symbol version selection: every non-zero entry becomes *global*.
     if let Some((off, size)) = versym {
         for k in 0..(size / 2) {
@@ -1125,6 +1139,20 @@ mod tests {
         let after = parse(&stripped).unwrap();
         assert_eq!(before.imports, after.imports);
         assert_eq!(before.exports, after.exports);
+    }
+
+    #[test]
+    fn strip_marks_android_arm32_containers_for_hard_float_loader() {
+        let mut elf = vec![0u8; 92];
+        elf[..7].copy_from_slice(b"\x7fELF\x01\x01\x01");
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&40u16.to_le_bytes());
+        elf[32..36].copy_from_slice(&52u32.to_le_bytes());
+        elf[36..40].copy_from_slice(&0x0500_0200u32.to_le_bytes());
+        elf[46..48].copy_from_slice(&40u16.to_le_bytes());
+        elf[48..50].copy_from_slice(&1u16.to_le_bytes());
+        let out = strip_android_versions(&elf).unwrap();
+        assert_eq!(u32::from_le_bytes(out[36..40].try_into().unwrap()), 0x0500_0400);
     }
 
     #[test]

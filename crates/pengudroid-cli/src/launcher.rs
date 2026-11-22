@@ -484,10 +484,10 @@ pub fn launch(args: &[String]) -> i32 {
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    if bundle_selected_abi.as_deref() == Some("armeabi-v7a") {
+    if bundle_selected_abi.as_deref() == Some("armeabi-v7a") && !cfg!(target_arch = "arm") {
         eprintln!(
             "pengudroid launch: {} only ships 32-bit armeabi-v7a libraries; \
-             PenguDroid's runtime and Berberis translator require 64-bit arm64-v8a or x86_64",
+             this PenguDroid build requires a 64-bit arm64-v8a or x86_64 runtime",
             info.package
         );
         return 1;
@@ -908,8 +908,12 @@ fn aurora_theme_density_dpi() -> Option<(f64, i32)> {
 }
 
 fn aurora_hybris_host() -> bool {
-    Path::new("/usr/lib/libhybris-common.so.1").is_file()
-        && Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file()
+    let egl = if cfg!(target_arch = "arm") {
+        "/usr/libexec/droid-hybris/system/lib/libEGL.so"
+    } else {
+        "/usr/libexec/droid-hybris/system/lib64/libEGL.so"
+    };
+    Path::new("/usr/lib/libhybris-common.so.1").is_file() && Path::new(egl).is_file()
 }
 
 fn apply_aurora_package_env(
@@ -917,7 +921,7 @@ fn apply_aurora_package_env(
     package: &str,
     configured_env: &[(String, String)],
 ) {
-    if !cfg!(target_arch = "aarch64") {
+    if !cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
         return;
     }
     let Some(lib) = aurora_package_data_dir().map(|data| data.join("lib")) else { return };
@@ -972,7 +976,7 @@ fn apply_aurora_package_env(
             cmd.env("PENGUDROID_GRALLOC_SHM", "1");
         }
     } else if !overridden("PENGUDROID_FORCE_SHM") {
-        // Preserve the verified fallback on other AArch64 package hosts.
+        // Preserve the verified fallback on other package hosts.
         cmd.env("PENGUDROID_FORCE_SHM", "1");
     }
     if std::env::var_os("PENGUDROID_FORCE_TRAVERSAL").is_none() {
@@ -1038,14 +1042,14 @@ fn configure_aurora_user_dirs() {
         std::env::set_var("XDG_DATA_HOME", &data);
         std::env::set_var("XDG_CACHE_HOME", &cache);
     }
-    let runtime = home.join("Documents/PenguDroid/runtime/android17-arm64");
+    let runtime = home.join(format!("Documents/PenguDroid/runtime/{}", crate::runtime::RUNTIME_DIR));
     eprintln!(
         "pengudroid launch: sandbox paths documents={} runtime={} framework={} cache={}",
         runtime.parent().is_some_and(|p| p.is_dir()), runtime.is_dir(),
         runtime.join("system/framework/framework.jar").is_file(), cache.is_dir(),
     );
     if !runtime.join("system/framework/framework.jar").is_file() {
-        let archive = package_data.join("runtime/android17-arm64.tar.gz");
+        let archive = package_data.join(format!("runtime/{}.tar.gz", crate::runtime::RUNTIME_DIR));
         if archive.is_file() {
             if let Some(parent) = runtime.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -1060,7 +1064,7 @@ fn configure_aurora_user_dirs() {
             }
         }
     }
-    let private_runtime = cache.join("pengudroid/runtime/android17-arm64");
+    let private_runtime = cache.join(format!("pengudroid/runtime/{}", crate::runtime::RUNTIME_DIR));
     for candidate in [runtime, private_runtime] {
         if candidate.is_dir() {
             unsafe { std::env::set_var("PENGUDROID_ART_SYSROOT", candidate) };

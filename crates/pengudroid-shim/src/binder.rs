@@ -1656,7 +1656,7 @@ pub fn open_device(path: &[u8]) -> Option<RawFd> {
         return None;
     }
     // SAFETY: `fd` is a fresh memfd.
-    if unsafe { libc::ftruncate(fd, MAP_SIZE) } != 0 {
+    if unsafe { libc::ftruncate(fd, MAP_SIZE as libc::off_t) } != 0 {
         unsafe { libc::close(fd) };
         return None;
     }

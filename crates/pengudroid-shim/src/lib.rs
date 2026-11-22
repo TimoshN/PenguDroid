@@ -84,7 +84,7 @@ pub unsafe extern "C" fn __pthread_cleanup_pop(cleanup: *mut BionicCleanup, exec
 }
 use pengudroid_proto::abi::{
     validate_platform_property_override, ANDROID_API_LEVEL, ANDROID_RELEASE, HOST_CPU_ABI,
-    HOST_RUNTIME_ARCH,
+    HOST_CPU_ABI32, HOST_CPU_ABI64, HOST_RUNTIME_ARCH,
 };
 
 mod ahardwarebuffer;
@@ -115,10 +115,14 @@ mod bridge_exec;
 mod bridge_tls;
 mod netdb;
 mod pathshim;
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm", test))]
 mod pthread_sync;
 mod rootfs;
 mod semaphore;
+#[cfg(target_arch = "arm")]
+mod stat_arm;
+#[cfg(target_arch = "arm")]
+include!(concat!(env!("OUT_DIR"), "/math_arm.rs"));
 mod syscall_paths;
 mod vlog;
 mod zip;
@@ -634,6 +638,14 @@ unsafe fn fault_rip(ctx: *mut c_void) -> u64 {
     (*uc).uc_mcontext.pc
 }
 
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "arm")]
+unsafe fn fault_rip(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() { return 0; }
+    (*(ctx as *const libc::ucontext_t)).uc_mcontext.arm_pc as u64
+}
+
 /// Read the interrupted stack pointer out of the signal frame.
 ///
 /// # Safety
@@ -656,6 +668,14 @@ unsafe fn fault_rsp(ctx: *mut c_void) -> u64 {
     }
     let uc = ctx as *const libc::ucontext_t;
     (*uc).uc_mcontext.sp
+}
+
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "arm")]
+unsafe fn fault_rsp(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() { return 0; }
+    (*(ctx as *const libc::ucontext_t)).uc_mcontext.arm_sp as u64
 }
 
 /// Read the interrupted frame pointer (`rbp`/`x29`).
@@ -682,6 +702,14 @@ unsafe fn fault_rbp(ctx: *mut c_void) -> u64 {
     (*uc).uc_mcontext.regs[29]
 }
 
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+#[cfg(target_arch = "arm")]
+unsafe fn fault_rbp(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() { return 0; }
+    (*(ctx as *const libc::ucontext_t)).uc_mcontext.arm_fp as u64
+}
+
 /// Walk the saved frame-pointer chain of the *faulting* thread.
 ///
 /// `backtrace()` unwinds the handler's own stack, so it stops at the frame that
@@ -692,13 +720,14 @@ unsafe fn fault_rbp(ctx: *mut c_void) -> u64 {
 ///
 /// # Safety
 /// Every read is bounds-checked against plausible stack layout: `rbp` must be
-/// 8-byte aligned, above the faulting `rsp`, and the chain must move upwards.
+/// pointer-aligned, above the faulting `rsp`, and the chain must move upwards.
 unsafe fn append_frame_chain(out: &mut [u8], n: &mut usize, mut rbp: u64, mut rsp: u64) {
+    let alignment = (std::mem::size_of::<usize>() - 1) as u64;
     for depth in 0..32u32 {
-        if rbp < 0x10000 || rbp & 7 != 0 || rbp <= rsp { return; }
-        let slot = rbp as *const u64;
-        let next = unsafe { std::ptr::read_volatile(slot) };
-        let ret = unsafe { std::ptr::read_volatile(slot.add(1)) };
+        if rbp < 0x10000 || rbp & alignment != 0 || rbp <= rsp { return; }
+        let slot = rbp as *const usize;
+        let next = unsafe { std::ptr::read_volatile(slot) } as u64;
+        let ret = unsafe { std::ptr::read_volatile(slot.add(1)) } as u64;
         if ret < 0x10000 { return; }
         let mut info: libc::Dl_info = std::mem::zeroed();
         let mut line = format!("[pengudroid]   fp#{depth} {ret:#x}");
@@ -1675,6 +1704,58 @@ pub unsafe extern "C" fn __loader_dlvsym(
     libc::dlsym(handle, symbol)
 }
 
+#[cfg(target_arch = "arm")]
+#[no_mangle]
+pub unsafe extern "C" fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void {
+    type Real = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
+    static NEXT: OnceLock<Option<Real>> = OnceLock::new();
+    let Some(real) = *NEXT.get_or_init(|| dlsym_next(b"dlopen\0")) else {
+        return std::ptr::null_mut();
+    };
+    // Bionic accepts NODELETE/NOLOAD without an explicit binding mode and
+    // defaults to NOW. Older glibc rejects those flags as an invalid mode.
+    let host_flags = if flags & (libc::RTLD_LAZY | libc::RTLD_NOW) == 0 {
+        flags | libc::RTLD_NOW
+    } else {
+        flags
+    };
+    let handle = real(filename, host_flags);
+    if handle.is_null() && std::env::var_os("PENGUDROID_TRACE_DLOPEN").is_some() {
+        let name = if filename.is_null() {
+            "<process>".into()
+        } else {
+            std::ffi::CStr::from_ptr(filename).to_string_lossy()
+        };
+        let error = libc::dlerror();
+        let error = if error.is_null() {
+            "<none>".into()
+        } else {
+            std::ffi::CStr::from_ptr(error).to_string_lossy()
+        };
+        eprintln!("[pengudroid:dlopen] {name} flags={flags:#x}: {error}");
+    }
+    // ART's CheckLoadedBuild constructor probes libartbase with RTLD_NOLOAD
+    // while that same DSO is still initializing. Older glibc returns NULL in
+    // this state; retrying without NOLOAD returns its existing link map. Do
+    // this only for the release self-check, never for the absent debug DSO.
+    if handle.is_null()
+        && flags & libc::RTLD_NOLOAD != 0
+        && !filename.is_null()
+        && std::ffi::CStr::from_ptr(filename).to_bytes() == b"libartbase.so"
+    {
+        let existing = real(filename, host_flags & !libc::RTLD_NOLOAD);
+        if !existing.is_null() {
+            return existing;
+        }
+        // CheckLoadedBuild uses this result only as a boolean and deliberately
+        // keeps the handle. Older glibc also rejects the non-NOLOAD retry while
+        // the constructor is active, so return the process-global handle rather
+        // than attempting to map another DSO recursively.
+        return real(std::ptr::null(), libc::RTLD_NOW);
+    }
+    handle
+}
+
 /// `__loader_dlerror()` — see `dlerror(3)`.
 #[no_mangle]
 pub unsafe extern "C" fn __loader_dlerror() -> *mut c_char {
@@ -1830,8 +1911,8 @@ fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, Str
         // Advertise only the ABI that native host code can actually load.
         // On x86_64 the optional ARM translator adds its own guest properties.
         ("ro.product.cpu.abilist", HOST_CPU_ABI),
-        ("ro.product.cpu.abilist64", HOST_CPU_ABI),
-        ("ro.product.cpu.abilist32", ""),
+        ("ro.product.cpu.abilist64", HOST_CPU_ABI64),
+        ("ro.product.cpu.abilist32", HOST_CPU_ABI32),
         ("ro.product.cpu.abi", HOST_CPU_ABI),
         ("ro.product.cpu.abi2", ""),
         ("ro.product.name", "pengudroid"),
@@ -1881,9 +1962,14 @@ fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, Str
     // HWUI's disk shader cache currently crashes in that configuration while
     // hashing the driver identity; the framework's emulator path disables only
     // this optional disk cache, not GL rendering or application behaviour.
-    if cfg!(target_arch = "aarch64")
+    let hybris_egl = if cfg!(target_arch = "arm") {
+        "/usr/libexec/droid-hybris/system/lib/libEGL.so"
+    } else {
+        "/usr/libexec/droid-hybris/system/lib64/libEGL.so"
+    };
+    if cfg!(any(target_arch = "aarch64", target_arch = "arm"))
         && std::path::Path::new("/usr/lib/libhybris-common.so.1").is_file()
-        && std::path::Path::new("/usr/libexec/droid-hybris/system/lib64/libEGL.so").is_file()
+        && std::path::Path::new(hybris_egl).is_file()
     {
         props.insert("ro.boot.qemu".to_string(), "1".to_string());
         props.insert("ro.kernel.qemu".to_string(), "1".to_string());
@@ -2460,6 +2546,91 @@ unsafe fn strlcat_impl(dst: *mut c_char, src: *const c_char, siz: usize) -> usiz
     std::ptr::copy_nonoverlapping(src, dst.add(dst_len), n);
     *dst.add(dst_len + n) = 0;
     dst_len + src_len
+}
+
+#[cfg(target_arch = "arm")]
+#[no_mangle]
+pub unsafe extern "C" fn memfd_create(name: *const c_char, flags: libc::c_uint) -> c_int {
+    type Real = unsafe extern "C" fn(*const c_char, libc::c_uint) -> c_int;
+    static NEXT: OnceLock<Option<Real>> = OnceLock::new();
+    if !name.is_null()
+        && std::ffi::CStr::from_ptr(name).to_bytes() == b"jit-cache"
+        && std::env::var_os("PENGUDROID_ART_JIT").is_some()
+    {
+        // This kernel/sandbox denies PROT_EXEC on a shared memfd. ART has a
+        // documented anonymous single-view fallback for kernels without
+        // memfd_create; select it only for the explicit JIT opt-in.
+        *libc::__errno_location() = libc::ENOSYS;
+        return -1;
+    }
+    let Some(real) = *NEXT.get_or_init(|| dlsym_next(b"memfd_create\0")) else {
+        *libc::__errno_location() = libc::ENOSYS;
+        return -1;
+    };
+    real(name, flags)
+}
+
+#[cfg(target_arch = "arm")]
+#[export_name = "_ZN3art12memfd_createEPKcj"]
+pub unsafe extern "C" fn art_memfd_create(name: *const c_char, flags: libc::c_uint) -> c_int {
+    type Real = unsafe extern "C" fn(*const c_char, libc::c_uint) -> c_int;
+    if !name.is_null()
+        && std::ffi::CStr::from_ptr(name).to_bytes() == b"jit-cache"
+        && std::env::var_os("PENGUDROID_ART_JIT").is_some()
+    {
+        *libc::__errno_location() = libc::ENOSYS;
+        return -1;
+    }
+    let library = CString::new("libartbase.so").unwrap();
+    let symbol = CString::new("_ZN3art12memfd_createEPKcj").unwrap();
+    let handle = libc::dlopen(library.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
+    let real = if handle.is_null() {
+        std::ptr::null_mut()
+    } else {
+        libc::dlsym(handle, symbol.as_ptr())
+    };
+    if real.is_null() {
+        *libc::__errno_location() = libc::ENOSYS;
+        return -1;
+    }
+    let real: Real = std::mem::transmute(real);
+    real(name, flags)
+}
+
+#[cfg(target_arch = "arm")]
+#[no_mangle]
+pub unsafe extern "C" fn __mmap2(
+    addr: *mut c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    page_offset: libc::c_ulong,
+) -> *mut c_void {
+    // Bionic's private ARM syscall stub takes an offset in 4096-byte pages.
+    libc::syscall(192, addr, len, prot, flags, fd, page_offset) as *mut c_void
+}
+
+#[cfg(target_arch = "arm")]
+#[no_mangle]
+pub unsafe extern "C" fn cacheflush(
+    start: libc::c_ulong,
+    end: libc::c_ulong,
+    flags: c_int,
+) -> c_int {
+    // ARM's private __ARM_NR_cacheflush (__ARM_NR_BASE + 2). Bionic uses
+    // this after linking/JIT writes; glibc does not export a cacheflush symbol.
+    libc::syscall(0x000f_0002, start, end, flags) as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strlcpy(dst: *mut c_char, src: *const c_char, siz: usize) -> usize {
+    strlcpy_impl(dst, src, siz)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strlcat(dst: *mut c_char, src: *const c_char, siz: usize) -> usize {
+    strlcat_impl(dst, src, siz)
 }
 
 #[no_mangle]
@@ -3869,41 +4040,98 @@ pub unsafe extern "C" fn _ZN7android14AndroidRuntime8setArgv0EPKcb(
 // translated here. The bit numbering is identical (signal `n` is bit `n - 1`),
 // so the conversion is just a widening/narrowing of the bit set.
 
-/// Bionic's `sigset_t` on LP64.
-pub type BionicSigset = u64;
+/// Bionic's `sigset_t` is pointer-sized: 64 bits on LP64 and 32 on ILP32.
+pub type BionicSigset = usize;
+pub type BionicSigset64 = u64;
 
-/// Bionic's `struct sigaction` on LP64.
+/// Bionic's LP64 `struct sigaction`.
+#[cfg(target_pointer_width = "64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BionicSigAction {
-    /// Bionic LP64 puts flags first (unlike its LP32 layout). The handler
-    /// begins at offset 8, mask at 16, and restorer at 24.
-    /// https://android.googlesource.com/platform/bionic/+/android-13.0.0_r1/libc/include/bits/signal_types.h
     pub sa_flags: c_int,
     pub _pad: c_int,
-    /// Union of `sa_handler` and `sa_sigaction`.
     pub sa_handler: usize,
     pub sa_mask: BionicSigset,
     pub sa_restorer: usize,
 }
 
+/// Bionic's ILP32 `struct sigaction`: handler, 32-bit mask, flags, restorer.
+#[cfg(target_pointer_width = "32")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BionicSigAction {
+    pub sa_handler: usize,
+    pub sa_mask: BionicSigset,
+    pub sa_flags: c_int,
+    pub sa_restorer: usize,
+}
+
+/// ILP32 sigaction64 moves flags/restorer before the 64-bit mask.
+#[cfg(target_pointer_width = "32")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BionicSigAction64 {
+    pub sa_handler: usize,
+    pub sa_flags: c_int,
+    pub sa_restorer: usize,
+    // ILP32 sigset64_t is unsigned long[2], so its alignment is four,
+    // unlike Rust's u64 alignment on ARM.
+    pub sa_mask: [u32; 2],
+}
+
+#[cfg(target_pointer_width = "64")]
+pub type BionicSigAction64 = BionicSigAction;
+
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<BionicSigAction>() == 32);
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    assert!(std::mem::size_of::<BionicSigAction>() == 16);
+    assert!(std::mem::size_of::<BionicSigAction64>() == 20);
+};
 const _: () = assert!(std::mem::size_of::<libc::sigset_t>() == 128);
 
 /// Widen a Bionic signal set to glibc's 1024-bit representation.
 fn sigset_to_glibc(mask: BionicSigset) -> libc::sigset_t {
-    // glibc's `sigset_t` is `unsigned long __val[16]` on x86-64.
-    let mut words = [0u64; 16];
-    words[0] = mask;
-    // SAFETY: the two types are both 128 bytes and alignment-compatible.
-    unsafe { std::mem::transmute::<[u64; 16], libc::sigset_t>(words) }
+    let mut out: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &mask as *const BionicSigset as *const u8,
+            &mut out as *mut libc::sigset_t as *mut u8,
+            std::mem::size_of::<BionicSigset>(),
+        );
+    }
+    out
 }
 
-/// Narrow glibc's signal set to Bionic's 64-bit representation.
+fn sigset64_to_glibc(mask: BionicSigset64) -> libc::sigset_t {
+    let mut out: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &mask as *const BionicSigset64 as *const u8,
+            &mut out as *mut libc::sigset_t as *mut u8,
+            std::mem::size_of::<BionicSigset64>(),
+        );
+    }
+    out
+}
+
+/// Narrow glibc's signal set to Bionic's pointer-sized representation.
 fn sigset_from_glibc(set: &libc::sigset_t) -> BionicSigset {
-    // SAFETY: see `sigset_to_glibc`.
-    let words: &[u64; 16] = unsafe { &*(set as *const libc::sigset_t as *const [u64; 16]) };
-    words[0]
+    unsafe { *(set as *const libc::sigset_t as *const BionicSigset) }
+}
+
+fn sigset64_from_glibc(set: &libc::sigset_t) -> BionicSigset64 {
+    let mut out = 0u64;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            set as *const libc::sigset_t as *const u8,
+            &mut out as *mut u64 as *mut u8,
+            std::mem::size_of::<u64>(),
+        );
+    }
+    out
 }
 
 /// Translate a Bionic `struct sigaction` into glibc's.
@@ -3924,6 +4152,7 @@ fn sigaction_from_glibc(g: &libc::sigaction) -> BionicSigAction {
         sa_handler: g.sa_sigaction,
         sa_mask: sigset_from_glibc(&g.sa_mask),
         sa_flags: g.sa_flags,
+        #[cfg(target_pointer_width = "64")]
         _pad: 0,
         sa_restorer: unsafe {
             std::mem::transmute::<Option<extern "C" fn()>, usize>(g.sa_restorer)
@@ -4087,7 +4316,7 @@ pub unsafe extern "C" fn sigfillset(set: *mut BionicSigset) -> c_int {
     if set.is_null() {
         return -1;
     }
-    *set = u64::MAX;
+    *set = usize::MAX;
     0
 }
 
@@ -4097,7 +4326,7 @@ pub unsafe extern "C" fn sigaddset(set: *mut BionicSigset, signum: c_int) -> c_i
     if set.is_null() || !(1..=64).contains(&signum) {
         return -1;
     }
-    *set |= 1u64 << (signum - 1);
+    *set |= 1usize << (signum - 1);
     0
 }
 
@@ -4111,7 +4340,7 @@ pub unsafe extern "C" fn sigdelset(set: *mut BionicSigset, signum: c_int) -> c_i
     if set.is_null() || !(1..=64).contains(&signum) {
         return -1;
     }
-    *set &= !(1u64 << (signum - 1));
+    *set &= !(1usize << (signum - 1));
     0
 }
 
@@ -4336,82 +4565,138 @@ pub unsafe extern "C" fn ppoll(
     )
 }
 
-/// `sigemptyset64(set)` — Bionic's 64-bit-signal-set variant.
+/// `sigemptyset64(set)` — Bionic's always-64-bit signal-set variant.
 #[no_mangle]
-pub unsafe extern "C" fn sigemptyset64(set: *mut BionicSigset) -> c_int {
-    sigemptyset(set)
+pub unsafe extern "C" fn sigemptyset64(set: *mut BionicSigset64) -> c_int {
+    if set.is_null() { return -1; }
+    *set = 0;
+    0
 }
 
-/// `sigfillset64(set)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigfillset64(set: *mut BionicSigset) -> c_int {
-    sigfillset(set)
+pub unsafe extern "C" fn sigfillset64(set: *mut BionicSigset64) -> c_int {
+    if set.is_null() { return -1; }
+    *set = u64::MAX;
+    0
 }
 
-/// `sigaddset64(set, signum)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigaddset64(set: *mut BionicSigset, signum: c_int) -> c_int {
-    sigaddset(set, signum)
+pub unsafe extern "C" fn sigaddset64(set: *mut BionicSigset64, signum: c_int) -> c_int {
+    if set.is_null() || !(1..=64).contains(&signum) { return -1; }
+    *set |= 1u64 << (signum - 1);
+    0
 }
 
-/// `sigdelset64(set, signum)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigdelset64(set: *mut BionicSigset, signum: c_int) -> c_int {
-    sigdelset(set, signum)
+pub unsafe extern "C" fn sigdelset64(set: *mut BionicSigset64, signum: c_int) -> c_int {
+    if set.is_null() || !(1..=64).contains(&signum) { return -1; }
+    *set &= !(1u64 << (signum - 1));
+    0
 }
 
-/// `sigismember64(set, signum)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigismember64(set: *const BionicSigset, signum: c_int) -> c_int {
-    sigismember(set, signum)
+pub unsafe extern "C" fn sigismember64(set: *const BionicSigset64, signum: c_int) -> c_int {
+    if set.is_null() || !(1..=64).contains(&signum) { return -1; }
+    ((*set >> (signum - 1)) & 1) as c_int
 }
 
-/// `sigprocmask64(how, set, oldset)`.
 #[no_mangle]
 pub unsafe extern "C" fn sigprocmask64(
     how: c_int,
-    set: *const BionicSigset,
-    oldset: *mut BionicSigset,
+    set: *const BionicSigset64,
+    oldset: *mut BionicSigset64,
 ) -> c_int {
-    sigprocmask(how, set, oldset)
+    let Some(real) = dlsym_next::<RealSigprocmask>(b"sigprocmask\0") else { return -1; };
+    let gset = if set.is_null() { None } else { Some(sigset64_to_glibc(*set)) };
+    let mut gold: libc::sigset_t = std::mem::zeroed();
+    let rc = real(how, gset.as_ref().map_or(std::ptr::null(), |s| s as *const _),
+        if oldset.is_null() { std::ptr::null_mut() } else { &mut gold });
+    if rc == 0 && !oldset.is_null() { *oldset = sigset64_from_glibc(&gold); }
+    rc
 }
 
-/// `pthread_sigmask64(how, set, oldset)`.
 #[no_mangle]
 pub unsafe extern "C" fn pthread_sigmask64(
     how: c_int,
-    set: *const BionicSigset,
-    oldset: *mut BionicSigset,
+    set: *const BionicSigset64,
+    oldset: *mut BionicSigset64,
 ) -> c_int {
-    pthread_sigmask(how, set, oldset)
+    let Some(real) = dlsym_next::<RealSigprocmask>(b"pthread_sigmask\0") else { return -1; };
+    let gset = if set.is_null() { None } else { Some(sigset64_to_glibc(*set)) };
+    let mut gold: libc::sigset_t = std::mem::zeroed();
+    let rc = real(how, gset.as_ref().map_or(std::ptr::null(), |s| s as *const _),
+        if oldset.is_null() { std::ptr::null_mut() } else { &mut gold });
+    if rc == 0 && !oldset.is_null() { *oldset = sigset64_from_glibc(&gold); }
+    rc
 }
 
-/// `sigpending64(set)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigpending64(set: *mut BionicSigset) -> c_int {
-    sigpending(set)
+pub unsafe extern "C" fn sigpending64(set: *mut BionicSigset64) -> c_int {
+    let Some(real) = dlsym_next::<RealSigpending>(b"sigpending\0") else { return -1; };
+    let mut gold: libc::sigset_t = std::mem::zeroed();
+    let rc = real(&mut gold);
+    if rc == 0 && !set.is_null() { *set = sigset64_from_glibc(&gold); }
+    rc
 }
 
-/// `sigsuspend64(set)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigsuspend64(set: *const BionicSigset) -> c_int {
-    sigsuspend(set)
+pub unsafe extern "C" fn sigsuspend64(set: *const BionicSigset64) -> c_int {
+    let Some(real) = dlsym_next::<RealSigsuspend>(b"sigsuspend\0") else { return -1; };
+    let gset = if set.is_null() { None } else { Some(sigset64_to_glibc(*set)) };
+    real(gset.as_ref().map_or(std::ptr::null(), |s| s as *const _))
 }
 
-/// `sigwait64(set, sig)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigwait64(set: *const BionicSigset, sig: *mut c_int) -> c_int {
-    sigwait(set, sig)
+pub unsafe extern "C" fn sigwait64(set: *const BionicSigset64, sig: *mut c_int) -> c_int {
+    let Some(real) = dlsym_next::<RealSigwait>(b"sigwait\0") else { return -1; };
+    let gset = if set.is_null() { None } else { Some(sigset64_to_glibc(*set)) };
+    real(gset.as_ref().map_or(std::ptr::null(), |s| s as *const _), sig)
 }
 
-/// `sigaction64(signum, act, oldact)`.
+#[cfg(target_pointer_width = "64")]
 #[no_mangle]
 pub unsafe extern "C" fn sigaction64(
     signum: c_int,
-    act: *const BionicSigAction,
-    oldact: *mut BionicSigAction,
+    act: *const BionicSigAction64,
+    oldact: *mut BionicSigAction64,
 ) -> c_int {
     sigaction(signum, act, oldact)
+}
+
+#[cfg(target_pointer_width = "32")]
+#[no_mangle]
+pub unsafe extern "C" fn sigaction64(
+    signum: c_int,
+    act: *const BionicSigAction64,
+    oldact: *mut BionicSigAction64,
+) -> c_int {
+    let Some(real) = dlsym_next::<RealSigaction>(b"sigaction\0") else { return -1; };
+    let gact = if act.is_null() {
+        None
+    } else {
+        let a = &*act;
+        let mut out: libc::sigaction = std::mem::zeroed();
+        out.sa_sigaction = a.sa_handler;
+        out.sa_mask = sigset64_to_glibc(a.sa_mask[0] as u64 | ((a.sa_mask[1] as u64) << 32));
+        out.sa_flags = a.sa_flags;
+        out.sa_restorer = std::mem::transmute::<usize, Option<extern "C" fn()>>(a.sa_restorer);
+        Some(out)
+    };
+    let mut gold: libc::sigaction = std::mem::zeroed();
+    let rc = real(signum, gact.as_ref().map_or(std::ptr::null(), |a| a as *const _),
+        if oldact.is_null() { std::ptr::null_mut() } else { &mut gold });
+    if rc == 0 && !oldact.is_null() {
+        *oldact = BionicSigAction64 {
+            sa_handler: gold.sa_sigaction,
+            sa_flags: gold.sa_flags,
+            sa_restorer: std::mem::transmute::<Option<extern "C" fn()>, usize>(gold.sa_restorer),
+            sa_mask: {
+                let mask = sigset64_from_glibc(&gold.sa_mask);
+                [mask as u32, (mask >> 32) as u32]
+            },
+        };
+    }
+    rc
 }
 
 // ---------------------------------------------------------------------------
@@ -4490,6 +4775,7 @@ pub unsafe extern "C" fn pthread_atfork(
     next(prepare, parent, child)
 }
 
+#[cfg(target_pointer_width = "64")]
 #[repr(C)]
 struct BionicPthreadAttr {
     flags: u32,
@@ -4501,7 +4787,23 @@ struct BionicPthreadAttr {
     sched_priority: c_int,
     _reserved: [u8; 16],
 }
-const _: () = assert!(std::mem::size_of::<BionicPthreadAttr>() == 56);
+
+#[cfg(target_pointer_width = "32")]
+#[repr(C)]
+struct BionicPthreadAttr {
+    flags: u32,
+    stack_base: *mut c_void,
+    stack_size: usize,
+    guard_size: usize,
+    sched_policy: c_int,
+    sched_priority: c_int,
+}
+
+#[cfg(target_pointer_width = "64")]
+const BIONIC_PTHREAD_ATTR_SIZE: usize = 56;
+#[cfg(target_pointer_width = "32")]
+const BIONIC_PTHREAD_ATTR_SIZE: usize = 24;
+const _: () = assert!(std::mem::size_of::<BionicPthreadAttr>() == BIONIC_PTHREAD_ATTR_SIZE);
 
 /// `pthread_getattr_np(thread, attr)` with an explicit Bionic layout.
 ///
@@ -4525,18 +4827,253 @@ pub unsafe extern "C" fn pthread_getattr_np(
         return rc;
     }
     let out = &mut *attr;
-    // glibc and Bionic share the first 56 bytes on AArch64. Copy exactly
-    // those bytes and no more: the remaining 8 bytes belong only to glibc.
-    std::ptr::copy_nonoverlapping(
-        &host as *const libc::pthread_attr_t as *const u8,
-        out as *mut BionicPthreadAttr as *mut u8,
-        56,
-    );
+    std::ptr::write_bytes(out, 0, 1);
+    // Query the public glibc accessors instead of copying its private object.
+    // Bionic's ILP32 attribute is 24 bytes and LP64 is 56; neither is a safe
+    // destination for glibc's architecture-specific pthread_attr_t.
+    type GetDetach = unsafe extern "C" fn(*const libc::pthread_attr_t, *mut c_int) -> c_int;
+    let Some(get_detach) = (unsafe { dlsym_next::<GetDetach>(b"pthread_attr_getdetachstate\0") }) else {
+        return libc::ENOSYS;
+    };
+    type GetStack = unsafe extern "C" fn(*const libc::pthread_attr_t, *mut *mut c_void, *mut usize) -> c_int;
+    type GetSize = unsafe extern "C" fn(*const libc::pthread_attr_t, *mut usize) -> c_int;
+    type GetPolicy = unsafe extern "C" fn(*const libc::pthread_attr_t, *mut c_int) -> c_int;
+    type GetParam = unsafe extern "C" fn(*const libc::pthread_attr_t, *mut libc::sched_param) -> c_int;
+    let Some(get_stack) = dlsym_next::<GetStack>(b"pthread_attr_getstack\0") else { return libc::ENOSYS; };
+    let Some(get_guard) = dlsym_next::<GetSize>(b"pthread_attr_getguardsize\0") else { return libc::ENOSYS; };
+    let Some(get_policy) = dlsym_next::<GetPolicy>(b"pthread_attr_getschedpolicy\0") else { return libc::ENOSYS; };
+    let Some(get_param) = dlsym_next::<GetParam>(b"pthread_attr_getschedparam\0") else { return libc::ENOSYS; };
+    let mut detached = 0;
+    let mut stack = std::ptr::null_mut();
+    let mut stack_size = 0usize;
+    let mut guard_size = 0usize;
+    let mut policy = 0;
+    let mut sched: libc::sched_param = std::mem::zeroed();
+    if get_detach(&host, &mut detached) != 0
+        || get_stack(&host, &mut stack, &mut stack_size) != 0
+        || get_guard(&host, &mut guard_size) != 0
+        || get_policy(&host, &mut policy) != 0
+        || get_param(&host, &mut sched) != 0
+    {
+        if let Some(destroy) = dlsym_next::<unsafe extern "C" fn(*mut libc::pthread_attr_t) -> c_int>(b"pthread_attr_destroy\0") {
+            destroy(&mut host);
+        }
+        return libc::EINVAL;
+    }
+    out.flags = (detached == libc::PTHREAD_CREATE_DETACHED) as u32;
+    out.stack_base = stack;
+    out.stack_size = stack_size;
+    out.guard_size = guard_size;
+    out.sched_policy = policy;
+    out.sched_priority = sched.sched_priority;
+    if let Some(destroy) = dlsym_next::<unsafe extern "C" fn(*mut libc::pthread_attr_t) -> c_int>(b"pthread_attr_destroy\0") {
+        destroy(&mut host);
+    }
     if std::env::var_os("PENGUDROID_TRACE_PTHREAD_ATTR").is_some() {
         eprintln!("[pengudroid] pthread_getattr_np: stack={:?} size={} guard={} policy={} priority={} flags={:#x}",
             out.stack_base, out.stack_size, out.guard_size, out.sched_policy, out.sched_priority, out.flags);
     }
     0
+}
+
+#[cfg(target_arch = "arm")]
+#[no_mangle]
+pub unsafe extern "C" fn dl_unwind_find_exidx(
+    pc: *mut c_void,
+    count: *mut c_int,
+) -> *mut c_void {
+    type Real = unsafe extern "C" fn(*mut c_void, *mut c_int) -> *mut c_void;
+    static NEXT: OnceLock<Option<Real>> = OnceLock::new();
+    match NEXT.get_or_init(|| dlsym_next(b"__gnu_Unwind_Find_exidx\0")) {
+        Some(real) => real(pc, count),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn real_pthread_attr_getstack(
+    attr: *const BionicPthreadAttr,
+    stack_base: *mut *mut c_void,
+    stack_size: *mut usize,
+) -> c_int {
+    pthread_attr_getstack(attr, stack_base, stack_size)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getstack(
+    attr: *const BionicPthreadAttr,
+    stack_base: *mut *mut c_void,
+    stack_size: *mut usize,
+) -> c_int {
+    *stack_base = (*attr).stack_base;
+    *stack_size = (*attr).stack_size;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getstacksize(
+    attr: *const BionicPthreadAttr,
+    stack_size: *mut usize,
+) -> c_int {
+    *stack_size = (*attr).stack_size;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setstacksize(
+    attr: *mut BionicPthreadAttr,
+    stack_size: usize,
+) -> c_int {
+    if stack_size < 16 * 1024 { return libc::EINVAL; }
+    (*attr).stack_size = stack_size;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setstack(
+    attr: *mut BionicPthreadAttr,
+    stack_base: *mut c_void,
+    stack_size: usize,
+) -> c_int {
+    if stack_size < 16 * 1024 || stack_size & 4095 != 0 || stack_base as usize & 4095 != 0 {
+        return libc::EINVAL;
+    }
+    (*attr).stack_base = stack_base;
+    (*attr).stack_size = stack_size;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getguardsize(
+    attr: *const BionicPthreadAttr,
+    guard_size: *mut usize,
+) -> c_int {
+    *guard_size = (*attr).guard_size;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setguardsize(
+    attr: *mut BionicPthreadAttr,
+    guard_size: usize,
+) -> c_int {
+    (*attr).guard_size = guard_size;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getdetachstate(
+    attr: *const BionicPthreadAttr,
+    state: *mut c_int,
+) -> c_int {
+    *state = if (*attr).flags & 1 != 0 {
+        libc::PTHREAD_CREATE_DETACHED
+    } else {
+        libc::PTHREAD_CREATE_JOINABLE
+    };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setdetachstate(
+    attr: *mut BionicPthreadAttr,
+    state: c_int,
+) -> c_int {
+    match state {
+        libc::PTHREAD_CREATE_DETACHED => (*attr).flags |= 1,
+        libc::PTHREAD_CREATE_JOINABLE => (*attr).flags &= !1,
+        _ => return libc::EINVAL,
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getschedpolicy(
+    attr: *const BionicPthreadAttr,
+    policy: *mut c_int,
+) -> c_int {
+    *policy = (*attr).sched_policy;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setschedpolicy(
+    attr: *mut BionicPthreadAttr,
+    policy: c_int,
+) -> c_int {
+    (*attr).sched_policy = policy;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getschedparam(
+    attr: *const BionicPthreadAttr,
+    param: *mut libc::sched_param,
+) -> c_int {
+    (*param).sched_priority = (*attr).sched_priority;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setschedparam(
+    attr: *mut BionicPthreadAttr,
+    param: *const libc::sched_param,
+) -> c_int {
+    (*attr).sched_priority = (*param).sched_priority;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getinheritsched(
+    attr: *const BionicPthreadAttr,
+    flag: *mut c_int,
+) -> c_int {
+    *flag = if (*attr).flags & 4 != 0 {
+        libc::PTHREAD_INHERIT_SCHED
+    } else if (*attr).flags & 8 != 0 || (*attr).sched_policy != libc::SCHED_OTHER {
+        libc::PTHREAD_EXPLICIT_SCHED
+    } else {
+        libc::PTHREAD_INHERIT_SCHED
+    };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setinheritsched(
+    attr: *mut BionicPthreadAttr,
+    flag: c_int,
+) -> c_int {
+    match flag {
+        libc::PTHREAD_EXPLICIT_SCHED => {
+            (*attr).flags = ((*attr).flags & !4) | 8;
+        }
+        libc::PTHREAD_INHERIT_SCHED => {
+            (*attr).flags = ((*attr).flags & !8) | 4;
+        }
+        _ => return libc::EINVAL,
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getscope(
+    _attr: *const BionicPthreadAttr,
+    scope: *mut c_int,
+) -> c_int {
+    *scope = 0; // PTHREAD_SCOPE_SYSTEM
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setscope(
+    _attr: *mut BionicPthreadAttr,
+    scope: c_int,
+) -> c_int {
+    match scope {
+        0 => 0, // PTHREAD_SCOPE_SYSTEM
+        1 => libc::ENOTSUP, // PTHREAD_SCOPE_PROCESS
+        _ => libc::EINVAL,
+    }
 }
 
 #[no_mangle]
@@ -6970,12 +7507,12 @@ mod tests {
     #[test]
     fn bionic_sigset_roundtrips_through_glibc() {
         // Signal n is bit n-1 in both libcs, so the widening must be lossless.
-        let mask: u64 = 0b1011;
+        let mask: BionicSigset = 0b1011;
         let g = sigset_to_glibc(mask);
         assert_eq!(sigset_from_glibc(&g), mask);
 
         // Every one of the 64 signals survives the round trip.
-        let all = u64::MAX;
+        let all = BionicSigset::MAX;
         assert_eq!(sigset_from_glibc(&sigset_to_glibc(all)), all);
     }
 
@@ -6991,12 +7528,13 @@ mod tests {
             assert_eq!(sigaddset(&mut set, 0), -1);
             assert_eq!(sigaddset(&mut set, 65), -1);
             assert_eq!(sigfillset(&mut set), 0);
-            assert_eq!(set, u64::MAX);
+            assert_eq!(set, BionicSigset::MAX);
             assert_eq!(sigemptyset(&mut set), 0);
             assert_eq!(set, 0);
         }
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn bionic_sigaction_layout_is_32_bytes() {
         // Bionic's `struct sigaction` is 32 bytes on LP64. If this ever changes,

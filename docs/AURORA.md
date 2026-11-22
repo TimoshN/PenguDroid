@@ -84,6 +84,24 @@ changes its button counter. Vulkan has not been tested.
   Mesa/GLVND/LLVM `GLIBC_2.17`/`2.30`/`2.34` calls go directly to glibc. This fixes the
   former RenderThread deadlock in host LLVM during `eglInitialize`.
 
+## ARMv7hl bring-up (development only)
+
+`tools/build-aurora-rpm.sh --arch armv7hl` builds the same workspace for
+`armv7-unknown-linux-gnueabihf` without changing the default AArch64 build.
+The pinned ARM64 GSI is multilib: `--arch arm` validates and selects its
+32-bit `lib/` and `framework/arm/` view as `android17-arm`; no separate GSI is
+downloaded. ARM32 support includes Bionic jump buffers, stat and pthread
+layouts, signal sets/actions, mmap2 offsets, Hybris pthread keys, and explicit
+softfp-to-hard-float GLES/libm boundaries.
+
+On the ARMv7hl-userspace device at 192.168.1.50, the development MAX RPM built
+from `~/max_app_armv7.apk` reaches `JNI_OK`, all requested native framework
+groups, `handleBindApplication`, providers and MAX background initialization.
+It does **not** yet have a pixel-verified Activity UI: both interpreter and JIT
+currently end in a native invocation `pc=0` in a MAX worker. The JIT's
+anonymous-cache fallback works, but does not resolve that later fault. ARMv7hl
+packages therefore remain development artifacts, not a claim of MAX usability.
+
 ## Build
 
 Requirements on the build host:

@@ -172,22 +172,34 @@ int openat64(int dirfd, const char *path, int flags, ...) {
  * Only the emulated binder device is interesting: libbinder maps the transfer
  * area and replies must be written inside that same mapping. Everything else
  * is a plain syscall. */
-void *mmap(void *addr, __SIZE_TYPE__ len, int prot, int flags, int fd, long off) {
+static void *pd_mmap(void *addr, __SIZE_TYPE__ len, int prot, int flags, int fd, long long off) {
     /* The emulated device keeps its transfer area in a memfd. libbinder maps it
      * read-only, but replies have to be written into it, so ask for write
      * permission on the device fd only. */
     if (fd >= 0) {
         prot = __pengudroid_binder_mmap_prot(fd, prot);
     }
-    long r = syscall(PD_SYS_MMAP, addr, len, prot, flags, fd, off);
+#if defined(__arm__)
+    /* ARM syscall 192 is mmap2: its offset is in 4096-byte pages, not bytes. */
+    if ((off & 4095) != 0) {
+        *__errno_location() = 22; /* EINVAL */
+        return (void *)-1;
+    }
+    off = (unsigned long long)off >> 12;
+#endif
+    long r = syscall(PD_SYS_MMAP, addr, len, prot, flags, fd, (long)off);
     if (fd >= 0) {
         __pengudroid_binder_mapping(fd, (void *)r, (unsigned long)len);
     }
     return (void *)r;
 }
 
-void *mmap64(void *addr, __SIZE_TYPE__ len, int prot, int flags, int fd, long off) {
-    return mmap(addr, len, prot, flags, fd, off);
+void *mmap(void *addr, __SIZE_TYPE__ len, int prot, int flags, int fd, long off) {
+    return pd_mmap(addr, len, prot, flags, fd, off);
+}
+
+void *mmap64(void *addr, __SIZE_TYPE__ len, int prot, int flags, int fd, long long off) {
+    return pd_mmap(addr, len, prot, flags, fd, off);
 }
 "#;
 

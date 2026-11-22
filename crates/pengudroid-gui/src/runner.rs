@@ -12,10 +12,14 @@ use std::process::{Child, Command, Stdio};
 const RUNTIME_DIR: &str = "android17-x86_64";
 #[cfg(target_arch = "aarch64")]
 const RUNTIME_DIR: &str = "android17-arm64";
+#[cfg(target_arch = "arm")]
+const RUNTIME_DIR: &str = "android17-arm";
 #[cfg(target_arch = "x86_64")]
 const CHECKOUT_SYSROOT: &str = ".toolchain/sysroot-android17";
 #[cfg(target_arch = "aarch64")]
 const CHECKOUT_SYSROOT: &str = ".toolchain/sysroot-android17-arm64";
+#[cfg(target_arch = "arm")]
+const CHECKOUT_SYSROOT: &str = ".toolchain/sysroot-android17-arm";
 
 /// An owned launcher and its dedicated process group. Keeping Child lets us
 /// reap exits and prevents stale running state and zombie launcher processes.
