@@ -631,6 +631,17 @@ open after Calls → Chats → Calls without old-tab textures or fatal errors.
 Evidence: `target/aurora/maxnext-layers126-menu-10.png`,
 `target/aurora/maxnext-layers126-after-navigation.png`.
 
+For the opt-in Android WebView provider on Sailjail, `webview.apk` must be
+read-only like an application APK. Its extracted native libraries cannot be
+loaded from the noexec home prefix. Development MAX RPMs may therefore carry
+`target/aurora/webview-provider-arm64` (prepared, unmodified-provider ARM64
+payload) in the application's package-owned native library directory, and
+webview.rs selects that directory under `/opt/app`. Generic desktop extraction
+is unchanged. With release 129 the real provider reaches
+`WebViewFactory: Loading com.android.webview 145.0.7632.218`, initializes the
+single-process Chromium renderer, and constructs `CookieManager`; this is
+provider initialization evidence, not yet a pixel-verified Channels page.
+
 A separate MAX route-content issue remains: labels/icons can be absent from a
 new Chats root until a later redraw. It reproduces with both synchronous and
 fenced async presentation; changing EGL_BUFFER_AGE_EXT did not fix it and was

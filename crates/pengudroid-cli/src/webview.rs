@@ -228,7 +228,15 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
         )?,
     );
     let ai = env.find_class("android/content/pm/ApplicationInfo")?;
-    let libdir = spec.data_dir.join("webview-provider/lib");
+    // Sailjail mounts the home prefix noexec. Development RPMs carry prepared
+    // provider libraries in the app's executable native library directory;
+    // generic desktop builds retain the existing cache/extraction path.
+    let packaged = spec.native_lib_dir.starts_with("/opt/app/");
+    let libdir = if packaged {
+        spec.native_lib_dir.to_path_buf()
+    } else {
+        spec.data_dir.join("webview-provider/lib")
+    };
     let native = libdir.join("libwebviewchromium.so");
     let metadata = std::fs::metadata(&apk).ok()?;
     let identity = format!(
@@ -237,8 +245,8 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
         metadata.modified().ok()?
     );
     let marker = libdir.join("provider.identity");
-    if !native.is_file()
-        || std::fs::read_to_string(&marker).ok().as_deref() != Some(identity.as_str())
+    if !packaged && (!native.is_file()
+        || std::fs::read_to_string(&marker).ok().as_deref() != Some(identity.as_str()))
     {
         let rawdir = spec.data_dir.join("webview-provider/raw");
         let prefix = format!("lib/{}/", crate::nativelib::host_abi());
@@ -255,9 +263,11 @@ pub(super) fn prepare(env: &JniEnv, spec: &AppSpec<'_>) -> Option<()> {
     if !native.is_file() {
         return None;
     }
-    let support = std::fs::read(root.join("lib64/libwebviewchromium_plat_support.so")).ok()?;
-    let support = pengudroid_elf::strip_android_versions(&support).ok()?;
-    publish_file(&libdir.join("libwebviewchromium_plat_support.so"), &support)?;
+    if !packaged {
+        let support = std::fs::read(root.join("lib64/libwebviewchromium_plat_support.so")).ok()?;
+        let support = pengudroid_elf::strip_android_versions(&support).ok()?;
+        publish_file(&libdir.join("libwebviewchromium_plat_support.so"), &support)?;
+    }
     for (field, value) in [
         ("sourceDir", apk.display().to_string()),
         ("publicSourceDir", apk.display().to_string()),

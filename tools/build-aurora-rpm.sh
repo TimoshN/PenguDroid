@@ -119,7 +119,15 @@ install -m 0644 "$DESKTOP_SOURCE" \
     "$STAGE/usr/share/applications/$PACKAGE.desktop"
 install -m 0644 "$ICON_SOURCE" "$STAGE/usr/share/icons/hicolor/256x256/apps/$PACKAGE.png"
 install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/$PACKAGE/LICENSE"
-
+# Android WebView native code must be executable inside Sailjail. The external
+# runtime retains webview.apk; this development-only copy is prepared ARM64
+# native payload, not a modified provider APK.
+PROVIDER_LIBS="$WORK/webview-provider-arm64"
+if [ "$PACKAGE" = io.github.denizomer10.MaxNext ] \
+    && [ -f "$PROVIDER_LIBS/libwebviewchromium.so" ]; then
+    mkdir -p "$PRIVATE/ru.oneme.app"
+    install -m 0644 "$PROVIDER_LIBS"/*.so "$PRIVATE/ru.oneme.app/"
+fi
 # Aurora's launcher uses these sizes. The original remains as a generic fallback.
 if command -v ffmpeg >/dev/null 2>&1; then
     for size in 86 108 128 172; do
