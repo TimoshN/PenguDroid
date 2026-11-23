@@ -148,11 +148,231 @@ qemu-aarch64-static -L "$SYSROOT" \
   target/aarch64-unknown-linux-gnu/release/pengudroid --version
 ```
 
+## Package an existing APK as an Aurora application
+
+The following flow creates a standalone development application RPM. It keeps
+the input APK unchanged and uses the same multi-call executable for the GUI,
+CLI and daemon. Replace the example package/application names with your own.
+The Android package ID inside the APK and the Aurora RPM package name are
+separate identifiers.
+
+Requirements in addition to the ordinary build requirements:
+
+- an APK containing `arm64-v8a` native libraries for AArch64 or
+  `armeabi-v7a` libraries for ARMv7, unless it is DEX-only;
+- `rpmbuild` and an Aurora PSDK signing key/certificate;
+- for a self-contained data-only runtime package, the matching minimized
+  runtime archive and a complete prepared executable ART library directory.
+
+### 1. Select the package and architecture
+
+```sh
+export PKG=org.example.myandroidapp
+export APP_NAME=MyAndroidApp
+export APK_NAME=MyAndroidApp.apk
+export APK="$PWD/MyAndroidApp.apk"
+export ARCH=aarch64                 # or armv7hl
+
+# For ARMv7, install the matching Rust standard library and use
+# arm-linux-gnueabihf-gcc/ar in addition to the AArch64 tools:
+#   rustup target add --toolchain 1.93 armv7-unknown-linux-gnueabihf
+
+export PENGUDROID_AURORA_PACKAGE="$PKG"
+tools/build-aurora-rpm.sh --arch "$ARCH" --no-rpm
+
+case "$ARCH" in
+  aarch64)
+    TRIPLE=aarch64-unknown-linux-gnu
+    RPM_TARGET=aarch64-linux
+    RUNTIME_NAME=android17-arm64
+    STAGE="$PWD/target/aurora/package/pengudroid-aurora"
+    ;;
+  armv7hl)
+    TRIPLE=armv7-unknown-linux-gnueabihf
+    RPM_TARGET=armv7hl-linux
+    RUNTIME_NAME=android17-arm
+    STAGE="$PWD/target/aurora/armv7hl/package/pengudroid-aurora"
+    ;;
+esac
+WORK="$PWD/target/aurora/custom-apk-rpm-$ARCH"
+mkdir -p "$WORK/rpm/SOURCES" "$WORK/rpm/BUILD"
+```
+
+`--no-rpm` is intentional: it creates the architecture-specific staging tree,
+so the APK and desktop resources can be added before the final RPM is made.
+Do not build the two architectures into the same staging tree.
+
+### 2. Add the original APK, desktop entry and icon
+
+```sh
+install -Dm0644 "$APK" \
+  "$STAGE/usr/share/$PKG/apps/$APK_NAME"
+
+# The input and packaged APK must remain byte-identical.
+sha256sum "$APK" "$STAGE/usr/share/$PKG/apps/$APK_NAME"
+
+cat > "$STAGE/usr/share/applications/$PKG.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+X-Nemo-Application-Type=silica-qt5
+Name=$APP_NAME
+Comment=Android application hosted by PenguDroid
+Exec=$PKG --cli launch $APK_NAME --backend art --log $APP_NAME.launch.log
+Icon=$PKG
+Terminal=false
+Categories=Utility;System;
+MimeType=application/vnd.android.package-archive;
+X-Nemo-Single-Instance=yes
+
+[X-Application]
+Permissions=Internet;Audio;Downloads;Documents
+OrganizationName=$PKG
+ApplicationName=$APP_NAME
+
+[X-Aurora-Application]
+Orientation=All
+IconMode=Scale
+EOF
+```
+
+Replace the generated fallback icon at every existing size with the desired
+PNG. For example:
+
+```sh
+ICON="$PWD/MyAndroidApp.png"
+find "$STAGE/usr/share/icons/hicolor" -type f -name "$PKG.png" \
+  -exec install -m0644 "$ICON" '{}' \;
+```
+
+### 3. Choose external or packaged runtime provisioning
+
+**External runtime:** no additional package files are required. Provision the
+matching full runtime on the device before launch:
+
+```text
+/home/defaultuser/Documents/PenguDroid/runtime/android17-arm64   # AArch64
+/home/defaultuser/Documents/PenguDroid/runtime/android17-arm     # ARMv7
+```
+
+**Self-contained development package:** add the matching data-only archive and
+prepared executable libraries. For the minimized trees produced for this
+project the archive names are:
+
+```text
+android_runtime/android17-aarch64.tar.gz
+android_runtime/android17-armv7.tar.gz
+```
+
+For example, for AArch64:
+
+```sh
+RUNTIME_ARCHIVE="$PWD/android_runtime/android17-aarch64.tar.gz"
+PREPARED_LIBS="$PWD/target/aurora/prepared-arm64-libs"
+
+# ARMv7 instead uses android17-armv7.tar.gz, android17-arm and an ARM32
+# PREPARED_LIBS directory. Never reuse AArch64 libraries for ARMv7.
+test -f "$PREPARED_LIBS/libart.so"
+install -Dm0644 "$RUNTIME_ARCHIVE" \
+  "$STAGE/usr/share/$PKG/runtime/$RUNTIME_NAME.tar.gz"
+cp -a "$PREPARED_LIBS/." "$STAGE/usr/share/$PKG/lib/"
+```
+
+A data-only archive has `"data_only": true` and intentionally contains no
+executable `libart.so`. At launch the package supplies
+`PENGUDROID_ART_LIBS=/opt/app/<package>/current/data/lib`; native code therefore
+loads from package-owned executable storage while Documents remains `noexec`.
+Use a complete known prepared set, not only a recursive `DT_NEEDED` closure:
+ART and applications also load libraries through `dlopen`/JNI (for example,
+`libstats_jni.so`).
+
+If prepared libraries were copied from an older package, restore the newly
+built shims afterwards:
+
+```sh
+ARTIFACTS="$PWD/target/$TRIPLE/release"
+for library in libpengudroid_shim.so libpengudroid_gleshim.so \
+               libpengudroid_hybris_pthread.so libpengudroid_vkshim.so; do
+  install -m0644 "$ARTIFACTS/$library" "$STAGE/usr/share/$PKG/lib/$library"
+done
+install -m0644 "$STAGE/usr/share/$PKG/lib/libpengudroid_gleshim.so" \
+  "$STAGE/usr/share/$PKG/lib/libEGL.so"
+```
+
+For WebView, retain the original signed `webview.apk` inside the runtime
+archive. Do not remove or replace native entries in that APK. If its provider
+libraries are supplied separately, place the matching prepared payload under
+`usr/share/$PKG/lib/<android-application-package>/`; this lets the provider
+load native code from `/opt/app` without modifying the signed APK.
+
+### 4. Build the RPM
+
+Create an application-specific spec from the development template and replace
+its package ID. Increase `Release` on every rebuild; APM rejects downgrades.
+
+```sh
+install -m0644 rpm/aurora/pengudroid.spec "$WORK/app.spec"
+sed -i "s/io.github.denizomer10.MaxNext/$PKG/g" "$WORK/app.spec"
+
+tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+  -C "$(dirname "$STAGE")" \
+  -czf "$WORK/rpm/SOURCES/pengudroid-aurora.tar.gz" pengudroid-aurora
+
+rpmbuild -bb "$WORK/app.spec" \
+  --target "$RPM_TARGET" \
+  --define "_topdir $WORK/rpm" \
+  --define "_builddir $WORK/rpm/BUILD"
+
+RPM="$WORK/rpm/RPMS/$ARCH/$PKG-0.2.1-1.aurora.$ARCH.rpm"
+ls -lh "$RPM"
+```
+
+### 5. Sign, install and launch
+
+Sign with the regular development certificate through the installed PSDK:
+
+```sh
+PSDK_CHROOT=$(echo "$HOME"/AuroraPlatformSDK-*/sdks/aurora_psdk/sdk-chroot)
+"$PSDK_CHROOT" rpmsign-external sign --force \
+  --key="$HOME/.aurora-cli/keys/regular_key.pem" \
+  --cert="$HOME/.aurora-cli/keys/regular_cert.pem" \
+  "$RPM"
+sha256sum "$RPM"
+```
+
+For a matching device architecture, the audb installer uses `ru.omp.APM` and
+waits for the new version to register:
+
+```sh
+audb -d phone package install "$RPM" --timeout 900 --command-timeout 1200
+audb -d phone launch "$PKG"
+```
+
+Some ARMv7 devices report RPM architecture `arm` while the build is named
+`armv7hl`; audb's local string comparison rejects that alias before APM. To
+use APM directly with a long installation timeout:
+
+```sh
+audb -d phone50 push "$RPM" /tmp/myandroidapp.rpm --command-timeout 600
+ssh defaultuser@192.168.1.50 \
+  'gdbus call --system --timeout 1400 \
+   --dest ru.omp.APM --object-path /ru/omp/APM \
+   --method ru.omp.APM.Install /tmp/myandroidapp.rpm "{}"'
+audb -d phone50 launch "$PKG"
+```
+
+The launch log is written below the application's cache directory using the
+name from the desktop entry. Run `audb app list-running`, inspect that log and
+verify actual pixels/UI lifetime; `JNI_OK` alone is not application validation.
+APK compatibility, WebView, media and store/regular validation still need to be
+checked separately for every application and target device.
+
 ## Prepare the ARM64 Android runtime
 
 Preparation currently stays on the development host because it needs Python,
 `debugfs`, `fsck.erofs`, and at least 12 GiB free space. Review Google's GSI
-license before obtaining the image; the RPM does not redistribute it.
+license before obtaining the image. The regular runtime-free RPM does not
+redistribute it; a self-contained development package requires the appropriate
+redistribution rights for every bundled runtime file.
 
 ```sh
 python3 tools/prepare-android17.py --arch arm64 --download --cache
@@ -162,8 +382,9 @@ The verified tree is placed at
 `$XDG_CACHE_HOME/pengudroid/runtime/android17-arm64`, or under
 `~/.cache/pengudroid/runtime/android17-arm64`. For an on-device experiment it
 must be transferred to the equivalent application-accessible location or
-selected explicitly with `PENGUDROID_SYSROOT`. Native on-device provisioning
-without the Python helper remains to be implemented.
+selected explicitly with `PENGUDROID_SYSROOT`. A packaged data-only archive is
+provisioned on device by the launcher's internal Rust extractor; preparing and
+minimizing that archive remains a host-side operation.
 
 Inspect a prepared tree with an AArch64 build:
 
@@ -310,6 +531,55 @@ Evidence: `target/aurora/maxnext-loading-early.png` (loading placeholder),
 `target/aurora/maxnext-owner-country.png` (real touch navigation), and
 `target/aurora/maxnext-owner-input.log` (Wayland touch and Android actions).
 
+## Graphics backends: Linux dma-buf and Hybris gralloc
+
+Both backends are present in the same `libpengudroid_gleshim.so` binary on
+AArch64 and ARMv7. Architecture alone does not select a backend. The active
+host EGL driver and its runtime capabilities do.
+
+| Property | Linux/Mesa dma-buf | Hybris native gralloc |
+| --- | --- | --- |
+| Implementation | `crates/pengudroid-gleshim/src/dmabuf.rs` | `crates/pengudroid-gleshim/src/gralloc.rs` |
+| Required host API | `eglCreateImageKHR`, `eglDestroyImageKHR`, `eglExportDMABUFImageQueryMESA/EXT`, `eglExportDMABUFImageMESA/EXT` | isolated Hybris EGL/GLES namespace, `libgralloc.so.1`, native-buffer EGLImage and `glEGLImageTargetTexture2DOES` |
+| Frame allocation | ordinary FBO texture | linear native BGRA buffer with render/texture/CPU-read usage |
+| Export | texture → EGLImage → dma-buf plane 0 | native handle → mmap-able fd; GPU blit/flip where required |
+| Daemon message | `Message::PresentDmabuf` | `Message::PresentShm` with `NATIVE_FD_FLAG` |
+| Normal CPU readback | none | none |
+| Hybris HIDL TLS workaround | never used | used only after active Hybris gralloc support is established |
+
+The dma-buf path creates an EGLImage for the current FBO texture, queries its
+format/modifier/planes, exports plane 0, closes unused plane descriptors and
+passes the owned fd to the daemon with `SCM_RIGHTS`. It is intended for an
+ordinary Linux/Mesa stack, but the same capability check is also valid for any
+other driver that actually implements the export API.
+
+The gralloc path is specific to the active Hybris stack. It resolves
+`hybris_gralloc_initialize/allocate/release/deinitialize`, checks the returned
+native handle and selects an mmap-able fd for wl_shm. HWUI renders into the
+associated EGLImage texture/FBO. On Lipstick, a second native buffer and a GPU
+blit provide the required Y-flip; `PENGUDROID_GRALLOC_ASYNC=1` optionally adds
+two fenced output buffers. There is no normal `glReadPixels` frame copy.
+
+Selection and fallback rules:
+
+1. The Aurora package launcher requests gralloc on detected Hybris hosts unless
+   the user overrides the graphics path.
+2. gleshim loads/checks gralloc support and attempts allocation for the actual
+   surface. An environment request without a successful allocation does not
+   force gralloc presentation: the surface retains an ordinary texture and can
+   continue through dma-buf.
+3. `PENGUDROID_FORCE_DMABUF=1` excludes gralloc probing, allocation and its
+   Hybris HIDL TLS workaround entirely.
+4. Missing or failing dma-buf export falls back to explicit SHM readback.
+   `PENGUDROID_FORCE_SHM=1` selects that fallback directly unless
+   `FORCE_DMABUF` is also set.
+5. `PENGUDROID_PROBE_GRALLOC=1` performs only the opt-in 64x64 native-buffer
+   capability probe; it does not replace normal presentation.
+
+Binder/Hybris TLS separation is in `hybris_tls.rs` with independent
+`hybris_tls/aarch64.rs` and `hybris_tls/arm.rs` layouts. The common dma-buf path
+does not call it. ARM never inherits AArch64 offsets or object sizes.
+
 ## SHM performance and dma-buf status
 
 `PENGUDROID_PROFILE_SHM=1` reports per-second guest readback, copy and IPC
@@ -333,8 +603,15 @@ package launcher detects Hybris and enables `PENGUDROID_GRALLOC=1` and
 `PENGUDROID_GRALLOC_SHM=1` by default. An explicit `PENGUDROID_FORCE_SHM=1`
 selects the readback fallback instead, while `PENGUDROID_FORCE_DMABUF=1`
 preserves the ordinary dma-buf attempt. Manual non-package launches can still
-set the two gralloc variables themselves. QEMU and ordinary Linux behavior is
-unchanged.
+set the two gralloc variables themselves. Both backends are compiled into the
+same AArch64/ARMv7 gleshim: dma-buf requires the active EGL image/export entry
+points, while gralloc additionally requires the active isolated Hybris stack,
+`libgralloc.so.1` and native-buffer texture support. A requested gralloc path
+is used only after allocation for the surface actually succeeded; otherwise
+rendering continues with an ordinary dma-buf-capable texture. `FORCE_DMABUF`
+excludes gralloc probing and its TLS workaround entirely. If dma-buf export is
+unavailable or fails, SHM remains the compatibility fallback. QEMU and
+ordinary Linux behavior is unchanged.
 
 In this mode gleshim allocates a linear BGRA Hybris gralloc buffer with
 SW_READ_OFTEN, wraps it as an EGLImage texture, and renders HWUI into its FBO. It selects the mmap-able native fd, converts the

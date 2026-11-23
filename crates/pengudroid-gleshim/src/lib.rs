@@ -5,11 +5,11 @@
 //! `dlopen`ing the host's `libEGL.so.1` / `libGLESv2.so.2` at runtime — there
 //! are no `-dev` headers involved — and by rendering into an offscreen FBO.
 //!
-//! Every [`eglSwapBuffers`] exports the FBO's texture as a dma-buf with
-//! `EGL_MESA_image_dma_buf_export` and hands the fd to the PenguDroid daemon as
-//! a [`Message::PresentDmabuf`] over `SCM_RIGHTS`. The daemon imports the
-//! buffer into its Wayland surface, so the frame reaches the screen with no CPU
-//! copy and no `wl_shm`.
+//! [`eglSwapBuffers`] selects one of two independent backends. `dmabuf.rs`
+//! exports the FBO texture with `EGL_MESA/EXT_image_dma_buf_export` and sends
+//! `Message::PresentDmabuf`; `gralloc.rs` allocates Hybris native buffers and
+//! presents mmap-able allocations through wl_shm. Both use `SCM_RIGHTS` and
+//! avoid CPU readback on their normal paths.
 //!
 //! # Surfaces
 //!
@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use pengudroid_proto::abi::{ANDROID_RGBA_8888, NATIVE_FD_FLAG};
+use pengudroid_proto::abi::ANDROID_RGBA_8888;
 use pengudroid_proto::{default_socket_path, BufferCrop, Message, Role, PROTO_VERSION};
 use pengudroid_socket::Connection;
 
@@ -510,315 +510,11 @@ fn mapped_elf_base(path: &str) -> Option<usize> {
     None
 }
 
-/// AArch64-only Binder/Hybris TLS separation. Every offset in this path is
-/// specific to the verified AArch64 Android 17 GSI and Aurora Hybris builds.
-/// ARMv7 needs its own ELF analysis and must not reuse these values.
-#[cfg(target_arch = "aarch64")]
-fn clear_legacy_tls_key(old: u32) {
-    thread_local! { static CLEARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-    CLEARED.with(|cleared| {
-        if cleared.get() { return; }
-        type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
-        let handle = unsafe { libc::dlopen(c"libc.so.6".as_ptr(), libc::RTLD_NOW) };
-        if let Some(clear) = sym_ptr(handle, "pthread_setspecific").and_then(cast_fn) {
-            let clear: SetSpecific = clear;
-            let _ = unsafe { clear(old, std::ptr::null_mut()) };
-        }
-        cleared.set(true);
-    });
-}
+mod dmabuf;
+mod gralloc;
+mod hybris_tls;
 
-#[cfg(target_arch = "aarch64")]
-fn clear_legacy_linux_binder_key(old: u32) {
-    clear_legacy_tls_key(old);
-}
-
-#[cfg(target_arch = "aarch64")]
-fn clear_legacy_hybris_hidl_key(old: u32) {
-    clear_legacy_tls_key(old);
-}
-
-/// Separate guest android::IPCThreadState from Hybris hardware::IPCThreadState
-/// on AArch64. ARMv7 has different object layouts and needs an independent fix.
-#[cfg(target_arch = "aarch64")]
-fn rekey_linux_binder_aarch64() {
-    static DONE: AtomicBool = AtomicBool::new(false);
-    static LEGACY_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
-    if DONE.load(Ordering::Relaxed) {
-        clear_legacy_linux_binder_key(LEGACY_KEY.load(Ordering::Relaxed));
-        return;
-    }
-    unsafe {
-    let Some(binder) = mapped_elf_base("/data/lib/libbinder.so") else {
-        eprintln!("[gleshim] guest libbinder mapping is absent for TLS separation");
-        return;
-    };
-    // Guest android::IPCThreadState is 496 bytes; Hybris' hardware state is
-    // 520. If both use the same low Bionic key, Hybris reads +512 beyond the
-    // guest object and interprets BR_REPLY as mCallRestriction.
-    if std::ptr::read_unaligned((binder + 0x54458) as *const u64) != 0xa9014ff4a9be7bfd {
-        eprintln!("[gleshim] guest IPCThreadState signature mismatch");
-        return;
-    }
-    type KeyCreate = unsafe extern "C" fn(*mut u32, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
-    type GetSpecific = unsafe extern "C" fn(u32) -> *mut c_void;
-    type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
-    let handle = libc::dlopen(c"libc.so.6".as_ptr(), libc::RTLD_NOW);
-    if handle.is_null() { return; }
-    let (Some(create), Some(get), Some(set)) = (
-        sym_ptr(handle, "pthread_key_create").and_then(cast_fn),
-        sym_ptr(handle, "pthread_getspecific").and_then(cast_fn),
-        sym_ptr(handle, "pthread_setspecific").and_then(cast_fn),
-    ) else { return };
-    let (create, get, set): (KeyCreate, GetSpecific, SetSpecific) = (create, get, set);
-    let key = (binder + 0xe8298) as *mut u32;
-    let old = *key;
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] guest Binder TLS key before separation={old}");
-    }
-    if old >= 16 {
-        DONE.store(true, Ordering::Relaxed);
-        return;
-    }
-    let current = get(old);
-    let mut new = 0u32;
-    while new < 16 {
-        if create(&mut new, None) != 0 { return; }
-    }
-    if set(new, current) != 0 { return; }
-    *key = new;
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] separated guest Binder TLS key {old} -> {new} (state={current:p})");
-    }
-    // Leave no stale state under the old key for Hybris' different 520-byte
-    // hardware::IPCThreadState. Its next self() then constructs its own object.
-    LEGACY_KEY.store(old, Ordering::Relaxed);
-    clear_legacy_linux_binder_key(old);
-    DONE.store(true, Ordering::Relaxed);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn rekey_hybris_hidl_aarch64() {
-    static DONE: AtomicBool = AtomicBool::new(false);
-    static LEGACY_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
-    if DONE.load(Ordering::Relaxed) {
-        clear_legacy_hybris_hidl_key(LEGACY_KEY.load(Ordering::Relaxed));
-        return;
-    }
-    unsafe {
-    let Some(base) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libhidlbase.so") else { return };
-    if std::ptr::read_unaligned((base + 0x88af0) as *const u64) != 0xa9014ff4a9be7bfd { return; }
-    type KeyCreate = unsafe extern "C" fn(*mut u32, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
-    type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
-    let handle = libc::dlopen(c"libc.so.6".as_ptr(), libc::RTLD_NOW);
-    if handle.is_null() { return; }
-    let (Some(create), Some(set)) = (
-        sym_ptr(handle, "pthread_key_create").and_then(cast_fn),
-        sym_ptr(handle, "pthread_setspecific").and_then(cast_fn),
-    ) else { return };
-    let (create, set): (KeyCreate, SetSpecific) = (create, set);
-    // Initialize gTLS before replacing it; otherwise the first self() call
-    // overwrites the new key with the library's default low key.
-    type IpcSelf = unsafe extern "C" fn() -> *mut c_void;
-    let self_fn: IpcSelf = std::mem::transmute(base + 0x88af0);
-    let _ = self_fn();
-    let key = (base + 0xa5c9c) as *mut u32;
-    let old = *key;
-    if old >= 16 {
-        DONE.store(true, Ordering::Relaxed);
-        return;
-    }
-    let mut new = 0u32;
-    while new < 16 {
-        if create(&mut new, None) != 0 { return; }
-    }
-    // Do not migrate the corrupt object. A fresh hardware::IPCThreadState must
-    // be constructed under the new key on each thread.
-    let _ = set(old, std::ptr::null_mut());
-    *key = new;
-    LEGACY_KEY.store(old, Ordering::Relaxed);
-    DONE.store(true, Ordering::Relaxed);
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] separated Hybris HIDL TLS key {old} -> {new}");
-    }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn rekey_hybris_egl() {
-    rekey_linux_binder_aarch64();
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) { return; }
-    let Some(egl) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libEGL.so") else {
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: internal libEGL mapping is absent");
-        }
-        return;
-    };
-    let Some(bionic) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libc.so") else {
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: Hybris Bionic libc mapping is absent");
-        }
-        return;
-    };
-    type KeyCreate = unsafe extern "C" fn(*mut u32, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
-    type GetSpecific = unsafe extern "C" fn(u32) -> *mut c_void;
-    type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
-    // These offsets are valid only for the verified Aurora Dialog-S Hybris
-    // build. Check the actual mapped instructions before calling or writing.
-    let signatures = [
-        (bionic + 0xbf920, 0xaa1f03eab0002b48u64),
-        (bionic + 0xbfbf0, 0x72b0000852801028u64),
-        (bionic + 0xbfc50, 0x72b0000852801028u64),
-        (egl + 0x1cb40, 0x910003fda9bf7bfdu64),
-    ];
-    if signatures.iter().any(|(address, expected)| unsafe {
-        std::ptr::read_unaligned(*address as *const u64) != *expected
-    }) {
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: Hybris ELF signatures do not match");
-        }
-        return;
-    }
-    let key = (egl + 0x31a40) as *mut u32;
-    let old = unsafe { *key };
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] rekey: egl={egl:#x} bionic={bionic:#x} old key={old}");
-    }
-    if old == u32::MAX { return; }
-    let current = unsafe {
-        let get: GetSpecific = std::mem::transmute(bionic + 0xbfbf0);
-        get(old)
-    };
-    let mut new = 0u32;
-    unsafe {
-        let create: KeyCreate = std::mem::transmute(bionic + 0xbf920);
-        // Bionic encodes the allocation flag in the high bit; the actual TLS
-        // index is in the low 31 bits. Keep EGL above ART's low guest keys.
-        while (new & 0x7fff_ffff) < 16 {
-            if create(&mut new, None) != 0 { return; }
-        }
-        if !current.is_null() {
-            let set: SetSpecific = std::mem::transmute(bionic + 0xbfc50);
-            if set(new, current) != 0 { return; }
-            let _ = set(old, std::ptr::null_mut());
-        }
-        *key = new;
-    }
-    DONE.store(true, Ordering::Relaxed);
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] moved Hybris EGL Bionic TLS key {old} -> {new}");
-    }
-}
-
-#[cfg(target_arch = "arm")]
-fn rekey_hybris_egl() {
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) { return; }
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] rekey: enter");
-    }
-    // Hybris' internal Android linker does not consistently honour the
-    // dlmopen pthread interposition. Move the guest IPCThreadState key above
-    // the low Bionic keys instead of depending on a particular EGL build.
-    let Some(binder) = mapped_elf_base("/data/lib/libbinder.so") else {
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: guest libbinder mapping is absent");
-        }
-        return;
-    };
-    // android::IPCThreadState::self(), pinned Android 17 ARM32. The load at
-    // +0x321ee reads gTLS through the PC-relative literal at +0x3220c,
-    // which resolves to +0x8afac. Refuse to write if instructions differ.
-    let signatures = [
-        (binder + 0x32190, 0xb5b0u16),
-        (binder + 0x321e2, 0x480eu16),
-        (binder + 0x321e4, 0x4478u16),
-        (binder + 0x321e6, 0xf04cu16),
-        (binder + 0x321ee, 0x6800u16),
-    ];
-    if signatures.iter().any(|(address, expected)| unsafe {
-        std::ptr::read_unaligned(*address as *const u16) != *expected
-    }) {
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: guest libbinder signatures do not match");
-        }
-        return;
-    }
-    type KeyCreate = unsafe extern "C" fn(*mut u32, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
-    type GetSpecific = unsafe extern "C" fn(u32) -> *mut c_void;
-    type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
-    let handle = unsafe { libc::dlopen(c"libc.so.6".as_ptr(), libc::RTLD_NOW) };
-    if handle.is_null() {
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: could not open host libc");
-        }
-        return;
-    }
-    let (Some(create), Some(get), Some(set)) = (
-        sym_ptr(handle, "pthread_key_create").and_then(cast_fn),
-        sym_ptr(handle, "pthread_getspecific").and_then(cast_fn),
-        sym_ptr(handle, "pthread_setspecific").and_then(cast_fn),
-    ) else {
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: host pthread symbols are unavailable");
-        }
-        return;
-    };
-    let (create, get, set): (KeyCreate, GetSpecific, SetSpecific) = (create, get, set);
-    let key = (binder + 0x8afac) as *mut u32;
-    let old = unsafe { *key };
-    if old >= 0x8000_0000 {
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: guest key is not initialized yet ({old:#x})");
-        }
-        return;
-    }
-    let current = unsafe { get(old) };
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] rekey: current key={old} value={current:p}");
-    }
-    let mut new = 0u32;
-    unsafe {
-        while new < 16 {
-            if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-                eprintln!("[gleshim] rekey: create enter {new}");
-            }
-            if create(&mut new, None) != 0 {
-                if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-                    eprintln!("[gleshim] rekey: pthread_key_create failed at {new}");
-                }
-                return;
-            }
-            if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-                eprintln!("[gleshim] rekey: create returned {new}");
-            }
-        }
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: set key={new} value={current:p}");
-        }
-        let replacement = if (current as usize) >= 0x10000 {
-            current
-        } else {
-            std::ptr::null_mut()
-        };
-        if set(new, replacement) != 0 {
-            if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-                eprintln!("[gleshim] rekey: pthread_setspecific failed for {new}");
-            }
-            return;
-        }
-        *key = new;
-        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-            eprintln!("[gleshim] rekey: gTLS updated to {new}");
-        }
-    }
-    DONE.store(true, Ordering::Relaxed);
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        eprintln!("[gleshim] moved guest IPCThreadState TLS key {old} -> {new}");
-    }
-}
+pub use dmabuf::{export_surface_dmabuf, DmabufExport};
 
 /// Publish the hosted SDR configuration before loading Hybris EGL. Loading
 /// libhybris-common first also gives EGL/GLES the same isolated namespace.
@@ -1155,29 +851,12 @@ struct SurfaceRec {
     child_of_early: bool,
 }
 
-struct GrallocTarget {
-    handle: *mut c_void,
-    fd: RawFd,
-    stride: u32,
-}
-
-struct GrallocFlipBuffer {
-    target: GrallocTarget,
-    fbo: u32,
-}
-
-struct GrallocFlip {
-    buffers: Vec<GrallocFlipBuffer>,
-    next: usize,
-    last: usize,
-}
-
 struct Target {
     group: u64,
     tex: u32,
     depth_rbo: u32,
-    gralloc: Option<GrallocTarget>,
-    flip: Option<GrallocFlip>,
+    gralloc: Option<gralloc::GrallocTarget>,
+    flip: Option<gralloc::GrallocFlip>,
     /// `(context serial, fbo)`.
     fbos: Vec<(u64, u32)>,
 }
@@ -1296,8 +975,13 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
             }
             bind_texture(GL_TEXTURE_2D, tex);
             let mut plain_texture = true;
-            if std::env::var_os("PENGUDROID_GRALLOC").is_some() {
-                match attach_gralloc_texture(host, tex, rec.w, rec.h) {
+            let gralloc_requested = std::env::var_os("PENGUDROID_GRALLOC").is_some()
+                && std::env::var_os("PENGUDROID_FORCE_DMABUF").is_none();
+            if gralloc_requested {
+                let attached = gralloc::support(host).and_then(|()| unsafe {
+                    gralloc::attach_gralloc_texture(host, tex, rec.w, rec.h)
+                });
+                match attached {
                     Ok(target) => {
                         eprintln!(
                             "[gleshim:gralloc] rendering {}x{} through fd={} stride={}",
@@ -1307,7 +991,7 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
                         plain_texture = false;
                     }
                     Err(error) => {
-                        eprintln!("[gleshim:gralloc] texture attach failed, using ordinary texture: {error}");
+                        eprintln!("[gleshim:gralloc] unsupported or texture attach failed, using dma-buf-capable ordinary texture: {error}");
                     }
                 }
             }
@@ -1405,7 +1089,7 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
     if target.gralloc.is_some() && target.flip.is_none()
         && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some()
     {
-        match create_gralloc_flip(host, rec.w, rec.h) {
+        match gralloc::create_gralloc_flip(host, rec.w, rec.h) {
             Ok(flip) => {
                 eprintln!(
                     "[gleshim:gralloc] GPU Y-flip enabled through fd={} fbo={}",
@@ -1418,7 +1102,7 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
         if std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_some() {
             let flip = target.flip.as_mut().unwrap();
             if flip.buffers.len() == 1 {
-                match create_gralloc_flip_buffer(host, rec.w, rec.h) {
+                match gralloc::create_gralloc_flip_buffer(host, rec.w, rec.h) {
                     Ok(buffer) => {
                         eprintln!(
                             "[gleshim:gralloc] async double buffering enabled through second fd={} fbo={}",
@@ -1448,241 +1132,6 @@ unsafe fn bind_surface_fbo(surface: EGLSurface, host: &Host) -> Result<(), Strin
         viewport(0, 0, rec.w as c_int, rec.h as c_int);
     }
     Ok(())
-}
-
-type ShaderSource = unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32);
-type ShaderIv = unsafe extern "C" fn(u32, u32, *mut i32);
-type ShaderInfoLog = unsafe extern "C" fn(u32, i32, *mut i32, *mut c_char);
-type Uniform1i = unsafe extern "C" fn(i32, i32);
-type GenObjects = unsafe extern "C" fn(i32, *mut u32);
-type BindObject = unsafe extern "C" fn(u32);
-
-#[derive(Clone, Copy)]
-struct ShaderApi {
-    create_shader: unsafe extern "C" fn(u32) -> u32,
-    shader_source: ShaderSource,
-    compile_shader: BindObject,
-    get_shader_iv: ShaderIv,
-    shader_info_log: ShaderInfoLog,
-    create_program: unsafe extern "C" fn() -> u32,
-    attach_shader: unsafe extern "C" fn(u32, u32),
-    link_program: BindObject,
-    get_program_iv: ShaderIv,
-    program_info_log: ShaderInfoLog,
-    use_program: BindObject,
-    get_uniform_location: unsafe extern "C" fn(u32, *const c_char) -> i32,
-    uniform1i: Uniform1i,
-    gen_vao: GenObjects,
-    bind_vao: BindObject,
-    draw_arrays: unsafe extern "C" fn(u32, i32, i32),
-    active_texture: BindObject,
-}
-
-#[derive(Clone, Copy)]
-struct ShaderFlipState {
-    api: ShaderApi,
-    program: u32,
-    vao: u32,
-}
-
-unsafe fn resolve_shader_proc(host: &Host, name: &str) -> Option<*mut c_void> {
-    let get = host.get_proc_address?;
-    let name = CString::new(name).ok()?;
-    let pointer = get(name.as_ptr());
-    if pointer.is_null() {
-        sym_ptr(host.gles_handle as *mut c_void, name.to_str().ok()?)
-    } else {
-        Some(pointer)
-    }
-}
-
-unsafe fn load_shader_api(host: &Host) -> Result<ShaderApi, String> {
-    macro_rules! load {
-        ($name:literal, $ty:ty) => {
-            resolve_shader_proc(host, $name).and_then(cast_fn::<$ty>)
-                .ok_or_else(|| format!("{} is unavailable", $name))?
-        };
-    }
-    Ok(ShaderApi {
-        create_shader: load!("glCreateShader", unsafe extern "C" fn(u32) -> u32),
-        shader_source: load!("glShaderSource", ShaderSource),
-        compile_shader: load!("glCompileShader", BindObject),
-        get_shader_iv: load!("glGetShaderiv", ShaderIv),
-        shader_info_log: load!("glGetShaderInfoLog", ShaderInfoLog),
-        create_program: load!("glCreateProgram", unsafe extern "C" fn() -> u32),
-        attach_shader: load!("glAttachShader", unsafe extern "C" fn(u32, u32)),
-        link_program: load!("glLinkProgram", BindObject),
-        get_program_iv: load!("glGetProgramiv", ShaderIv),
-        program_info_log: load!("glGetProgramInfoLog", ShaderInfoLog),
-        use_program: load!("glUseProgram", BindObject),
-        get_uniform_location: load!("glGetUniformLocation", unsafe extern "C" fn(u32, *const c_char) -> i32),
-        uniform1i: load!("glUniform1i", Uniform1i),
-        gen_vao: load!("glGenVertexArrays", GenObjects),
-        bind_vao: load!("glBindVertexArray", BindObject),
-        draw_arrays: load!("glDrawArrays", unsafe extern "C" fn(u32, i32, i32)),
-        active_texture: load!("glActiveTexture", BindObject),
-    })
-}
-
-unsafe fn shader_info(api: &ShaderApi, shader: u32, program: bool) -> String {
-    let mut bytes = vec![0u8; 2048];
-    let mut length = 0i32;
-    if program {
-        (api.program_info_log)(shader, bytes.len() as i32, &mut length, bytes.as_mut_ptr() as *mut c_char);
-    } else {
-        (api.shader_info_log)(shader, bytes.len() as i32, &mut length, bytes.as_mut_ptr() as *mut c_char);
-    }
-    String::from_utf8_lossy(&bytes[..length.max(0) as usize]).into_owned()
-}
-
-unsafe fn compile_flip_shader(api: &ShaderApi, kind: u32, source: &str) -> Result<u32, String> {
-    let shader = (api.create_shader)(kind);
-    if shader == 0 { return Err("glCreateShader returned 0".into()); }
-    let source = CString::new(source).unwrap();
-    let pointer = source.as_ptr();
-    (api.shader_source)(shader, 1, &pointer, std::ptr::null());
-    (api.compile_shader)(shader);
-    let mut ok = 0;
-    (api.get_shader_iv)(shader, 0x8B81, &mut ok); // GL_COMPILE_STATUS
-    if ok == 0 {
-        return Err(format!("shader compilation failed: {}", shader_info(api, shader, false)));
-    }
-    Ok(shader)
-}
-
-unsafe fn create_shader_flip_state(host: &Host) -> Result<ShaderFlipState, String> {
-    let started = std::time::Instant::now();
-    let api = load_shader_api(host)?;
-    let vertex = compile_flip_shader(&api, 0x8B31, "#version 300 es
-out vec2 v_uv;
-void main() {
-    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-    v_uv = vec2(p.x, 1.0 - p.y);
-    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
-}")?;
-    let fragment = compile_flip_shader(&api, 0x8B30, "#version 300 es
-precision mediump float;
-in vec2 v_uv;
-uniform sampler2D u_texture;
-out vec4 out_color;
-void main() { out_color = texture(u_texture, v_uv); }")?;
-    let program = (api.create_program)();
-    (api.attach_shader)(program, vertex);
-    (api.attach_shader)(program, fragment);
-    (api.link_program)(program);
-    let mut ok = 0;
-    (api.get_program_iv)(program, 0x8B82, &mut ok); // GL_LINK_STATUS
-    if ok == 0 {
-        return Err(format!("shader link failed: {}", shader_info(&api, program, true)));
-    }
-    let mut vao = 0;
-    (api.gen_vao)(1, &mut vao);
-    if vao == 0 { return Err("glGenVertexArrays returned 0".into()); }
-    let location = (api.get_uniform_location)(program, c"u_texture".as_ptr());
-    (api.use_program)(program);
-    (api.uniform1i)(location, 0);
-    if std::env::var_os("PENGUDROID_PROFILE_GRALLOC").is_some() {
-        eprintln!("[gleshim:gralloc:setup] shader flip program={:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
-    }
-    Ok(ShaderFlipState { api, program, vao })
-}
-
-fn shader_flip_state(host: &Host, serial: u64) -> Option<ShaderFlipState> {
-    static STATES: OnceLock<Mutex<std::collections::HashMap<u64, Option<ShaderFlipState>>>> = OnceLock::new();
-    let states = STATES.get_or_init(Default::default);
-    if let Some(state) = states.lock().unwrap_or_else(|e| e.into_inner()).get(&serial).copied() {
-        return state;
-    }
-    let state = unsafe { create_shader_flip_state(host) }
-        .map_err(|error| {
-            eprintln!("[gleshim:gralloc] shader flip unavailable, using blit fallback: {error}");
-            error
-        }).ok();
-    states.lock().unwrap_or_else(|e| e.into_inner()).insert(serial, state);
-    state
-}
-
-unsafe fn shader_flip_draw(host: &Host, serial: u64, texture: u32, width: u32, height: u32) -> bool {
-    let Some(state) = shader_flip_state(host, serial) else { return false };
-    let api = state.api;
-    let previous_program = host_get_integer(host, 0x8B8D) as u32; // GL_CURRENT_PROGRAM
-    let previous_vao = host_get_integer(host, 0x85B5) as u32; // GL_VERTEX_ARRAY_BINDING
-    let previous_texture = host_get_integer(host, 0x8069) as u32; // GL_TEXTURE_BINDING_2D
-    let previous_active = host_get_integer(host, 0x84E0) as u32; // GL_ACTIVE_TEXTURE
-    let mut viewport = [0i32; 4];
-    if let Some(get) = host.gl_get_integerv { get(0x0BA2, viewport.as_mut_ptr()); }
-    let toggles = [0x0B71, 0x0B90, 0x0C11, 0x0BE2, 0x0B44]; // depth/stencil/scissor/blend/cull
-    let mut enabled = [false; 5];
-    if let (Some(is_enabled), Some(disable)) = (host.gl_is_enabled, host.gl_disable) {
-        for (index, capability) in toggles.iter().enumerate() {
-            enabled[index] = is_enabled(*capability) != 0;
-            disable(*capability);
-        }
-    }
-    (api.active_texture)(0x84C0); // GL_TEXTURE0
-    if let Some(bind) = host.gl_bind_texture { bind(GL_TEXTURE_2D, texture); }
-    (api.use_program)(state.program);
-    (api.bind_vao)(state.vao);
-    if let Some(set) = host.gl_viewport { set(0, 0, width as i32, height as i32); }
-    (api.draw_arrays)(0x0004, 0, 3); // GL_TRIANGLES
-    (api.use_program)(previous_program);
-    (api.bind_vao)(previous_vao);
-    if let Some(bind) = host.gl_bind_texture { bind(GL_TEXTURE_2D, previous_texture); }
-    (api.active_texture)(previous_active);
-    if let Some(set) = host.gl_viewport { set(viewport[0], viewport[1], viewport[2], viewport[3]); }
-    if let Some(enable) = host.gl_enable {
-        for (index, capability) in toggles.iter().enumerate() {
-            if enabled[index] { enable(*capability); }
-        }
-    }
-    true
-}
-
-/// Flip the native texture on the GPU because Lipstick's wl_shell ignores
-/// wl_buffer transforms. No CPU readback is involved.
-unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
-    if std::env::var_os("PENGUDROID_GRALLOC_SHM").is_none() { return; }
-    let rec = &mut *(surface as *mut SurfaceRec);
-    let current = host.get_current_context.map(|f| f() as usize).filter(|c| *c != 0)
-        .unwrap_or_else(|| CURRENT_CONTEXT.with(|c| c.get()));
-    let info = context_info(current);
-    let Some(target) = rec.targets.iter_mut().find(|target| target.group == info.group) else { return };
-    let Some(flip) = target.flip.as_mut() else { return };
-    let Some((_, read_fbo)) = target.fbos.iter().find(|(serial, _)| *serial == info.serial) else { return };
-    let index = if flip.buffers.len() > 1 { flip.next } else { 0 };
-    flip.last = index;
-    flip.next = index ^ 1;
-    let (read_fbo, write_fbo) = (*read_fbo, flip.buffers[index].fbo);
-    let Some(bind) = host.gl_bind_framebuffer else { return };
-    bind(0x8CA8, read_fbo); // GL_READ_FRAMEBUFFER
-    bind(0x8CA9, write_fbo); // GL_DRAW_FRAMEBUFFER
-    let mut flipped = false;
-    if std::env::var_os("PENGUDROID_GRALLOC_SHADER_FLIP").is_some() {
-        flipped = shader_flip_draw(host, info.serial, target.tex, rec.w, rec.h);
-    }
-    if !flipped {
-        let Some(blit) = host.gl_blit_framebuffer else { return };
-        // HWUI leaves its dirty-rectangle scissor enabled on some frames. The
-        // flip is a separate full-surface operation, not part of that damage:
-        // glBlitFramebuffer honors scissor, so leaving it enabled can preserve
-        // stale pixels in the gralloc target (notably MAX's 420-dpi route).
-        let scissor = host.gl_is_enabled.map(|is_enabled| is_enabled(GL_SCISSOR_TEST) != 0);
-        if scissor == Some(true) {
-            if let Some(disable) = host.gl_disable { disable(GL_SCISSOR_TEST); }
-        }
-        blit(
-            0, 0, rec.w as i32, rec.h as i32,
-            0, rec.h as i32, rec.w as i32, 0,
-            GL_COLOR_BUFFER_BIT, GL_NEAREST as u32,
-        );
-        if scissor == Some(true) {
-            if let Some(enable) = host.gl_enable { enable(GL_SCISSOR_TEST); }
-        }
-    }
-    if std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_none() {
-        if let Some(finish) = host.gl_finish { finish(); }
-    }
-    bind(GL_FRAMEBUFFER, read_fbo);
 }
 
 /// `glGetIntegerv(pname)` on the current host context (0 if unavailable).
@@ -1800,212 +1249,6 @@ unsafe fn ensure_host_context(host: &Host) -> Result<(), String> {
     } else {
         // We cannot query the driver; assume the app made the context current.
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// dma-buf export
-// ---------------------------------------------------------------------------
-
-/// Plane 0 of an exported EGLImage. The caller owns `fd`.
-#[derive(Debug, Clone, Copy)]
-pub struct DmabufExport {
-    pub fd: RawFd,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub fourcc: u32,
-    pub modifier: u64,
-    pub offset: u32,
-}
-
-/// Export the texture of `surface` as a dma-buf.
-///
-/// The host context must be current. The internal EGL context value is passed
-/// to `eglCreateImageKHR` — Mesa's Iris driver dereferences it and segfaults if
-/// `EGL_NO_CONTEXT` is used.
-pub fn export_surface_dmabuf(surface: EGLSurface) -> Result<DmabufExport, String> {
-    if surface.is_null() {
-        return Err("export: null EGLSurface".into());
-    }
-    let host = host()?;
-
-    let create_image = host
-        .create_image_khr
-        .ok_or_else(|| "EGL_KHR_image_base (eglCreateImageKHR) is unavailable".to_string())?;
-    let destroy_image = host
-        .destroy_image_khr
-        .ok_or_else(|| "eglDestroyImageKHR is unavailable".to_string())?;
-    unsafe {
-        // Direct callers of this helper may not have made the context current
-        // even though they set one up earlier.
-        ensure_host_context(host)?;
-    }
-    let (texture, _) = unsafe { ensure_fbo(surface, host)? };
-    let rec = unsafe { &*(surface as *const SurfaceRec) };
-    if let Some(target) = rec.targets.iter().find(|target| target.tex == texture)
-        .and_then(|target| target.flip.as_ref().map(|flip| &flip.buffers[flip.last].target).or(target.gralloc.as_ref()))
-    {
-        let fd = unsafe { libc::dup(target.fd) };
-        if fd < 0 {
-            return Err(format!("cannot duplicate gralloc fd: {}", std::io::Error::last_os_error()));
-        }
-        return Ok(DmabufExport {
-            fd,
-            width: rec.w,
-            height: rec.h,
-            stride: target.stride * 4,
-            // HAL_BGRA_8888 bytes correspond to DRM RGBA8888 on AArch64 LE.
-            fourcc: 0x3432_4152,
-            modifier: 0, // DRM_FORMAT_MOD_LINEAR
-            offset: 0,
-        });
-    }
-    let query_image = host
-        .export_dmabuf_query
-        .ok_or_else(|| "EGL_MESA/EXT_image_dma_buf_export is unavailable".to_string())?;
-    let export_image = host
-        .export_dmabuf_export
-        .ok_or_else(|| "EGL_MESA/EXT_image_dma_buf_export is unavailable".to_string())?;
-
-    // The display and current context. Never pass `EGL_NO_CONTEXT`.
-    let (cached_display, cached_context) = {
-        let st = lock_state();
-        let own = CURRENT_CONTEXT.with(|c| c.get());
-        (st.display, if own != 0 { own } else { st.context })
-    };
-    let current_context = host
-        .get_current_context
-        .map(|f| unsafe { f() })
-        .unwrap_or(std::ptr::null_mut());
-    let context = if current_context.is_null() {
-        if cached_context == 0 {
-            return Err("export: no current EGLContext".into());
-        }
-        cached_context as EGLContext
-    } else {
-        current_context
-    };
-    // Prefer the display this process actually initialized: every image this
-    // module creates is created against that one, and Mesa's dma-buf entry
-    // points validate the display before anything else.
-    let display = if cached_display != 0 {
-        cached_display as EGLDisplay
-    } else {
-        host.get_current_display
-            .map(|f| unsafe { f() })
-            .unwrap_or(std::ptr::null_mut())
-    };
-    if display.is_null() {
-        return Err("export: display is not initialized".into());
-    }
-
-    // SAFETY: the texture belongs to the current context and `image` is
-    // destroyed below on every path.
-    let image = unsafe {
-        create_image(
-            display,
-            context,
-            EGL_GL_TEXTURE_2D_KHR,
-            texture as usize as EGLClientBuffer,
-            std::ptr::null(),
-        )
-    };
-    if image.is_null() {
-        return Err(format!("eglCreateImageKHR failed: {}", host_error(host)));
-    }
-
-    let result = export_plane0(
-        host,
-        display,
-        image,
-        query_image,
-        export_image,
-        rec.w,
-        rec.h,
-    );
-    // SAFETY: `image` was created above and is not used afterwards.
-    unsafe { destroy_image(display, image) };
-    result
-}
-
-fn export_plane0(
-    host: &Host,
-    display: EGLDisplay,
-    image: EGLImageKHR,
-    query_image: EglExportDMABUFImageQueryMESA,
-    export_image: EglExportDMABUFImageMESA,
-    width: u32,
-    height: u32,
-) -> Result<DmabufExport, String> {
-    let mut fourcc: c_int = 0;
-    let mut num_planes: c_int = 0;
-    let mut modifiers = [0u64; 4];
-
-    // SAFETY: `image` is live, the out-pointers are valid, and `modifiers` has
-    // room for the number of planes the extension reports.
-    let ok = unsafe { query_image(display, image, &mut fourcc, &mut num_planes, modifiers.as_mut_ptr()) };
-    if ok != EGL_TRUE {
-        return Err(format!(
-            "eglExportDMABUFImageQueryMESA failed: {}",
-            host_error(host)
-        ));
-    }
-    if num_planes < 1 {
-        return Err("dmabuf export reported no planes".into());
-    }
-    let planes = (num_planes as usize).min(modifiers.len());
-
-    let mut fds = [-1i32; 4];
-    let mut strides = [0i32; 4];
-    let mut offsets = [0i32; 4];
-    // SAFETY: three arrays of at least `num_planes` `int`s, as required.
-    let ok = unsafe {
-        export_image(
-            display,
-            image,
-            fds.as_mut_ptr(),
-            strides.as_mut_ptr(),
-            offsets.as_mut_ptr(),
-        )
-    };
-    if ok != EGL_TRUE {
-        close_exported_fds(&fds[..planes]);
-        return Err(format!(
-            "eglExportDMABUFImageMESA failed: {}",
-            host_error(host)
-        ));
-    }
-    if fds[0] < 0 {
-        close_exported_fds(&fds[..planes]);
-        return Err("dmabuf export returned an invalid fd".into());
-    }
-
-    // Only plane 0 is presented; close any additional planes (avoiding dupes).
-    for i in 1..planes {
-        if fds[i] >= 0 && !fds[..i].contains(&fds[i]) {
-            // SAFETY: this fd was just created by the export extension.
-            unsafe { libc::close(fds[i]) };
-        }
-    }
-
-    Ok(DmabufExport {
-        fd: fds[0],
-        width,
-        height,
-        stride: strides[0] as u32,
-        fourcc: fourcc as u32,
-        modifier: modifiers[0],
-        offset: offsets[0] as u32,
-    })
-}
-
-fn close_exported_fds(fds: &[RawFd]) {
-    for &fd in fds {
-        if fd >= 0 {
-            // SAFETY: these fds are owned by us and not closed elsewhere.
-            unsafe { libc::close(fd) };
-        }
     }
 }
 
@@ -2730,79 +1973,6 @@ pub unsafe extern "C" fn pengudroid_input_read_text(out: *mut u8, capacity: u32)
     text.len() as i32
 }
 
-/// Send one `PresentDmabuf` and wait for exactly one reply.
-///
-/// The connection is taken out of the global state for the duration, so even a
-/// blocked `recv` does not leave the mutex in a state that other EGL calls
-/// would deadlock on; the mutex is held only for this single request/response.
-unsafe fn present_dmabuf(
-    surface: EGLSurface,
-    width: u32,
-    height: u32,
-    stride: u32,
-    fourcc: u32,
-    modifier: u64,
-    offset: u32,
-    fd: RawFd,
-) -> Result<(), String> {
-    let mut st = lock_state();
-    // SAFETY: every non-null surface is a `SurfaceRec` this module allocated.
-    let rec = &mut *(surface as *mut SurfaceRec);
-    let surface_id = ensure_surface_id(&mut st, rec)?;
-
-    let conn = st
-        .conn
-        .take()
-        .ok_or_else(|| "daemon is unavailable".to_string())?;
-
-    let mut io_failure = false;
-    let result = (|| -> Result<(), String> {
-        let msg = Message::PresentDmabuf {
-            surface_id,
-            width,
-            height,
-            stride,
-            fourcc,
-            modifier,
-            offset,
-            top_down: false,
-        };
-        conn.send_message(&msg, &[fd]).map_err(|e| {
-            io_failure = true;
-            format!("PresentDmabuf send failed: {e}")
-        })?;
-        let (reply, fds) = conn.recv_message().map_err(|e| {
-            io_failure = true;
-            format!("PresentDmabuf reply failed: {e}")
-        })?;
-        close_fds(&fds);
-        match reply {
-            Message::Ack => Ok(()),
-            Message::Error { code, message } => {
-                Err(format!("present rejected ({code}): {message}"))
-            }
-            other => Err(format!("unexpected present reply: {other:?}")),
-        }
-    })();
-
-    if io_failure {
-        // Dead socket: allow a later swap to reconnect.
-        st.conn = None;
-        st.connect_attempted = false;
-    } else {
-        st.conn = Some(conn);
-    }
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-        match &result {
-            Ok(()) => eprintln!(
-                "[gleshim] presented surface {surface_id} {width}x{height}"
-            ),
-            Err(e) => eprintln!("[gleshim] present failed: {e}"),
-        }
-    }
-    result
-}
-
 /// CPU presentation fallback for drivers without a working dma-buf export.
 /// Enabled explicitly with `PENGUDROID_FORCE_SHM=1`; the default zero-copy
 /// path is unchanged. GL rows are bottom-up, Wayland's shared frame is top-down.
@@ -2911,310 +2081,6 @@ unsafe fn present_shm(surface: EGLSurface) -> Result<(), String> {
     result
 }
 
-/// Present the native gralloc allocation through wl_shm. Unlike PresentDmabuf
-/// this needs no compositor dma-buf global; wl_shm accepts any mmap-able fd.
-unsafe fn present_gralloc_shm(surface: EGLSurface) -> Result<(), String> {
-    let host = host()?;
-    let rec = &mut *(surface as *mut SurfaceRec);
-    let current = host.get_current_context.map(|f| f() as usize).filter(|c| *c != 0)
-        .unwrap_or_else(|| CURRENT_CONTEXT.with(|c| c.get()));
-    let info = context_info(current);
-    let target = rec.targets.iter().rev().find(|target| target.group == info.group)
-        .and_then(|target| target.flip.as_ref().map(|flip| &flip.buffers[flip.last].target).or(target.gralloc.as_ref()))
-        .ok_or_else(|| "surface has no gralloc target for the current context".to_string())?;
-    let fd = libc::dup(target.fd);
-    if fd < 0 {
-        return Err(format!("cannot duplicate gralloc fd: {}", std::io::Error::last_os_error()));
-    }
-    let result = present_gralloc_fd(fd, rec, target.stride * 4);
-    libc::close(fd);
-    result
-}
-
-/// Send one already-synchronized native buffer. The caller retains ownership
-/// of `fd`; the socket duplicates it into the daemon during SCM_RIGHTS send.
-fn present_gralloc_fd(fd: RawFd, rec: &mut SurfaceRec, stride: u32) -> Result<(), String> {
-    let mut st = lock_state();
-    let surface_id = ensure_surface_id(&mut st, rec)?;
-    let mut conn = st.conn.take().ok_or_else(|| "daemon is unavailable".to_string())?;
-    let native_window = if env_truthy("PENGUDROID_ANDROID_LAYERS") { rec.native_window as u64 } else { 0 };
-    let result = transmit_gralloc(&mut conn, surface_id, rec.w, rec.h, stride, fd, native_window);
-    if result.is_err() {
-        st.conn = None;
-        st.connect_attempted = false;
-    } else {
-        st.conn = Some(conn);
-    }
-    result
-}
-
-/// Worker-side variant which does not retain a raw SurfaceRec pointer.
-fn present_gralloc_metadata(
-    surface_id: u32,
-    width: u32,
-    height: u32,
-    stride: u32,
-    fd: RawFd,
-    native_window: u64,
-) -> Result<(), String> {
-    let mut st = lock_state();
-    let mut conn = st.conn.take().ok_or_else(|| "daemon is unavailable".to_string())?;
-    let result = transmit_gralloc(&mut conn, surface_id, width, height, stride, fd, native_window);
-    if result.is_err() {
-        st.conn = None;
-        st.connect_attempted = false;
-    } else {
-        st.conn = Some(conn);
-    }
-    result
-}
-
-fn transmit_gralloc(
-    conn: &mut Connection,
-    surface_id: u32,
-    width: u32,
-    height: u32,
-    stride: u32,
-    fd: RawFd,
-    native_window: u64,
-) -> Result<(), String> {
-    let message = Message::PresentShm {
-        surface_id,
-        width,
-        height,
-        stride,
-        format: ANDROID_RGBA_8888 | NATIVE_FD_FLAG,
-        native_window,
-        crop: BufferCrop::full(width as i32, height as i32),
-    };
-    conn.send_message(&message, &[fd]).map_err(|e| format!("gralloc wl_shm send failed: {e}"))?;
-    let (reply, fds) = conn.recv_message().map_err(|e| format!("gralloc wl_shm reply failed: {e}"))?;
-    close_fds(&fds);
-    match reply {
-        Message::Ack => Ok(()),
-        Message::Error { code, message } => Err(format!("gralloc wl_shm rejected ({code}): {message}")),
-        other => Err(format!("unexpected gralloc wl_shm reply: {other:?}")),
-    }
-}
-
-struct PendingGrallocFrame {
-    surface: usize,
-    surface_id: u32,
-    width: u32,
-    height: u32,
-    stride: u32,
-    fd: RawFd,
-    native_window: u64,
-    display: usize,
-    sync: usize,
-    frame: u64,
-    touch_seq: u64,
-    touch_kind: &'static str,
-    touch_recv_ms: u64,
-}
-
-#[derive(Default)]
-struct AsyncOutstanding {
-    counts: std::collections::HashMap<usize, usize>,
-}
-
-fn async_outstanding() -> &'static (Mutex<AsyncOutstanding>, Condvar) {
-    static OUTSTANDING: OnceLock<(Mutex<AsyncOutstanding>, Condvar)> = OnceLock::new();
-    OUTSTANDING.get_or_init(|| (Mutex::new(AsyncOutstanding::default()), Condvar::new()))
-}
-
-fn async_presenter() -> &'static std::sync::mpsc::Sender<PendingGrallocFrame> {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<PendingGrallocFrame>> = OnceLock::new();
-    SENDER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<PendingGrallocFrame>();
-        std::thread::Builder::new()
-            .name("pengudroid-present".into())
-            .spawn(move || {
-                while let Ok(frame) = rx.recv() {
-                    let Ok(host) = host() else { break };
-                    let wait_started = std::time::Instant::now();
-                    let waited = host.client_wait_sync.map(|wait| unsafe { wait(
-                        frame.display as EGLDisplay,
-                        frame.sync as EGLSync,
-                        0,
-                        1_000_000_000,
-                    ) });
-                    let wait_elapsed = wait_started.elapsed();
-                    if let Some(destroy) = host.destroy_sync {
-                        unsafe { destroy(frame.display as EGLDisplay, frame.sync as EGLSync); }
-                    }
-                    let present_started = std::time::Instant::now();
-                    let result = if waited == Some(EGL_CONDITION_SATISFIED_KHR) {
-                        present_gralloc_metadata(
-                            frame.surface_id, frame.width, frame.height, frame.stride, frame.fd,
-                            frame.native_window,
-                        )
-                    } else {
-                        Err(format!("async GPU fence did not signal: {waited:?}"))
-                    };
-                    let present_elapsed = present_started.elapsed();
-                    unsafe { libc::close(frame.fd); }
-                    if result.is_ok() {
-                        notify_frame_presented_vsync();
-                    }
-                    if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
-                        let now = input_trace_now_ms();
-                        eprintln!(
-                            "[gleshim:async] ts={now} frame={} success={} touch_seq={} kind={} touch_to_present_ms={} fence_wait_us={} present_us={}",
-                            frame.frame, result.is_ok(), frame.touch_seq, frame.touch_kind,
-                            now.saturating_sub(frame.touch_recv_ms),
-                            wait_elapsed.as_micros(), present_elapsed.as_micros(),
-                        );
-                    }
-                    if let Err(error) = result {
-                        eprintln!("[gleshim:gralloc] async present failed: {error}");
-                    }
-                    let (lock, ready) = async_outstanding();
-                    let mut outstanding = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(count) = outstanding.counts.get_mut(&frame.surface) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 { outstanding.counts.remove(&frame.surface); }
-                    }
-                    ready.notify_all();
-                }
-            })
-            .expect("spawn async gralloc presenter");
-        tx
-    })
-}
-
-/// Wait before reusing an output buffer. This must run before the Y-flip, not
-/// after it: with two outstanding frames the third flip would otherwise
-/// overwrite the oldest buffer before the presenter had fenced it off.
-fn wait_gralloc_async_slot(surface: EGLSurface) {
-    let (lock, ready) = async_outstanding();
-    let mut outstanding = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while outstanding.counts.get(&(surface as usize)).copied().unwrap_or(0) >= 2 {
-        outstanding = ready.wait(outstanding).unwrap_or_else(|e| e.into_inner());
-    }
-}
-
-/// Queue a flipped buffer behind a real host EGL fence. No SurfaceRec pointer
-/// crosses to the worker: surface destruction cannot leave it with a raw
-/// reference, and all connection access remains serialized by State's mutex.
-unsafe fn queue_gralloc_async(surface: EGLSurface, host: &Host) -> Result<(), String> {
-    let create = host.create_sync.ok_or("eglCreateSync is unavailable")?;
-    if host.client_wait_sync.is_none() || host.destroy_sync.is_none() {
-        return Err("EGL fence wait/destroy is unavailable".into());
-    }
-    let rec = &mut *(surface as *mut SurfaceRec);
-    let current = host.get_current_context.map(|f| f() as usize).filter(|c| *c != 0)
-        .unwrap_or_else(|| CURRENT_CONTEXT.with(|c| c.get()));
-    let info = context_info(current);
-    let target = rec.targets.iter().rev()
-        .find(|target| target.group == info.group)
-        .and_then(|target| target.flip.as_ref())
-        .ok_or("surface has no gralloc flip target for the current context")?;
-    if target.buffers.len() < 2 {
-        return Err("async double buffering needs two output buffers".into());
-    }
-    let output = &target.buffers[target.last].target;
-    let fd = libc::dup(output.fd);
-    if fd < 0 {
-        return Err(format!("cannot duplicate async gralloc fd: {}", std::io::Error::last_os_error()));
-    }
-    let (width, height, stride) = (rec.w, rec.h, output.stride * 4);
-    let display = lock_state().display;
-    let sync = create(display as EGLDisplay, 0x30F9, std::ptr::null()); // EGL_SYNC_FENCE_KHR
-    if sync.is_null() {
-        libc::close(fd);
-        return Err(format!("async eglCreateSync failed: {}", host_error(host)));
-    }
-    if let Some(flush) = host.gl_flush { flush(); }
-    let mut st = lock_state();
-    let surface_id = match ensure_surface_id(&mut st, rec) {
-        Ok(id) => id,
-        Err(error) => {
-            drop(st);
-            if let Some(destroy) = host.destroy_sync { destroy(display as EGLDisplay, sync); }
-            libc::close(fd);
-            return Err(error);
-        }
-    };
-    drop(st);
-    let (frame, touch_seq, touch_kind, touch_recv_ms) = {
-        let state = FRAME_TRACE_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        (state.frame, state.touch_seq, state.touch_kind, state.touch_recv_ms)
-    };
-    let pending = PendingGrallocFrame {
-        surface: surface as usize, surface_id, width, height, stride, fd,
-        native_window: if env_truthy("PENGUDROID_ANDROID_LAYERS") { rec.native_window as u64 } else { 0 },
-        display, sync: sync as usize, frame, touch_seq, touch_kind, touch_recv_ms,
-    };
-    let (lock, ready) = async_outstanding();
-    let mut outstanding = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while outstanding.counts.get(&(surface as usize)).copied().unwrap_or(0) >= 2 {
-        outstanding = ready.wait(outstanding).unwrap_or_else(|e| e.into_inner());
-    }
-    *outstanding.counts.entry(surface as usize).or_insert(0) += 1;
-    drop(outstanding);
-    if let Err(error) = async_presenter().send(pending) {
-        let pending = error.0;
-        if let Some(destroy) = host.destroy_sync {
-            destroy(pending.display as EGLDisplay, pending.sync as EGLSync);
-        }
-        libc::close(pending.fd);
-        let mut outstanding = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = outstanding.counts.get_mut(&(surface as usize)) {
-            *count = count.saturating_sub(1);
-            if *count == 0 { outstanding.counts.remove(&(surface as usize)); }
-        }
-        ready.notify_all();
-        return Err("async presenter queue is disconnected".into());
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-struct GrallocProfile {
-    count: u32,
-    since: Option<std::time::Instant>,
-    finish: std::time::Duration,
-    flip: std::time::Duration,
-    present: std::time::Duration,
-    pace: std::time::Duration,
-    swap: std::time::Duration,
-}
-
-fn profile_gralloc(
-    finish: std::time::Duration,
-    flip: std::time::Duration,
-    present: std::time::Duration,
-    pace: std::time::Duration,
-    swap: std::time::Duration,
-) {
-    static PROFILE: Mutex<GrallocProfile> = Mutex::new(GrallocProfile {
-        count: 0, since: None,
-        finish: std::time::Duration::ZERO, flip: std::time::Duration::ZERO,
-        present: std::time::Duration::ZERO, pace: std::time::Duration::ZERO,
-        swap: std::time::Duration::ZERO,
-    });
-    let mut p = PROFILE.lock().unwrap_or_else(|e| e.into_inner());
-    p.count += 1;
-    p.finish += finish; p.flip += flip; p.present += present;
-    p.pace += pace; p.swap += swap;
-    let elapsed = p.since.map(|since| since.elapsed()).unwrap_or_default();
-    if p.since.is_none() || elapsed >= std::time::Duration::from_secs(1) {
-        let n = p.count.max(1) as f64;
-        let fps = if elapsed.is_zero() { 0.0 } else { p.count as f64 / elapsed.as_secs_f64() };
-        let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0 / n;
-        eprintln!(
-            "[gleshim:gralloc:profile] fps={fps:.1} finish={:.2}ms flip={:.2}ms present={:.2}ms pace={:.2}ms swap={:.2}ms",
-            ms(p.finish), ms(p.flip), ms(p.present), ms(p.pace), ms(p.swap),
-        );
-        p.count = 0;
-        p.finish = std::time::Duration::ZERO; p.flip = std::time::Duration::ZERO;
-        p.present = std::time::Duration::ZERO; p.pace = std::time::Duration::ZERO;
-        p.swap = std::time::Duration::ZERO;
-        p.since = Some(std::time::Instant::now());
-    }
-}
-
 #[derive(Default)]
 struct ShmProfile {
     count: u32,
@@ -3255,402 +2121,6 @@ fn profile_shm(
         p.ipc = std::time::Duration::ZERO; p.total = std::time::Duration::ZERO;
         p.since = Some(std::time::Instant::now());
     }
-}
-
-#[repr(C)]
-struct ProbeNativeBase {
-    magic: i32,
-    version: i32,
-    reserved: [*mut c_void; 4],
-    inc_ref: *mut c_void,
-    dec_ref: *mut c_void,
-}
-
-extern "C" fn probe_noop_ref(_: *mut ProbeNativeBase) {}
-
-#[repr(C)]
-struct ProbeNativeWindowBuffer {
-    common: ProbeNativeBase,
-    width: i32,
-    height: i32,
-    stride: i32,
-    format: i32,
-    usage_deprecated: i32,
-    layer_count: usize,
-    reserved: *mut c_void,
-    handle: *const c_void,
-    usage: u64,
-    reserved_proc: [*mut c_void; 7],
-}
-
-type GrallocInitialize = unsafe extern "C" fn(c_int) -> c_int;
-type GrallocAllocate = unsafe extern "C" fn(
-    u32, u32, c_int, u32, *mut *mut c_void, *mut u32,
-) -> c_int;
-type GrallocRelease = unsafe extern "C" fn(*mut c_void, c_int);
-type GrallocDeinitialize = unsafe extern "C" fn();
-
-struct GrallocApi {
-    initialize: GrallocInitialize,
-    allocate: GrallocAllocate,
-    release: GrallocRelease,
-    deinitialize: GrallocDeinitialize,
-}
-
-unsafe fn open_host_gralloc(host: &Host) -> *mut c_void {
-    let path: &[u8] = if cfg!(target_arch = "arm") {
-        b"/usr/lib/libgralloc.so.1\0"
-    } else {
-        b"/lib64/libgralloc.so.1\0"
-    };
-    let name = path.as_ptr() as *const c_char;
-    let mut handle = if host.gl_isolated {
-        libc::dlmopen(
-            host.gl_namespace,
-            name,
-            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NOLOAD,
-        )
-    } else {
-        libc::dlopen(name, libc::RTLD_NOW | libc::RTLD_GLOBAL | libc::RTLD_NOLOAD)
-    };
-    if handle.is_null() {
-        handle = if host.gl_isolated {
-            libc::dlmopen(host.gl_namespace, name, libc::RTLD_NOW | libc::RTLD_LOCAL)
-        } else {
-            libc::dlopen(name, libc::RTLD_NOW | libc::RTLD_GLOBAL)
-        };
-    }
-    handle
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn log_hybris_ipc_state() {
-    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_none() { return; }
-    let Some(base) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libhidlbase.so") else { return };
-    if std::ptr::read_unaligned((base + 0x88af0) as *const u64) != 0xa9014ff4a9be7bfd { return; }
-    type IpcSelf = unsafe extern "C" fn() -> *mut c_void;
-    let self_fn: IpcSelf = std::mem::transmute(base + 0x88af0);
-    let state = self_fn();
-    if state.is_null() { return; }
-    let restriction = *((state as *mut u8).add(512) as *const i32);
-    let key = *((base + 0xa5c9c) as *const u32);
-    let guest = mapped_elf_base("/data/lib/libbinder.so").and_then(|guest_base| {
-        if std::ptr::read_unaligned((guest_base + 0x54458) as *const u64) != 0xa9014ff4a9be7bfd {
-            return None;
-        }
-        let self_fn: IpcSelf = std::mem::transmute(guest_base + 0x54458);
-        Some(self_fn())
-    });
-    let process = *(state as *mut *mut u8);
-    let process_restriction = if process.is_null() { -1 } else { *(process.add(192) as *const i32) };
-    let art = mapped_elf_base("/data/lib/libart.so").and_then(|base| {
-        if std::ptr::read_unaligned((base + 0x96d480) as *const u64) != 0x90001608d503245f {
-            return None;
-        }
-        let current: IpcSelf = std::mem::transmute(base + 0x96d480);
-        Some(current())
-    });
-    eprintln!("[gleshim] Hybris HIDL state={state:p} key={key} restriction={restriction} process={process:p} process_restriction={process_restriction} guest={:p} art={:p}", guest.unwrap_or(std::ptr::null_mut()), art.unwrap_or(std::ptr::null_mut()));
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-unsafe fn log_hybris_ipc_state() {}
-
-unsafe fn gralloc_api(host: &Host) -> Result<GrallocApi, String> {
-    // This branch is specific to Linux+Hybris/AArch64/gralloc. The dma-buf
-    // path never enters it; ARMv7hl needs an independently verified fix.
-    #[cfg(target_arch = "aarch64")]
-    if hybris_host() { rekey_hybris_hidl_aarch64(); }
-    let handle = open_host_gralloc(host);
-    if handle.is_null() {
-        return Err("cannot load host libgralloc.so.1".into());
-    }
-    Ok(GrallocApi {
-        initialize: sym_ptr(handle, "hybris_gralloc_initialize")
-            .and_then(cast_fn).ok_or("hybris_gralloc_initialize is unavailable")?,
-        allocate: sym_ptr(handle, "hybris_gralloc_allocate")
-            .and_then(cast_fn).ok_or("hybris_gralloc_allocate is unavailable")?,
-        release: sym_ptr(handle, "hybris_gralloc_release")
-            .and_then(cast_fn).ok_or("hybris_gralloc_release is unavailable")?,
-        deinitialize: sym_ptr(handle, "hybris_gralloc_deinitialize")
-            .and_then(cast_fn).ok_or("hybris_gralloc_deinitialize is unavailable")?,
-    })
-}
-
-unsafe fn allocate_gralloc(host: &Host, width: u32, height: u32) -> Result<GrallocTarget, String> {
-    let api = gralloc_api(host)?;
-    let mut handle = std::ptr::null_mut();
-    let mut stride = 0u32;
-    (api.initialize)(0);
-    log_hybris_ipc_state();
-    // HW_RENDER | HW_TEXTURE | SW_READ_OFTEN: request linear CPU-readable data.
-    let rc = (api.allocate)(width, height, 5, 0x303, &mut handle, &mut stride);
-    if rc != 0 || handle.is_null() {
-        (api.deinitialize)();
-        return Err(format!("hybris_gralloc_allocate failed: rc={rc} handle={handle:p}"));
-    }
-    let header = handle as *const i32;
-    let num_fds = *header.add(1);
-    if num_fds < 1 {
-        (api.release)(handle, 1);
-        (api.deinitialize)();
-        return Err("gralloc handle contains no file descriptor".into());
-    }
-    let mut fd = *header.add(3);
-    if std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some() {
-        let length = stride as usize * height as usize * 4;
-        let mut selected = None;
-        let mut mmapable = Vec::new();
-        for index in 0..num_fds {
-            let candidate = *header.add(3 + index as usize);
-            if candidate < 0 { continue; }
-            let mapping = libc::mmap(
-                std::ptr::null_mut(), length, libc::PROT_READ, libc::MAP_SHARED, candidate, 0,
-            );
-            let ok = mapping != libc::MAP_FAILED;
-            if ok {
-                libc::munmap(mapping, length);
-                mmapable.push(index);
-                if selected.is_none() { selected = Some(index); }
-            }
-            eprintln!("[gleshim:gralloc] fd index={index} fd={candidate} mmap={ok}");
-        }
-        if let Some(requested) = std::env::var("PENGUDROID_GRALLOC_FD_INDEX")
-            .ok().and_then(|value| value.parse::<i32>().ok())
-        {
-            if mmapable.contains(&requested) {
-                selected = Some(requested);
-            } else {
-                selected = None;
-            }
-        }
-        let Some(index) = selected else {
-            (api.release)(handle, 1);
-            (api.deinitialize)();
-            return Err("no gralloc fd is mmap-able for wl_shm".into());
-        };
-        fd = *header.add(3 + index as usize);
-        eprintln!("[gleshim:gralloc] selected mmap-able fd index {index} for wl_shm");
-    }
-    if fd < 0 {
-        (api.release)(handle, 1);
-        (api.deinitialize)();
-        return Err("gralloc handle has an invalid file descriptor".into());
-    }
-    Ok(GrallocTarget { handle, fd, stride })
-}
-
-fn native_window_buffer(target: &GrallocTarget, width: u32, height: u32) -> ProbeNativeWindowBuffer {
-    ProbeNativeWindowBuffer {
-        common: ProbeNativeBase {
-            magic: i32::from_be_bytes(*b"_bfr"),
-            version: std::mem::size_of::<ProbeNativeWindowBuffer>() as i32,
-            reserved: [std::ptr::null_mut(); 4],
-            inc_ref: probe_noop_ref as *mut () as *mut c_void,
-            dec_ref: probe_noop_ref as *mut () as *mut c_void,
-        },
-        width: width as i32,
-        height: height as i32,
-        stride: target.stride as i32,
-        format: 5, // HAL_PIXEL_FORMAT_BGRA_8888
-        usage_deprecated: 0x303,
-        layer_count: 1,
-        reserved: std::ptr::null_mut(),
-        handle: target.handle as *const c_void,
-        usage: 0x303,
-        reserved_proc: [std::ptr::null_mut(); 7],
-    }
-}
-
-/// Wrap a gralloc allocation as the texture used by the surface FBO.
-unsafe fn attach_gralloc_texture(
-    host: &Host,
-    texture: u32,
-    width: u32,
-    height: u32,
-) -> Result<GrallocTarget, String> {
-    let started = std::time::Instant::now();
-    let target = allocate_gralloc(host, width, height)?;
-    let mut native = native_window_buffer(&target, width, height);
-    let image_target = host.gl_egl_image_target_texture_2d
-        .ok_or("glEGLImageTargetTexture2DOES is unavailable")?;
-    let image = (host.create_image_khr.ok_or("eglCreateImageKHR unavailable")?)(
-        lock_state().display as EGLDisplay,
-        std::ptr::null_mut(),
-        0x3140, // EGL_NATIVE_BUFFER_ANDROID
-        &mut native as *mut ProbeNativeWindowBuffer as EGLClientBuffer,
-        std::ptr::null(),
-    );
-    if image.is_null() {
-        return Err(format!("gralloc EGLImage creation failed: {}", host_error(host)));
-    }
-    image_target(GL_TEXTURE_2D, image);
-    let error = host.gl_get_error.map(|get| get()).unwrap_or(0);
-    if let Some(destroy) = host.destroy_image_khr {
-        destroy(lock_state().display as EGLDisplay, image);
-    }
-    if error != 0 {
-        return Err(format!("glEGLImageTargetTexture2DOES failed: GL error {error:#x}"));
-    }
-    if std::env::var_os("PENGUDROID_PROFILE_GRALLOC").is_some() {
-        eprintln!("[gleshim:gralloc:setup] allocation+EGLImage+texture={:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
-    }
-    Ok(target)
-}
-
-/// Allocate a native output buffer and its FBO for the GPU Y-flip blit.
-unsafe fn create_gralloc_flip_buffer(host: &Host, width: u32, height: u32) -> Result<GrallocFlipBuffer, String> {
-    let started = std::time::Instant::now();
-    let gen_texture = host.gl_gen_textures.ok_or("glGenTextures unavailable")?;
-    let bind_texture = host.gl_bind_texture.ok_or("glBindTexture unavailable")?;
-    let target_image = host.gl_egl_image_target_texture_2d.ok_or("EGL image texture unavailable")?;
-    let _ = target_image;
-    let mut texture = 0u32;
-    gen_texture(1, &mut texture);
-    if texture == 0 { return Err("flip glGenTextures returned 0".into()); }
-    bind_texture(GL_TEXTURE_2D, texture);
-    let target = attach_gralloc_texture(host, texture, width, height)?;
-    if let Some(set) = host.gl_tex_parameter_i {
-        set(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        set(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    }
-    let gen_fbo = host.gl_gen_framebuffers.ok_or("glGenFramebuffers unavailable")?;
-    let bind_fbo = host.gl_bind_framebuffer.ok_or("glBindFramebuffer unavailable")?;
-    let attach = host.gl_framebuffer_texture_2d.ok_or("glFramebufferTexture2D unavailable")?;
-    let mut fbo = 0u32;
-    gen_fbo(1, &mut fbo);
-    if fbo == 0 { return Err("flip glGenFramebuffers returned 0".into()); }
-    bind_fbo(GL_FRAMEBUFFER, fbo);
-    attach(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-    if let Some(check) = host.gl_check_framebuffer_status {
-        if check(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE {
-            return Err("flip framebuffer is incomplete".into());
-        }
-    }
-    if std::env::var_os("PENGUDROID_PROFILE_GRALLOC").is_some() {
-        eprintln!("[gleshim:gralloc:setup] flip buffer+FBO={:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
-    }
-    Ok(GrallocFlipBuffer { target, fbo })
-}
-
-unsafe fn create_gralloc_flip(host: &Host, width: u32, height: u32) -> Result<GrallocFlip, String> {
-    Ok(GrallocFlip {
-        buffers: vec![create_gralloc_flip_buffer(host, width, height)?],
-        next: 0,
-        last: 0,
-    })
-}
-
-/// Opt-in host gralloc probe. It does not replace the normal present path:
-/// after logging allocation/EGLImage support, eglSwapBuffers continues through
-/// the selected dma-buf or SHM fallback.
-fn probe_gralloc_once() {
-    if std::env::var_os("PENGUDROID_PROBE_GRALLOC").is_none() {
-        return;
-    }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        if let Err(error) = unsafe { probe_gralloc() } {
-            eprintln!("[gleshim:gralloc] {error}");
-        }
-    });
-}
-
-unsafe fn probe_gralloc() -> Result<(), String> {
-    let host = host()?;
-    if !host.gl_isolated {
-        return Ok(()); // Mesa already has the normal dma-buf export path.
-    }
-    let gralloc = open_host_gralloc(host);
-    let gralloc = if gralloc.is_null() { None } else { Some(gralloc) }
-        .ok_or_else(|| {
-            let error = unsafe { libc::dlerror() };
-            if error.is_null() {
-                "cannot load host libgralloc.so.1".to_string()
-            } else {
-                format!(
-                    "cannot load host libgralloc.so.1: {}",
-                    unsafe { std::ffi::CStr::from_ptr(error) }.to_string_lossy(),
-                )
-            }
-        })?;
-    type Initialize = unsafe extern "C" fn(c_int) -> c_int;
-    type Allocate = unsafe extern "C" fn(
-        u32, u32, c_int, u32, *mut *mut c_void, *mut u32,
-    ) -> c_int;
-    type Release = unsafe extern "C" fn(*mut c_void, c_int);
-    type Deinitialize = unsafe extern "C" fn();
-    let initialize: Initialize = sym_ptr(gralloc, "hybris_gralloc_initialize")
-        .and_then(cast_fn).ok_or("hybris_gralloc_initialize is unavailable")?;
-    let allocate: Allocate = sym_ptr(gralloc, "hybris_gralloc_allocate")
-        .and_then(cast_fn).ok_or("hybris_gralloc_allocate is unavailable")?;
-    let release: Release = sym_ptr(gralloc, "hybris_gralloc_release")
-        .and_then(cast_fn).ok_or("hybris_gralloc_release is unavailable")?;
-    let deinitialize: Deinitialize = sym_ptr(gralloc, "hybris_gralloc_deinitialize")
-        .and_then(cast_fn).ok_or("hybris_gralloc_deinitialize is unavailable")?;
-    #[cfg(target_arch = "aarch64")]
-    if hybris_host() { rekey_hybris_hidl_aarch64(); }
-    let mut handle = std::ptr::null_mut();
-    let mut stride = 0u32;
-    initialize(0);
-    // HW_RENDER | HW_TEXTURE | SW_READ_OFTEN.
-    let rc = allocate(64, 64, 5, 0x303, &mut handle, &mut stride);
-    if rc != 0 || handle.is_null() {
-        deinitialize();
-        return Err(format!("hybris_gralloc_allocate failed: rc={rc} handle={handle:p}"));
-    }
-    eprintln!(
-        "[gleshim:gralloc] allocated 64x64 stride={} handle={:p}",
-        stride, handle,
-    );
-    let header = handle as *const i32;
-    let num_fds = *header.add(1);
-    let first_fd = if num_fds > 0 { *header.add(3) } else { -1 };
-    eprintln!(
-        "[gleshim:gralloc] native handle fds={} first_fd={}",
-        num_fds, first_fd,
-    );
-    let mut native = ProbeNativeWindowBuffer {
-        common: ProbeNativeBase {
-            magic: i32::from_be_bytes(*b"_bfr"),
-            version: std::mem::size_of::<ProbeNativeWindowBuffer>() as i32,
-            reserved: [std::ptr::null_mut(); 4],
-            inc_ref: probe_noop_ref as *mut () as *mut c_void,
-            dec_ref: probe_noop_ref as *mut () as *mut c_void,
-        },
-        width: 64,
-        height: 64,
-        stride: stride as i32,
-        format: 5,
-        usage_deprecated: 0x303,
-        layer_count: 1,
-        reserved: std::ptr::null_mut(),
-        handle: handle as *const c_void,
-        usage: 0x303,
-        reserved_proc: [std::ptr::null_mut(); 7],
-    };
-    let create_image = host.create_image_khr.ok_or("eglCreateImageKHR unavailable")?;
-    let image = create_image(
-        lock_state().display as EGLDisplay,
-        std::ptr::null_mut(),
-        0x3140, // EGL_NATIVE_BUFFER_ANDROID
-        &mut native as *mut ProbeNativeWindowBuffer as EGLClientBuffer,
-        std::ptr::null(),
-    );
-    if image.is_null() {
-        eprintln!(
-            "[gleshim:gralloc] EGL_NATIVE_BUFFER_ANDROID image failed: {}",
-            host_error(host),
-        );
-    } else {
-        eprintln!("[gleshim:gralloc] EGL_NATIVE_BUFFER_ANDROID image created successfully");
-        if let Some(destroy) = host.destroy_image_khr {
-            destroy(lock_state().display as EGLDisplay, image);
-        }
-    }
-    release(handle, 1);
-    deinitialize();
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3748,10 +2218,10 @@ pub unsafe extern "C" fn eglInitialize(
     // real configstore over hwbinder from inside this call.
     let _host_call = HostCallGuard::enter();
     #[cfg(target_arch = "aarch64")]
-    if hybris_host() { rekey_linux_binder_aarch64(); }
+    if hybris_host() { hybris_tls::rekey_linux_binder(); }
     let ok = (host.initialize)(dpy, major, minor);
     #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-    if hybris_host() { rekey_hybris_egl(); }
+    if hybris_host() { hybris_tls::rekey_egl(); }
     if ok == EGL_TRUE {
         lock_state().display = dpy as usize;
     }
@@ -4234,7 +2704,7 @@ pub unsafe extern "C" fn eglCreateContext(
         Ok(host) => {
             let context = (host.create_context)(dpy, config, share_context, attribs);
             #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-            if hybris_host() { rekey_hybris_egl(); }
+            if hybris_host() { hybris_tls::rekey_egl(); }
             register_context(context as usize, share_context as usize);
             if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
                 eprintln!("[gleshim] eglCreateContext share={share_context:p} -> {context:p} thread={}", thread_label());
@@ -4297,7 +2767,7 @@ pub unsafe extern "C" fn eglMakeCurrent(
         ctx,
     );
     #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-    if hybris_host() { rekey_hybris_egl(); }
+    if hybris_host() { hybris_tls::rekey_egl(); }
     if ok != EGL_TRUE {
         // A failed eglMakeCurrent leaves the previous binding in place.
         return EGL_FALSE;
@@ -5666,15 +4136,22 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         log_once(format_args!("eglSwapBuffers: {e}"));
         return EGL_FALSE;
     }
-    probe_gralloc_once();
+    if std::env::var_os("PENGUDROID_FORCE_DMABUF").is_none() {
+        gralloc::probe_gralloc_once();
+    }
     trace_touch_swap();
     draw_mangohud_overlay(surface, host);
     draw_touch_debug_overlay(surface, host);
-    let async_gralloc = std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_some()
-        && std::env::var_os("PENGUDROID_GRALLOC").is_some()
+    // Requesting gralloc is not enough: use it only after this surface's
+    // allocation succeeded. Otherwise the same binary continues with the
+    // active Linux/Hybris driver's dma-buf export path.
+    let gralloc_active = std::env::var_os("PENGUDROID_FORCE_DMABUF").is_none()
+        && gralloc::has_target(surface, host);
+    let async_gralloc = gralloc_active
+        && std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_some()
         && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some();
     if async_gralloc {
-        wait_gralloc_async_slot(surface);
+        gralloc::wait_gralloc_async_slot(surface);
     }
     let finish_started = std::time::Instant::now();
     // Diagnostic readback still requires synchronous source pixels. Normal
@@ -5690,32 +4167,30 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
     let finish_elapsed = finish_started.elapsed();
     trace_content_hash(surface, host);
     let flip_started = std::time::Instant::now();
-    flip_gralloc_surface(surface, host);
+    gralloc::flip_gralloc_surface(surface, host);
     let flip_elapsed = flip_started.elapsed();
     dump_frame_once(surface, host);
     trace_presents(surface);
 
-    if std::env::var_os("PENGUDROID_GRALLOC").is_some()
-        && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some()
-    {
+    if gralloc_active && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some() {
         let present_started = std::time::Instant::now();
         let presented = if async_gralloc {
-            match queue_gralloc_async(surface, host) {
+            match gralloc::queue_gralloc_async(surface, host) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     eprintln!("[gleshim:gralloc] async queue failed, using synchronous fence fallback: {error}");
                     if let Some(finish) = host.gl_finish { finish(); }
-                    present_gralloc_shm(surface)
+                    gralloc::present_gralloc_shm(surface)
                 }
             }
         } else {
-            present_gralloc_shm(surface)
+            gralloc::present_gralloc_shm(surface)
         };
         let present_elapsed = present_started.elapsed();
         let gralloc_presented = presented.is_ok();
         let pace_started = std::time::Instant::now();
         if presented.is_ok() {
-            pace_gralloc_swap(surface);
+            gralloc::pace_gralloc_swap(surface);
         }
         let pace_elapsed = pace_started.elapsed();
         let outcome = match presented {
@@ -5748,7 +4223,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
             }
         }
         if std::env::var_os("PENGUDROID_PROFILE_GRALLOC").is_some() {
-            profile_gralloc(
+            gralloc::profile_gralloc(
                 finish_elapsed, flip_elapsed, present_elapsed, pace_elapsed,
                 profile_started.elapsed(),
             );
@@ -5756,9 +4231,16 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         return outcome;
     }
 
-    if std::env::var_os("PENGUDROID_FORCE_SHM").is_some()
-        && std::env::var_os("PENGUDROID_FORCE_DMABUF").is_none()
+    let dmabuf_supported = dmabuf::is_supported(host);
+    if (std::env::var_os("PENGUDROID_FORCE_SHM").is_some()
+        && std::env::var_os("PENGUDROID_FORCE_DMABUF").is_none())
+        || !dmabuf_supported
     {
+        if !dmabuf_supported {
+            log_once(format_args!(
+                "active host EGL has no complete dma-buf export API; using SHM"
+            ));
+        }
         return match present_shm(surface) {
             Ok(()) => {
                 pace_swap(surface as usize);
@@ -5787,9 +4269,19 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         Err(e) => {
             static LOGGED_EXPORT_ERROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !LOGGED_EXPORT_ERROR.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("[gleshim] dma-buf export failed: {e}");
+                eprintln!("[gleshim] dma-buf export failed, using SHM: {e}");
             }
-            return EGL_FALSE;
+            return match present_shm(surface) {
+                Ok(()) => {
+                    pace_swap(surface as usize);
+                    notify_frame_presented_vsync();
+                    EGL_TRUE
+                }
+                Err(shm_error) => {
+                    eprintln!("[gleshim] SHM fallback failed: {shm_error}");
+                    EGL_FALSE
+                }
+            };
         }
     };
     let rec = &*(surface as *const SurfaceRec);
@@ -5799,7 +4291,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
     // SAFETY: `exported.fd` is a freshly exported descriptor we own.
     let fd = OwnedFd::from_raw_fd(exported.fd);
 
-    match present_dmabuf(
+    match dmabuf::present_dmabuf(
         surface,
         rec.w,
         rec.h,
@@ -5867,18 +4359,6 @@ fn reserve_frame_slot(previous_next: Option<u64>, now_us: u64, gap_us: u64) -> (
 /// that short-lived pointer let their frame budgets add up and produced a
 /// nominal 70 Hz stream with a 60 Hz cap. The daemon surface id is stable and
 /// is also the object on which the visual frame counter is reported.
-fn pace_gralloc_swap(surface: EGLSurface) {
-    let id = unsafe { (*(surface as *const SurfaceRec)).surface_id };
-    let key = if id == 0 {
-        surface as usize
-    } else {
-        usize::MAX - id as usize
-    };
-    pace_swap(key);
-}
-
-/// Cap the guest's swap rate.
-///
 /// `present_dmabuf` is synchronous — it waits for the daemon's ack — but the
 /// daemon acks as soon as the frame is *queued* for the compositor, not when
 /// the compositor presents it. Without a cap a game free-runs at hundreds of
@@ -6190,6 +4670,13 @@ mod tests {
             return None;
         }
         Some(std::mem::transmute_copy(&ptr))
+    }
+
+    #[test]
+    fn linux_dma_buf_does_not_require_gralloc() {
+        let host = host().expect("host EGL must load");
+        assert!(dmabuf::is_supported(host));
+        assert!(gralloc::support(host).is_err());
     }
 
     #[test]
