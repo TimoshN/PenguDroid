@@ -495,7 +495,7 @@ fn host() -> Result<&'static Host, String> {
     HOST.get_or_init(Host::load).as_ref().map_err(Clone::clone)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
 fn mapped_elf_base(path: &str) -> Option<usize> {
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     for line in maps.lines() {
@@ -581,8 +581,110 @@ fn rekey_hybris_egl() {
 
 #[cfg(target_arch = "arm")]
 fn rekey_hybris_egl() {
-    // The isolated ARM32 namespace uses libpengudroid_hybris_pthread.so's
-    // explicit LIBC/GLIBC boundary, so no build-specific EGL key rewrite.
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) { return; }
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] rekey: enter");
+    }
+    // Hybris' internal Android linker does not consistently honour the
+    // dlmopen pthread interposition. Move the guest IPCThreadState key above
+    // the low Bionic keys instead of depending on a particular EGL build.
+    let Some(binder) = mapped_elf_base("/data/lib/libbinder.so") else {
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: guest libbinder mapping is absent");
+        }
+        return;
+    };
+    // android::IPCThreadState::self(), pinned Android 17 ARM32. The load at
+    // +0x321ee reads gTLS through the PC-relative literal at +0x3220c,
+    // which resolves to +0x8afac. Refuse to write if instructions differ.
+    let signatures = [
+        (binder + 0x32190, 0xb5b0u16),
+        (binder + 0x321e2, 0x480eu16),
+        (binder + 0x321e4, 0x4478u16),
+        (binder + 0x321e6, 0xf04cu16),
+        (binder + 0x321ee, 0x6800u16),
+    ];
+    if signatures.iter().any(|(address, expected)| unsafe {
+        std::ptr::read_unaligned(*address as *const u16) != *expected
+    }) {
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: guest libbinder signatures do not match");
+        }
+        return;
+    }
+    type KeyCreate = unsafe extern "C" fn(*mut u32, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
+    type GetSpecific = unsafe extern "C" fn(u32) -> *mut c_void;
+    type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
+    let handle = unsafe { libc::dlopen(c"libc.so.6".as_ptr(), libc::RTLD_NOW) };
+    if handle.is_null() {
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: could not open host libc");
+        }
+        return;
+    }
+    let (Some(create), Some(get), Some(set)) = (
+        sym_ptr(handle, "pthread_key_create").and_then(cast_fn),
+        sym_ptr(handle, "pthread_getspecific").and_then(cast_fn),
+        sym_ptr(handle, "pthread_setspecific").and_then(cast_fn),
+    ) else {
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: host pthread symbols are unavailable");
+        }
+        return;
+    };
+    let (create, get, set): (KeyCreate, GetSpecific, SetSpecific) = (create, get, set);
+    let key = (binder + 0x8afac) as *mut u32;
+    let old = unsafe { *key };
+    if old >= 0x8000_0000 {
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: guest key is not initialized yet ({old:#x})");
+        }
+        return;
+    }
+    let current = unsafe { get(old) };
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] rekey: current key={old} value={current:p}");
+    }
+    let mut new = 0u32;
+    unsafe {
+        while new < 16 {
+            if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                eprintln!("[gleshim] rekey: create enter {new}");
+            }
+            if create(&mut new, None) != 0 {
+                if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                    eprintln!("[gleshim] rekey: pthread_key_create failed at {new}");
+                }
+                return;
+            }
+            if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                eprintln!("[gleshim] rekey: create returned {new}");
+            }
+        }
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: set key={new} value={current:p}");
+        }
+        let replacement = if (current as usize) >= 0x10000 {
+            current
+        } else {
+            std::ptr::null_mut()
+        };
+        if set(new, replacement) != 0 {
+            if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                eprintln!("[gleshim] rekey: pthread_setspecific failed for {new}");
+            }
+            return;
+        }
+        *key = new;
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            eprintln!("[gleshim] rekey: gTLS updated to {new}");
+        }
+    }
+    DONE.store(true, Ordering::Relaxed);
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] moved guest IPCThreadState TLS key {old} -> {new}");
+    }
 }
 
 /// Publish the hosted SDR configuration before loading Hybris EGL. Loading
@@ -3474,7 +3576,7 @@ pub unsafe extern "C" fn eglInitialize(
     // real configstore over hwbinder from inside this call.
     let _host_call = HostCallGuard::enter();
     let ok = (host.initialize)(dpy, major, minor);
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
     if hybris_host() { rekey_hybris_egl(); }
     if ok == EGL_TRUE {
         lock_state().display = dpy as usize;
@@ -3957,7 +4059,7 @@ pub unsafe extern "C" fn eglCreateContext(
         // SAFETY: forwarded verbatim.
         Ok(host) => {
             let context = (host.create_context)(dpy, config, share_context, attribs);
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
             if hybris_host() { rekey_hybris_egl(); }
             register_context(context as usize, share_context as usize);
             if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
@@ -4020,7 +4122,7 @@ pub unsafe extern "C" fn eglMakeCurrent(
         std::ptr::null_mut(),
         ctx,
     );
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
     if hybris_host() { rekey_hybris_egl(); }
     if ok != EGL_TRUE {
         // A failed eglMakeCurrent leaves the previous binding in place.

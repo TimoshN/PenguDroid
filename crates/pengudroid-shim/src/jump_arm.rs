@@ -36,6 +36,7 @@ pub const ASSEMBLY: &str = r#"
 
 /* int sigsetjmp(void* env, int save_signal_mask). */
 jump_function sigsetjmp
+    push {r7}                  /* r7 is callee-saved; syscalls need it as r7. */
     mov r12, r0
     /* Private cookie, with Bionic's save-mask bit in bit zero. */
     ldr r2, .Lcookie
@@ -55,13 +56,18 @@ jump_function sigsetjmp
     vmrs r1, fpscr
     str r1, [r12, #80]
     add r1, r12, #84
-    stmia r1, {r4-r11}
+    stmia r1, {r4-r6}
+    ldr r2, [sp]
+    str r2, [r1, #12]         /* original r7, not __NR_rt_sigprocmask. */
+    add r2, r1, #16
+    stmia r2, {r8-r11}
     str lr, [r1, #32]
     mov r2, sp
     str r2, [r1, #36]
     mov r2, #0
     str r2, [r12, #124]        /* private checksum/reserved word */
     mov r0, #0
+    pop {r7}
     bx lr
 .balign 4
 .Lcookie:

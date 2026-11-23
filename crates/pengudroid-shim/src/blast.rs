@@ -184,6 +184,19 @@ type SurfaceCtor =
     unsafe extern "C" fn(*mut c_void, *const [usize; 2], bool, *const [usize; 2]);
 type SurfaceIntSetter = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type SurfaceDimsSetter = unsafe extern "C" fn(*mut c_void, u32, u32) -> i32;
+
+#[cfg(target_pointer_width = "64")]
+const ITEM_CONSUMER_CTOR_SYMBOL: &[u8] = b"_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib\0";
+#[cfg(target_pointer_width = "32")]
+const ITEM_CONSUMER_CTOR_SYMBOL: &[u8] = b"_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEyib\0";
+#[cfg(target_pointer_width = "64")]
+const ACQUIRE_BUFFER_SYMBOL: &[u8] = b"_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemElbNSt3__18optionalINS3_8functionIFvRKNS_2spINS_13GraphicBufferEEEEEEEE\0";
+#[cfg(target_pointer_width = "32")]
+const ACQUIRE_BUFFER_SYMBOL: &[u8] = b"_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemExbNSt3__18optionalINS3_8functionIFvRKNS_2spINS_13GraphicBufferEEEEEEEE\0";
+#[cfg(target_pointer_width = "64")]
+const CONSUMER_USAGE_SYMBOL: &[u8] = b"_ZN7android12ConsumerBase20setConsumerUsageBitsEm\0";
+#[cfg(target_pointer_width = "32")]
+const CONSUMER_USAGE_SYMBOL: &[u8] = b"_ZN7android12ConsumerBase20setConsumerUsageBitsEy\0";
 /// `BLASTBufferQueue::update(const sp<SurfaceControl>&, uint32_t width,
 /// uint32_t height, int32_t format)`.
 type BbqUpdate = unsafe extern "C" fn(*mut c_void, *const *mut c_void, u32, u32, i32);
@@ -241,10 +254,7 @@ fn gui() -> Option<&'static Gui> {
             b"libgui.so\0",
             b"_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb\0",
         );
-        let item_consumer_ctor = guest_sym(
-            b"libgui.so\0",
-            b"_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib\0",
-        );
+        let item_consumer_ctor = guest_sym(b"libgui.so\0", ITEM_CONSUMER_CTOR_SYMBOL);
         let item_ctor = guest_sym(b"libgui.so\0", b"_ZN7android10BufferItemC1Ev\0");
         let item_dtor = guest_sym(b"libgui.so\0", b"_ZN7android10BufferItemD1Ev\0");
         let get_native_buffer = guest_sym(b"libui.so\0", GRAPHIC_BUFFER_GET_NATIVE_BUFFER);
@@ -252,10 +262,7 @@ fn gui() -> Option<&'static Gui> {
             eprintln!("[blast] libui.so is missing Android 17 GraphicBuffer::getNativeBuffer() const; private-layout fallback is unsupported");
             return None;
         }
-        let acquire = guest_sym(
-            b"libgui.so\0",
-            b"_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemElbNSt3__18optionalINS3_8functionIFvRKNS_2spINS_13GraphicBufferEEEEEEEE\0",
-        );
+        let acquire = guest_sym(b"libgui.so\0", ACQUIRE_BUFFER_SYMBOL);
         let release = guest_sym(
             b"libgui.so\0",
             b"_ZN7android18BufferItemConsumer13releaseBufferERKNS_10BufferItemERKNS_2spINS_5FenceEEENSt3__18optionalINS9_8functionIFvRKNS4_INS_13GraphicBufferEEEEEEEE\0",
@@ -268,10 +275,7 @@ fn gui() -> Option<&'static Gui> {
             b"libgui.so\0",
             b"_ZN7android12ConsumerBase22setDefaultBufferFormatEi\0",
         );
-        let set_consumer_usage = guest_sym(
-            b"libgui.so\0",
-            b"_ZN7android12ConsumerBase20setConsumerUsageBitsEm\0",
-        );
+        let set_consumer_usage = guest_sym(b"libgui.so\0", CONSUMER_USAGE_SYMBOL);
         let set_max_acquired = guest_sym(
             b"libgui.so\0",
             b"_ZN7android12ConsumerBase25setMaxAcquiredBufferCountEi\0",
@@ -711,7 +715,7 @@ unsafe fn refbase_of(obj: *mut c_void) -> *mut c_void {
     if vptr.is_null() {
         return obj;
     }
-    let off = *(vptr.sub(24) as *const i32);
+    let off = *(vptr.sub(3 * std::mem::size_of::<usize>()) as *const i32);
     (obj as *mut u8).offset(off as isize) as *mut c_void
 }
 
@@ -725,13 +729,13 @@ unsafe fn refbase_of(obj: *mut c_void) -> *mut c_void {
 unsafe fn keep_alive(gui: &Gui, what: &str, obj: *mut c_void, fixed_offset: Option<i32>) -> bool {
     let vptr = *(obj as *const *const u8);
     // Remaining private C++ ABI dependencies: Surface's RefBase at +0, the
-    // virtual-base entry at v[-3], and RefBase::mRefs at +8 below. The Android 17
-    // inheritance declarations are source-confirmed, but the native-buffer
-    // fixture does not establish these target-build offsets.
+    // virtual-base entry at v[-3], and RefBase::mRefs immediately after the
+    // vptr. The Android 17 inheritance declarations are source-confirmed, but
+    // the native-buffer fixture does not establish these target-build offsets.
     let off = match fixed_offset {
         Some(off) => off,
         None if vptr.is_null() => 0,
-        None => *(vptr.sub(24) as *const i32),
+        None => *(vptr.sub(3 * std::mem::size_of::<usize>()) as *const i32),
     };
     // A vbase offset outside the object we allocated is not a `RefBase` at all;
     // calling `incStrong` there faults. Bail instead of guessing.
@@ -743,7 +747,7 @@ unsafe fn keep_alive(gui: &Gui, what: &str, obj: *mut c_void, fixed_offset: Opti
         return false;
     }
     let rb = (obj as *mut u8).offset(off as isize) as *mut c_void;
-    let refs = *(rb.add(8) as *const usize);
+    let refs = *(rb.add(std::mem::size_of::<usize>()) as *const usize);
     if refs == 0 {
         eprintln!("[blast] {what}: no mRefs at {rb:p}; not taking a reference");
         return false;

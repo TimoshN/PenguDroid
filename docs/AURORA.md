@@ -260,14 +260,13 @@ On Hybris/AArch64 the GLES shim loads `libhybris-common.so.1` first and sets
 `ro.surface_flinger.has_wide_color_display=false`,
 `ro.surface_flinger.has_HDR_display=false`, and
 `ro.surface_flinger.use_context_priority=false` **before** loading host
-EGL/GLES. This is required because libEGL's initializer can query configstore
-immediately; setting the properties after `dlopen(libEGL)` was too late and
-caused `Process may not make oneway calls` on RenderThread. The launcher also
-calls `/usr/bin/setprop` directly when that executable is visible (manual SSH
-launch). Sailjail's private-bin hides it from desktop launches, so cold-boot
-property provisioning inside the sandbox still needs hardening; the manual
-three-property command remains the verified recovery if they are empty after
-a reboot. The ordinary non-Hybris/QEMU path is unchanged.
+EGL/GLES. The daemon's application-owned property broker carries the same
+three defaults, so cold-boot provisioning needs no device-global
+`/usr/bin/setprop` and no manual SSH command. This is required because
+libEGL's initializer can query configstore immediately; setting the
+properties after `dlopen(libEGL)` was too late and caused `Process may not
+make oneway calls` on RenderThread. The ordinary non-Hybris/QEMU path is
+unchanged.
 
 The isolated Hybris namespace also used to load its own Bionic `libc.so`.
 Bionic and glibc independently allocated the same pthread key; on MAX's

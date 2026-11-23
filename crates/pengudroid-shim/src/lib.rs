@@ -1370,11 +1370,14 @@ pub unsafe extern "C" fn png_set_longjmp_fn(
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     if unsafe { libc::dladdr(real as *const c_void, &mut info) } != 0 && !info.dli_fname.is_null() {
         let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
-        // Host libpng16 embeds glibc's 312-byte AArch64 jmp_buf. The guest
-        // passes Bionic's 256-byte PNG jmpbuf size. The actual non-local jump
-        // still uses our Bionic longjmp_fn; only libpng's capacity check needs
-        // the host size, otherwise its second set_longjmp call returns NULL.
-        host_libpng16 = cfg!(target_arch = "aarch64") && path.contains("libpng16.so");
+        // Host libpng16 embeds glibc's architecture-specific jmp_buf. The
+        // guest passes Bionic's 256-byte PNG jmpbuf size. AArch64 glibc uses
+        // 312 bytes; this ARM32 Aurora build compares against 392 (0x188),
+        // verified both in its setjmp.h ABI and png_set_longjmp_fn machine
+        // code. The actual non-local jump still uses our Bionic longjmp_fn;
+        // only libpng's capacity check needs the host size.
+        host_libpng16 = cfg!(any(target_arch = "aarch64", target_arch = "arm"))
+            && path.contains("libpng16.so");
         if trace {
             eprintln!(
                 "[png] real={real:p} library={} offset={:#x}",
@@ -1383,7 +1386,11 @@ pub unsafe extern "C" fn png_set_longjmp_fn(
             );
         }
     }
-    let real_size = if host_libpng16 && size == 256 { 312 } else { size };
+    let real_size = if host_libpng16 && size == 256 {
+        if cfg!(target_arch = "arm") { 392 } else { 312 }
+    } else {
+        size
+    };
     if trace && !png.is_null() {
         let state = |offset: usize| (png as *const u8).add(offset).cast::<usize>().read();
         eprintln!(
@@ -2595,6 +2602,35 @@ pub unsafe extern "C" fn art_memfd_create(name: *const c_char, flags: libc::c_ui
     }
     let real: Real = std::mem::transmute(real);
     real(name, flags)
+}
+
+#[cfg(target_arch = "arm")]
+#[no_mangle]
+pub unsafe extern "C" fn pthread_getspecific(key: c_int) -> *mut c_void {
+    type Real = unsafe extern "C" fn(c_int) -> *mut c_void;
+    static NEXT: OnceLock<Option<Real>> = OnceLock::new();
+    let Some(real) = *NEXT.get_or_init(|| dlsym_next(b"pthread_getspecific\0")) else {
+        return std::ptr::null_mut();
+    };
+    let result = real(key);
+    if std::env::var_os("PENGUDROID_TRACE_TLS").is_some() {
+        eprintln!("[tls] get key={key} -> {result:p}");
+    }
+    result
+}
+
+#[cfg(target_arch = "arm")]
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setspecific(key: c_int, value: *mut c_void) -> c_int {
+    type Real = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+    static NEXT: OnceLock<Option<Real>> = OnceLock::new();
+    let Some(real) = *NEXT.get_or_init(|| dlsym_next(b"pthread_setspecific\0")) else {
+        return libc::ENOSYS;
+    };
+    if std::env::var_os("PENGUDROID_TRACE_TLS").is_some() {
+        eprintln!("[tls] set key={key} value={value:p}");
+    }
+    real(key, value)
 }
 
 #[cfg(target_arch = "arm")]

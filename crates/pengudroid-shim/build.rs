@@ -201,6 +201,54 @@ fn compile_math_shim(out_dir: &PathBuf) {
             index += 1;
         }
     }
+    for (name, kind) in [("sincos", 4u8), ("sincosf", 5u8)] {
+        writeln!(rust, "    \"{name}\",").unwrap();
+        let internal = format!("__pengudroid_math_{name}");
+        writeln!(assembly, ".globl {internal}\n.type {internal}, %function\n{internal}:").unwrap();
+        assembly.push_str("    sub sp, sp, #24\n    stmia sp, {r0-r3}\n    str lr, [sp, #16]\n");
+        writeln!(assembly, "    movw r0, #{index}").unwrap();
+        assembly.push_str("    blx __pengudroid_math_lookup\n    mov r12, r0\n    cmp r12, #0\n    beq 1f\n");
+        if kind == 4 {
+            // softfp sincos(double x, double *sin, double *cos):
+            // x=r0:r1, sin=r2, cos=r3 -> hard-float x=d0, sin=r0, cos=r1.
+            assembly.push_str("    vldr d0, [sp, #0]\n    ldr r0, [sp, #8]\n    ldr r1, [sp, #12]\n");
+        } else {
+            // softfp sincosf(float x, float *sin, float *cos):
+            // x=r0, sin=r1, cos=r2 -> hard-float x=s0, sin=r0, cos=r1.
+            assembly.push_str("    vldr s0, [sp, #0]\n    ldr r0, [sp, #4]\n    ldr r1, [sp, #8]\n");
+        }
+        assembly.push_str("    blx r12\n    mov r0, #0\n    b 2f\n1:\n    mov r0, #0\n    mov r1, #0\n2:\n    ldr lr, [sp, #16]\n    add sp, sp, #24\n    bx lr\n");
+        writeln!(assembly, ".size {internal}, .-{internal}").unwrap();
+        writeln!(assembly, ".symver {internal}, {name}@@LIBM\n").unwrap();
+        index += 1;
+    }
+
+    for (name, kind) in [
+        ("strtod", 6u8), ("strtof", 7u8), ("atof", 6u8),
+        ("strtod_l", 6u8), ("strtof_l", 7u8),
+    ] {
+        writeln!(rust, "    \"{name}\",").unwrap();
+        let internal = format!("__pengudroid_math_{name}");
+        writeln!(assembly, ".globl {internal}\n.type {internal}, %function\n{internal}:").unwrap();
+        assembly.push_str("    sub sp, sp, #24\n    stmia sp, {r0-r3}\n    str lr, [sp, #16]\n");
+        writeln!(assembly, "    movw r0, #{index}").unwrap();
+        assembly.push_str("    blx __pengudroid_math_lookup\n    mov r12, r0\n    cmp r12, #0\n    beq 1f\n");
+        // Pointer arguments already use the same registers. Restore them after
+        // the lookup call; only the floating point return register differs
+        // between softfp Bionic and hard-float glibc: d0 -> r0:r1 for double,
+        // s0 -> r0 for float.
+        assembly.push_str("    ldmia sp, {r0-r3}\n    blx r12\n");
+        if kind == 6 {
+            assembly.push_str("    vmov r0, r1, d0\n");
+        } else {
+            assembly.push_str("    vmov r0, s0\n");
+        }
+        assembly.push_str("    b 2f\n1:\n    mov r0, #0\n    mov r1, #0\n2:\n    ldr lr, [sp, #16]\n    add sp, sp, #24\n    bx lr\n");
+        writeln!(assembly, ".size {internal}, .-{internal}").unwrap();
+        writeln!(assembly, ".symver {internal}, {name}@@LIBC\n").unwrap();
+        index += 1;
+    }
+
     rust.push_str(
         "];
 static MATH_HOSTS: [std::sync::atomic::AtomicUsize; MATH_NAMES.len()] =

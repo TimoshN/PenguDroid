@@ -438,6 +438,137 @@ pub unsafe extern "C" fn readlinkat(
     }
 }
 
+#[cfg(target_arch = "arm")]
+const BIONIC_STATVFS_WORDS: usize = 11;
+
+#[cfg(target_arch = "arm")]
+unsafe fn write_statvfs32(buf: *mut c_void, values: [u64; BIONIC_STATVFS_WORDS]) {
+    // Bionic's 32-bit statvfs/statvfs64 have eleven 32-bit fields and no
+    // reserved tail. glibc has 72-byte statvfs and 96-byte statvfs64 here;
+    // letting either write directly into the 44-byte guest object overwrites
+    // the caller's canary and saved return address.
+    let out = buf.cast::<u32>();
+    for (index, value) in values.into_iter().enumerate() {
+        out.add(index).write(value as u32);
+    }
+}
+
+#[cfg(target_arch = "arm")]
+type FstatVfsFn = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+
+#[cfg(target_arch = "arm")]
+type StatFs64Fn = unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int;
+
+#[cfg(target_arch = "arm")]
+type FstatFs64Fn = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+
+#[cfg(target_arch = "arm")]
+unsafe fn statvfs32_path(path: *const c_char, buf: *mut c_void, wide: bool) -> c_int {
+    if wide {
+        let Some(f) = next::<StatVfsFn>(b"statvfs64\0") else { return -1 };
+        let mut host: libc::statvfs64 = std::mem::zeroed();
+        let rc = with_path(path, |p| f(p, (&mut host as *mut libc::statvfs64).cast()));
+        if rc == 0 {
+            write_statvfs32(buf, [
+                host.f_bsize as u64, host.f_frsize as u64, host.f_blocks,
+                host.f_bfree, host.f_bavail, host.f_files, host.f_ffree,
+                host.f_favail, host.f_fsid as u64, host.f_flag as u64,
+                host.f_namemax as u64,
+            ]);
+        }
+        rc
+    } else {
+        let Some(f) = next::<StatVfsFn>(b"statvfs\0") else { return -1 };
+        let mut host: libc::statvfs = std::mem::zeroed();
+        let rc = with_path(path, |p| f(p, (&mut host as *mut libc::statvfs).cast()));
+        if rc == 0 {
+            write_statvfs32(buf, [
+                host.f_bsize as u64, host.f_frsize as u64, host.f_blocks as u64,
+                host.f_bfree as u64, host.f_bavail as u64, host.f_files as u64,
+                host.f_ffree as u64, host.f_favail as u64, host.f_fsid as u64,
+                host.f_flag as u64, host.f_namemax as u64,
+            ]);
+        }
+        rc
+    }
+}
+
+#[cfg(target_arch = "arm")]
+unsafe fn statvfs32_fd(fd: c_int, buf: *mut c_void, wide: bool) -> c_int {
+    if wide {
+        let Some(f) = next::<FstatVfsFn>(b"fstatvfs64\0") else { return -1 };
+        let mut host: libc::statvfs64 = std::mem::zeroed();
+        let rc = f(fd, (&mut host as *mut libc::statvfs64).cast());
+        if rc == 0 {
+            write_statvfs32(buf, [
+                host.f_bsize as u64, host.f_frsize as u64, host.f_blocks,
+                host.f_bfree, host.f_bavail, host.f_files, host.f_ffree,
+                host.f_favail, host.f_fsid as u64, host.f_flag as u64,
+                host.f_namemax as u64,
+            ]);
+        }
+        rc
+    } else {
+        let Some(f) = next::<FstatVfsFn>(b"fstatvfs\0") else { return -1 };
+        let mut host: libc::statvfs = std::mem::zeroed();
+        let rc = f(fd, (&mut host as *mut libc::statvfs).cast());
+        if rc == 0 {
+            write_statvfs32(buf, [
+                host.f_bsize as u64, host.f_frsize as u64, host.f_blocks as u64,
+                host.f_bfree as u64, host.f_bavail as u64, host.f_files as u64,
+                host.f_ffree as u64, host.f_favail as u64, host.f_fsid as u64,
+                host.f_flag as u64, host.f_namemax as u64,
+            ]);
+        }
+        rc
+    }
+}
+
+#[cfg(target_arch = "arm")]
+unsafe fn write_statfs32(buf: *mut c_void, host: &libc::statfs64) {
+    // Bionic uses the kernel's packed ARM statfs64 layout: 84 bytes. Rust's
+    // host type may have a larger aligned tail, so copy every field explicitly.
+    let out = buf.cast::<u8>();
+    macro_rules! u32at { ($off:expr, $value:expr) => {
+        out.add($off).cast::<u32>().write_unaligned($value as u32)
+    } }
+    macro_rules! u64at { ($off:expr, $value:expr) => {
+        out.add($off).cast::<u64>().write_unaligned($value)
+    } }
+    u32at!(0, host.f_type);
+    u32at!(4, host.f_bsize);
+    u64at!(8, host.f_blocks);
+    u64at!(16, host.f_bfree);
+    u64at!(24, host.f_bavail);
+    u64at!(32, host.f_files);
+    u64at!(40, host.f_ffree);
+    std::ptr::copy_nonoverlapping((&host.f_fsid as *const libc::fsid_t).cast::<u8>(), out.add(48), 8);
+    u32at!(56, host.f_namelen);
+    u32at!(60, host.f_frsize);
+    u32at!(64, host.f_flags);
+    for (index, value) in host.f_spare.iter().copied().enumerate() {
+        u32at!(68 + index * 4, value);
+    }
+}
+
+#[cfg(target_arch = "arm")]
+unsafe fn statfs32_path(path: *const c_char, buf: *mut c_void) -> c_int {
+    let Some(f) = next::<StatFs64Fn>(b"statfs64\0") else { return -1 };
+    let mut host: libc::statfs64 = std::mem::zeroed();
+    let rc = with_path(path, |p| f(p, (&mut host as *mut libc::statfs64).cast()));
+    if rc == 0 { write_statfs32(buf, &host); }
+    rc
+}
+
+#[cfg(target_arch = "arm")]
+unsafe fn statfs32_fd(fd: c_int, buf: *mut c_void) -> c_int {
+    let Some(f) = next::<FstatFs64Fn>(b"fstatfs64\0") else { return -1 };
+    let mut host: libc::statfs64 = std::mem::zeroed();
+    let rc = f(fd, (&mut host as *mut libc::statfs64).cast());
+    if rc == 0 { write_statfs32(buf, &host); }
+    rc
+}
+
 /// `statvfs(path, buf)`.
 ///
 /// `StatFs("/data")` is how the framework asks for the free space on the data
@@ -446,36 +577,116 @@ pub unsafe extern "C" fn readlinkat(
 /// framework throws "Invalid path: /data".
 #[no_mangle]
 pub unsafe extern "C" fn statvfs(path: *const c_char, buf: *mut c_void) -> c_int {
-    match next::<StatVfsFn>(b"statvfs\0") {
-        Some(f) => with_path(path, |p| f(p, buf)),
-        None => -1,
+    #[cfg(target_arch = "arm")]
+    { statvfs32_path(path, buf, false) }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        match next::<StatVfsFn>(b"statvfs\0") {
+            Some(f) => with_path(path, |p| f(p, buf)),
+            None => -1,
+        }
+    }
+}
+
+/// `fstatvfs(fd, buf)`.
+#[no_mangle]
+pub unsafe extern "C" fn fstatvfs(fd: c_int, buf: *mut c_void) -> c_int {
+    #[cfg(target_arch = "arm")]
+    { statvfs32_fd(fd, buf, false) }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        type Real = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+        match next::<Real>(b"fstatvfs\0") {
+            Some(f) => f(fd, buf),
+            None => -1,
+        }
     }
 }
 
 /// `statvfs64(path, buf)`.
 #[no_mangle]
 pub unsafe extern "C" fn statvfs64(path: *const c_char, buf: *mut c_void) -> c_int {
-    match next::<StatVfsFn>(b"statvfs64\0") {
-        Some(f) => with_path(path, |p| f(p, buf)),
-        None => -1,
+    #[cfg(target_arch = "arm")]
+    { statvfs32_path(path, buf, true) }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        match next::<StatVfsFn>(b"statvfs64\0") {
+            Some(f) => with_path(path, |p| f(p, buf)),
+            None => -1,
+        }
+    }
+}
+
+/// `fstatvfs64(fd, buf)`.
+#[no_mangle]
+pub unsafe extern "C" fn fstatvfs64(fd: c_int, buf: *mut c_void) -> c_int {
+    #[cfg(target_arch = "arm")]
+    { statvfs32_fd(fd, buf, true) }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        type Real = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+        match next::<Real>(b"fstatvfs64\0") {
+            Some(f) => f(fd, buf),
+            None => -1,
+        }
     }
 }
 
 /// `statfs(path, buf)` — the raw syscall wrapper, which `Os.statfs` uses.
 #[no_mangle]
 pub unsafe extern "C" fn statfs(path: *const c_char, buf: *mut c_void) -> c_int {
-    match next::<StatVfsFn>(b"statfs\0") {
-        Some(f) => with_path(path, |p| f(p, buf)),
-        None => -1,
+    #[cfg(target_arch = "arm")]
+    { statfs32_path(path, buf) }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        match next::<StatVfsFn>(b"statfs\0") {
+            Some(f) => with_path(path, |p| f(p, buf)),
+            None => -1,
+        }
+    }
+}
+
+/// `fstatfs(fd, buf)`.
+#[no_mangle]
+pub unsafe extern "C" fn fstatfs(fd: c_int, buf: *mut c_void) -> c_int {
+    #[cfg(target_arch = "arm")]
+    { statfs32_fd(fd, buf) }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        type Real = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+        match next::<Real>(b"fstatfs\0") {
+            Some(f) => f(fd, buf),
+            None => -1,
+        }
     }
 }
 
 /// `statfs64(path, buf)`.
 #[no_mangle]
 pub unsafe extern "C" fn statfs64(path: *const c_char, buf: *mut c_void) -> c_int {
-    match next::<StatVfsFn>(b"statfs64\0") {
-        Some(f) => with_path(path, |p| f(p, buf)),
-        None => -1,
+    #[cfg(target_arch = "arm")]
+    { statfs32_path(path, buf) }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        match next::<StatVfsFn>(b"statfs64\0") {
+            Some(f) => with_path(path, |p| f(p, buf)),
+            None => -1,
+        }
+    }
+}
+
+/// `fstatfs64(fd, buf)`.
+#[no_mangle]
+pub unsafe extern "C" fn fstatfs64(fd: c_int, buf: *mut c_void) -> c_int {
+    #[cfg(target_arch = "arm")]
+    { statfs32_fd(fd, buf) }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        type Real = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+        match next::<Real>(b"fstatfs64\0") {
+            Some(f) => f(fd, buf),
+            None => -1,
+        }
     }
 }
 

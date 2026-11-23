@@ -35,6 +35,12 @@ pub fn defaults() -> BTreeMap<String, String> {
         ("ro.hardware", "pengudroid".to_string()),
         ("ro.build.characteristics", "default".to_string()),
         ("persist.sys.timezone", "UTC".to_string()),
+        // Hybris must see SDR-only defaults before its EGL static initializer
+        // queries configstore. Keep them in the application-owned broker, not
+        // in the device-global property service or a manual SSH setprop step.
+        ("ro.surface_flinger.has_wide_color_display", "false".to_string()),
+        ("ro.surface_flinger.has_HDR_display", "false".to_string()),
+        ("ro.surface_flinger.use_context_priority", "false".to_string()),
     ];
     for (k, v) in pairs {
         m.insert(k.to_string(), v);
@@ -135,6 +141,9 @@ mod tests {
         assert_eq!(p.get("ro.build.version.release"), Some("17"));
         assert_eq!(p.get("ro.product.cpu.abilist"), Some(HOST_CPU_ABI));
         assert_eq!(p.get("ro.product.cpu.abilist32"), Some(""));
+        assert_eq!(p.get("ro.surface_flinger.has_wide_color_display"), Some("false"));
+        assert_eq!(p.get("ro.surface_flinger.has_HDR_display"), Some("false"));
+        assert_eq!(p.get("ro.surface_flinger.use_context_priority"), Some("false"));
     }
 
     #[test]

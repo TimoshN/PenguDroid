@@ -32,16 +32,25 @@ pub fn test(args: &[String]) -> i32 {
     }
 
     let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
-    if let Err(e) = touch.tap(cx, cy) {
+    let (tap_x, tap_y) = args
+        .iter()
+        .position(|a| a == "--tap")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.split_once(','))
+        .and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?)))
+        .unwrap_or((cx, cy));
+    if let Err(e) = touch.tap(tap_x, tap_y) {
         eprintln!("input: tap failed: {e}");
         return 1;
     }
-    println!("input: tap at {cx},{cy} injected");
-    if let Err(e) = touch.swipe(cx, cy, cx + 200.0, cy, 10) {
-        eprintln!("input: swipe failed: {e}");
-        return 1;
+    println!("input: tap at {tap_x},{tap_y} injected");
+    if !args.iter().any(|a| a == "--no-swipe") {
+        if let Err(e) = touch.swipe(cx, cy, cx + 200.0, cy, 10) {
+            eprintln!("input: swipe failed: {e}");
+            return 1;
+        }
+        println!("input: swipe injected");
     }
-    println!("input: swipe injected");
 
     // Show what a keymap for this panel/controller looks like.
     let sample = keymap::Keymap::parse("W = lstick up\nSPACE = pad a\n");
