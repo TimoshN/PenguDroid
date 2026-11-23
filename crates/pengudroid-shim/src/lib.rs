@@ -566,6 +566,10 @@ extern "C" fn pengudroid_fault_handler(sig: c_int, info: *mut c_void, ctx: *mut 
         &mut n,
         &format!("[pengudroid] fatal signal {sig} code={code} rip={rip:#x} rsp={rsp:#x} addr={addr:#x}\n"),
     );
+    // Preserve the register dump even if the unwinder itself faults on the
+    // corrupted guest stack; previously everything was written only after it.
+    unsafe { libc::write(2, out.as_ptr() as *const c_void, n) };
+    n = 0;
     unsafe {
         let mut frames = [std::ptr::null_mut::<c_void>(); 48];
         let count = backtrace(frames.as_mut_ptr(), frames.len() as c_int).max(0) as usize;
@@ -4899,7 +4903,11 @@ pub unsafe extern "C" fn pthread_getattr_np(
     out.flags = (detached == libc::PTHREAD_CREATE_DETACHED) as u32;
     out.stack_base = stack;
     out.stack_size = stack_size;
-    out.guard_size = guard_size;
+    // ART adds this value to its own reserved stack region. Returning the
+    // host's MiB-sized guard makes GetStackEnd exceed the current frame and
+    // aborts RenderThread in FindStackTop. Keep only the Bionic page guard;
+    // the host continues to enforce its real guard independently.
+    out.guard_size = guard_size.min(4096);
     out.sched_policy = policy;
     out.sched_priority = sched.sched_priority;
     if let Some(destroy) = dlsym_next::<unsafe extern "C" fn(*mut libc::pthread_attr_t) -> c_int>(b"pthread_attr_destroy\0") {

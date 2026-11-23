@@ -94,13 +94,21 @@ downloaded. ARM32 support includes Bionic jump buffers, stat and pthread
 layouts, signal sets/actions, mmap2 offsets, Hybris pthread keys, and explicit
 softfp-to-hard-float GLES/libm boundaries.
 
-On the ARMv7hl-userspace device at 192.168.1.50, the development MAX RPM built
-from `~/max_app_armv7.apk` reaches `JNI_OK`, all requested native framework
-groups, `handleBindApplication`, providers and MAX background initialization.
-It does **not** yet have a pixel-verified Activity UI: both interpreter and JIT
-currently end in a native invocation `pc=0` in a MAX worker. The JIT's
-anonymous-cache fallback works, but does not resolve that later fault. ARMv7hl
-packages therefore remain development artifacts, not a claim of MAX usability.
+On the ARMv7hl-userspace device at 192.168.1.50, the development MAX RPM now
+reaches a pixel-verified interactive login UI after a cold phone reboot. The
+ordinary APM/desktop launch needs no device-global `setprop`: gleshim logs
+`configured Hybris SDR properties before host EGL`, and ART/EGL continue through
+activity creation. The initial ARM32 touch path produced correct host
+coordinates but garbage inside Android's `MotionEvent`: JNI `SetFloatField` was
+being called with the host hard-float convention while Android ARM32 uses
+AAPCS softfp. ARM32 wrappers now pass/return float bits in the softfp core
+registers for `SetFloatField`, `GetFloatField` and `CallFloatMethodA`. Real
+physical DOWN/UP events retain their coordinates and open the country selector,
+not merely the host-assisted editor focus. Evidence:
+`target/aurora/armv7hl/reboot-softfp-fix-country.png` and
+`target/aurora/armv7hl/reboot-softfp-physical-final.log`. ARMv7hl packages remain
+development artifacts; this does not claim complete MAX authentication or
+compatibility with every application.
 
 ## Build
 
@@ -377,28 +385,21 @@ flushes it with a roundtrip. This prevents Lipstick from leaving a newly
 launched Android app visible only as a small cover. Compositors without the
 global keep the existing xdg/wl_shell behavior.
 
-Lipstick draws the system bar, while Android receives a separate top inset via
-`WindowInsets.Builder` once per root View. On Dialog-S the dconf statusbar and
-cutout heights are both 132 px; `PENGUDROID_STATUSBAR_HEIGHT` overrides this
-value and zero disables the inset. Dispatch alone is insufficient for
-edge-to-edge Compose: after the app-driven layout, the host checks the real
-`android.R.id.content` global top and reserves only the missing space on
-DecorView. Waiting for layout avoids double-insetting traditional Views such as
-PSB. The real desktop-launch paths for MAX and Sberbank now record
-`reserved missing status-bar space after layout: 0px -> 132px`; PSB already lays
-out at 132 px and receives no extra DecorView padding. Evidence:
-`target/aurora/maxnext-statusbar-after-layout.png`,
-`target/aurora/psbmobile-statusbar-after-layout.png`, and
-`target/aurora/sberbank-statusbar-after-layout.png`.
-
-When that fallback padding is necessary, the host also clones the app's own
-full-width top background drawable onto DecorView before applying the final
-padding. This keeps the safe area visually part of the app instead of exposing
-a black framework window. Applying the background last was also tested and
-rejected because drawable padding could reset the safe-area padding. On MAX's
-main UI the old band sampled RGB (0,0,0); the fixed band and adjacent app
-background both sample (23,24,28), while controls remain below Lipstick.
-Evidence: `target/aurora/maxnext-status-app-background2.png` and `.log`.
+Lipstick draws the system bar. Before ART starts, the launcher reads optional
+`statusbar/height` and `cutout_area/height` values through libdconf. The status
+height is used only when `statusbarAsInset=true`; a visible status bar selects
+`max(statusbar, cutout)`, while an invisible one leaves only the cutout. Missing
+keys contribute zero—there is no device-specific 132-pixel fallback. Thus the
+192.168.1.110 configuration supplies 132 px, while 192.168.1.50 currently has no
+height keys and supplies zero. `PENGUDROID_STATUSBAR_HEIGHT` remains an explicit
+override. A launcher-hosted DConfClient watches the statusbar and cutout
+directories; on `changed` it recalculates the value and forwards only the final
+i32 through an inherited pipe to ART. The existing main-Looper waker then
+redispatches WindowInsets and adjusts tracked fallback padding in both
+directions. A device test without an app restart produced 0 → 96 → 0 px and
+matching top padding 0 → 96 → 0. Evidence:
+`target/aurora/armv7hl/dconf-watch-57-changes.log`. The separate IME inset and
+bottom-padding lifecycle are unchanged.
 
 The phone logs `qt_surface_extension enabled`, `surface 1 has
 qt_extended_surface`, and `onscreen visibility=true`; MAX remains visible and
@@ -1019,5 +1020,53 @@ banking operation have been tested.
 6. Complete sandbox lifecycle and application-data tests. Developer signing,
    audb installation and the visible Compose lifecycle have passed only with
    the separate combined test package.
+
+### Future goal: minimize and split the Android runtime image
+
+Reduce the prepared multilib GSI into architecture-specific runtime packages
+and remove files that the hosted runtime does not consume. Measurements below
+come from the local Android 17 ARM64 runtime in `runtime.rpm`; they are a
+packaging goal, not yet a validated minimized runtime. The baseline contains
+2345.5 MiB of regular files and produces a 1140.2 MiB `tar.gz`.
+
+| Experimental variant | Extracted regular files | gzip archive |
+| --- | ---: | ---: |
+| Current multilib tree | 2345.5 MiB | 1140.2 MiB |
+| Drop packed APEX/CAPEX originals | 1863.2 MiB | 820.2 MiB |
+| ARM64-only, without packed originals | 1691.0 MiB | 731.6 MiB |
+| ARM32-only, without packed originals | 1301.9 MiB | 599.5 MiB |
+
+Implement this in stages:
+
+1. Delete the 310.9 MiB of `system/apex/*.apex|capex` and 171.4 MiB of
+   `system/system_ext/apex/*.apex` after successful extraction and validation.
+   The current launcher consumes expanded APEX directories, not these packed
+   copies. `tools/art/unpack-apex.py` currently retains them deliberately.
+2. Make `tools/prepare-android17.py --arch arm64|arm` prune the opposite ABI
+   instead of merely selecting its validation view. Remove opposite-arch ELF
+   files and matching `framework/{arm,arm64}`, framework/application OAT and
+   ART paths. This removes 172.2 MiB of ARM32-specific files from the ARM64
+   tree or 561.3 MiB of ARM64-specific files from the ARM32 tree. Preserve all
+   selected-ABI ART images, boot-classpath JARs, ICU/tzdata, framework
+   resources, fonts and required native-library closures.
+3. Consider an aggressive, separately tested profile for preinstalled system
+   APKs. There are 136 APKs other than WebView and `framework-res.apk`,
+   occupying 561.6 MiB, plus 13.6 MiB of application OAT/ART artifacts. No
+   direct hosted-runtime consumers were found for those APKs, but this needs
+   application regression testing. Do not remove whole APEX directories:
+   many modules still contribute boot-classpath JARs.
+4. Move the 215.9 MiB WebView provider to an optional runtime package where
+   possible. Its APK still contains 127.4 MiB of ARM64 and 73.8 MiB of ARM32
+   native payload. Do not simply delete one ABI from the APK: doing so
+   invalidates the signature verified by `webview.rs`. ABI-specific WebView
+   requires a properly signed provider artifact.
+5. Optionally hardlink identical expanded libraries during packaging. Exact
+   duplicates account for 38.3 MiB in the measured ARM64-only tree; this
+   overlaps with, and is not additive to, all other savings.
+
+Validate any minimized image with sysroot detection, ART/CheckJNI startup,
+Compose and NativeActivity rendering, WebView, audio/media and representative
+ARM64 and ARM32 applications. Prefer collecting actual runtime file accesses
+before enabling the aggressive APK/native-service pruning profile.
 
 Do not distribute this package as a working Android compatibility layer yet.

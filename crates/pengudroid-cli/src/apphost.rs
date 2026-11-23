@@ -1720,13 +1720,7 @@ fn report_surface_views(env: &JniEnv, verbose: bool) {
                     let Some(method) = env.method_id(view_class, method, "()F") else {
                         return -1.0;
                     };
-                    let call: unsafe extern "C" fn(
-                        *mut c_void, JObject, JMethodId, *const JValue,
-                    ) -> f32 = unsafe {
-                        let table = *(env.0 as *const *const *const c_void);
-                        std::mem::transmute(*table.add(57)) // CallFloatMethodA
-                    };
-                    unsafe { call(env.0, view, method, std::ptr::null()) }
+                    env.call_float(view, method, &[]).unwrap_or(-1.0)
                 };
                 println!(
                     "views: {:indent$}translationY={} alpha={} scaleY={}",
@@ -3525,17 +3519,13 @@ fn report_display_metrics(env: &JniEnv) {
         eprintln!("metrics: DisplayMetrics not found");
         return;
     };
-    let get_float: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> f32 = unsafe {
-        let table = *(env.0 as *const *const *const c_void);
-        std::mem::transmute(*table.add(102)) // GetFloatField
-    };
     let get_int: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> i32 = unsafe {
         let table = *(env.0 as *const *const *const c_void);
         std::mem::transmute(*table.add(100)) // GetIntField
     };
     for field in ["density", "scaledDensity"] {
         if let Some(id) = env.field_id(metrics_class, field, "F") {
-            println!("apphost: DisplayMetrics.{field} = {}", unsafe { get_float(env.0, metrics, id) });
+            println!("apphost: DisplayMetrics.{field} = {}", env.get_float_field(metrics, id));
         }
     }
     if let Some(id) = env.field_id(metrics_class, "densityDpi", "I") {
@@ -3738,6 +3728,7 @@ pub fn loop_forever(env: &JniEnv) {
         eprintln!("apphost: cannot start the activity-host main-queue waker");
         return;
     };
+    spawn_dconf_statusbar_listener();
     let mut scratch = vec![0u8; ACTIVITY_REQUEST_SCRATCH];
     loop {
         drain_activity_requests(env, &mut scratch);
@@ -5089,8 +5080,11 @@ fn spawn_input_pump(env: &JniEnv) {
                 )
             });
             if let Some(event) = event {
-                if !event.is_null() {
-                    env.call_void(root, dispatch, &[JValue { l: event }]);
+                if !event.is_null()
+                    && !env.call_void(root, dispatch, &[JValue { l: event }])
+                    && std::env::var_os("PENGUDROID_TRACE_INPUT").is_some()
+                {
+                    eprintln!("input: dispatchInputEvent threw for action={action}");
                 }
             }
         };
@@ -5405,7 +5399,11 @@ fn spawn_input_pump(env: &JniEnv) {
                 );
             }
             if let Some(event) = multi.obtain(&env, motion_class, &frame, gesture_down.get(), now) {
-                env.call_void(root, dispatch, &[JValue { l: event }]);
+                if !env.call_void(root, dispatch, &[JValue { l: event }])
+                    && std::env::var_os("PENGUDROID_TRACE_INPUT").is_some()
+                {
+                    eprintln!("input: dispatchInputEvent threw for kernel action={:#x}", frame.action);
+                }
             }
             if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
                 println!("input: ts={} touch action={} dispatch end", monotonic_ms(), frame.action);
@@ -6059,6 +6057,18 @@ impl MultiTouchJni {
                 JValue { i: 0 }, // flags
             ],
         )?;
+        if !event.is_null()
+            && frame.action <= 1
+            && std::env::var_os("PENGUDROID_TRACE_INPUT").is_some()
+        {
+            let description = (|| -> Option<String> {
+                let object_class = env.find_class("java/lang/Object")?;
+                let to_string = env.method_id(object_class, "toString", "()Ljava/lang/String;")?;
+                let text = env.call_object(event, to_string, &[])?;
+                env.get_string(text)
+            })();
+            println!("input: MotionEvent {}", description.unwrap_or_else(|| "<unavailable>".into()));
+        }
         (!event.is_null()).then_some(event)
     }
 
@@ -6405,15 +6415,57 @@ fn ime_inset_height() -> i32 {
     (surface_height - top).clamp(0, surface_height)
 }
 
+fn current_statusbar_height() -> i32 {
+    let dynamic = DCONF_STATUSBAR_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+    if dynamic >= 0 { return dynamic; }
+    std::env::var("PENGUDROID_STATUSBAR_HEIGHT").ok()
+        .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0)
+}
+
+/// Receive host-recalculated insets from the launcher's dconf listener. Only
+/// the final i32 crosses into ART; no host GLib/DConf calls run in the guest.
+fn spawn_dconf_statusbar_listener() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if std::env::var_os("PENGUDROID_DCONF_STATUSBAR_WATCH").as_deref()
+        == Some(std::ffi::OsStr::new("0"))
+    {
+        return;
+    }
+    let Some(fd) = std::env::var("PENGUDROID_DCONF_INSET_FD").ok()
+        .and_then(|value| value.parse::<i32>().ok()).filter(|fd| *fd >= 0)
+    else { return };
+    ONCE.call_once(move || {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            use std::os::fd::FromRawFd;
+            let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+            loop {
+                let mut bytes = [0u8; 4];
+                match pipe.read_exact(&mut bytes) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(_) => break,
+                }
+                let height = i32::from_le_bytes(bytes);
+                if !(0..=4096).contains(&height) { continue; }
+                let old = DCONF_STATUSBAR_HEIGHT.swap(
+                    height, std::sync::atomic::Ordering::AcqRel,
+                );
+                if old != height {
+                    STATUSBAR_INSET_PENDING.store(true, std::sync::atomic::Ordering::Release);
+                    println!("apphost: dconf status-bar inset changed {old}px -> {height}px");
+                }
+            }
+        });
+    });
+}
+
 /// Apply host safe-area insets to the real Android window. Lipstick draws the
 /// status bar and Maliit overlays the fullscreen gralloc surface, so Android
 /// needs both the status-bar and IME contracts. A zero IME inset removes the
 /// keyboard reservation when Maliit hides.
 fn apply_safe_area_insets(env: &JniEnv, root: JObject, include_status: bool) -> Option<()> {
-    let height = if include_status {
-        std::env::var("PENGUDROID_STATUSBAR_HEIGHT").ok()
-            .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0)
-    } else { 0 };
+    let height = if include_status { current_statusbar_height() } else { 0 };
     let root_class = env.find_class("android/view/ViewRootImpl")?;
     let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
     let view = env.object_field(root, m_view);
@@ -6474,47 +6526,12 @@ fn apply_safe_area_insets(env: &JniEnv, root: JObject, include_status: bool) -> 
     Some(())
 }
 
-/// Find the app's own full-width top background so DecorView's forced safe-area
-/// padding does not expose the framework's black window background.
-fn top_background_drawable(
-    env: &JniEnv, view: JObject, content_width: i32, depth: usize,
-) -> Option<JObject> {
-    if view.is_null() || depth > 20 { return None; }
-    let view_class = env.find_class("android/view/View")?;
-    let visible = env.method_id(view_class, "getVisibility", "()I")?;
-    if env.call_int(view, visible, &[])? != 0 { return None; }
-    let width = env.method_id(view_class, "getWidth", "()I")?;
-    let get_background = env.method_id(
-        view_class, "getBackground", "()Landroid/graphics/drawable/Drawable;",
-    )?;
-    if env.call_int(view, width, &[])? >= content_width * 9 / 10 {
-        let background = env.call_object(view, get_background, &[])?;
-        if !background.is_null() { return Some(background); }
-    }
-    let group_class = env.find_class("android/view/ViewGroup")?;
-    let class_class = env.find_class("java/lang/Class")?;
-    let is_instance = env.method_id(class_class, "isInstance", "(Ljava/lang/Object;)Z")?;
-    if !env.call_boolean(group_class, is_instance, &[JValue { l: view }])? {
-        return None;
-    }
-    let count = env.method_id(group_class, "getChildCount", "()I")?;
-    let child_at = env.method_id(group_class, "getChildAt", "(I)Landroid/view/View;")?;
-    for index in 0..env.call_int(view, count, &[])? {
-        let child = env.call_object(view, child_at, &[JValue { i: index }])?;
-        if let Some(background) = top_background_drawable(env, child, content_width, depth + 1) {
-            return Some(background);
-        }
-    }
-    None
-}
-
 /// After the app-driven layout has completed, reserve only safe-area space the
 /// app did not consume itself. In particular, do not add a second IME inset to
 /// an app that already honored WindowInsets. The tracked bottom addition is
 /// removed when Maliit hides; unrelated app padding is left untouched.
 fn ensure_safe_area_layout_insets(env: &JniEnv, root: JObject) -> Option<()> {
-    let height = std::env::var("PENGUDROID_STATUSBAR_HEIGHT").ok()
-        .and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0);
+    let height = current_statusbar_height();
     let ime_height = ime_inset_height();
     let root_class = env.find_class("android/view/ViewRootImpl")?;
     let m_view = env.field_id(root_class, "mView", "Landroid/view/View;")?;
@@ -6557,14 +6574,29 @@ fn ensure_safe_area_layout_insets(env: &JniEnv, root: JObject) -> Option<()> {
             0
         }
     };
+    let old_top_added = {
+        let mut states = SAFE_AREA_TOP_ADDITIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = states.iter().position(|state| {
+            env.is_same_object(state.content as JObject, content)
+        }) {
+            states[index].added
+        } else {
+            let global = env.new_global_ref(content)? as usize;
+            states.push(SafeAreaTopAddition { content: global, added: 0 });
+            0
+        }
+    };
     // Hiding Maliit must not leave our old bottom padding behind when an app
     // keeps a layout request pending without performing another traversal.
     if layout_pending && !(ime_height == 0 && old_bottom_added > 0) {
         return None;
     }
-    let top_delta = if height > 0 && content_top < height {
-        height - content_top.max(0)
-    } else { 0 };
+    // content_top already includes our previous fallback addition. Subtract it
+    // to recover the app's own position, then allow both increases and removal
+    // when dconf changes the inset at runtime.
+    let base_top = content_top - old_top_added;
+    let new_top_added = (height - base_top.max(0)).max(0);
+    let top_delta = new_top_added - old_top_added;
     let bottom_delta = if ime_height > 0 || old_bottom_added > 0 {
         let desired_bottom = root_height - ime_height;
         let measured_delta = desired_bottom - content_bottom;
@@ -6581,43 +6613,10 @@ fn ensure_safe_area_layout_insets(env: &JniEnv, root: JObject) -> Option<()> {
     let request_layout = env.method_id(view_class, "requestLayout", "()V")?;
     let values = [
         env.call_int(view, left, &[])?,
-        env.call_int(view, padding_top, &[])? + top_delta,
+        (env.call_int(view, padding_top, &[])? + top_delta).max(0),
         env.call_int(view, right, &[])?,
         (env.call_int(view, bottom, &[])? + bottom_delta).max(0),
     ];
-    if top_delta > 0 {
-        let content_width = env.method_id(view_class, "getWidth", "()I")
-            .and_then(|method| env.call_int(content, method, &[])).unwrap_or(0);
-        if let Some(background) = top_background_drawable(env, content, content_width, 0) {
-            let cloned = (|| -> Option<JObject> {
-                let drawable = env.find_class("android/graphics/drawable/Drawable")?;
-                let constant_state = env.method_id(
-                    drawable, "getConstantState", "()Landroid/graphics/drawable/Drawable$ConstantState;",
-                )?;
-                let state = env.call_object(background, constant_state, &[])?;
-                if state.is_null() { return None; }
-                let state_class = env.find_class("android/graphics/drawable/Drawable$ConstantState")?;
-                let resources = env.call_object(content, env.method_id(
-                    view_class, "getResources", "()Landroid/content/res/Resources;",
-                )?, &[])?;
-                let new_drawable = env.method_id(
-                    state_class,
-                    "newDrawable",
-                    "(Landroid/content/res/Resources;)Landroid/graphics/drawable/Drawable;",
-                )?;
-                env.call_object(state, new_drawable, &[JValue { l: resources }])
-            })();
-            if let Some(background) = cloned.filter(|drawable| !drawable.is_null()) {
-                let set_background = env.method_id(
-                    view_class, "setBackground", "(Landroid/graphics/drawable/Drawable;)V",
-                )?;
-                env.call_void(view, set_background, &[JValue { l: background }]);
-                println!("apphost: extended app background behind status-bar safe area");
-            }
-        }
-    }
-    // setBackground may apply the drawable's own padding; safe-area padding
-    // must be the final state.
     env.call_void(view, set_padding, &[
         JValue { i: values[0] }, JValue { i: values[1] },
         JValue { i: values[2] }, JValue { i: values[3] },
@@ -6629,6 +6628,12 @@ fn ensure_safe_area_layout_insets(env: &JniEnv, root: JObject) -> Option<()> {
         env.is_same_object(state.content as JObject, content)
     }) {
         state.added = new_bottom_added;
+    }
+    let mut states = SAFE_AREA_TOP_ADDITIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(state) = states.iter_mut().find(|state| {
+        env.is_same_object(state.content as JObject, content)
+    }) {
+        state.added = new_top_added;
     }
     println!(
         "apphost: reserved missing safe-area space after layout: top {content_top}px -> {}px, bottom {content_bottom}px -> {}px",
@@ -6951,6 +6956,14 @@ struct SafeAreaBottomAddition {
 }
 static SAFE_AREA_BOTTOM_ADDITIONS: std::sync::Mutex<Vec<SafeAreaBottomAddition>> =
     std::sync::Mutex::new(Vec::new());
+struct SafeAreaTopAddition {
+    content: usize,
+    added: i32,
+}
+static SAFE_AREA_TOP_ADDITIONS: std::sync::Mutex<Vec<SafeAreaTopAddition>> =
+    std::sync::Mutex::new(Vec::new());
+static DCONF_STATUSBAR_HEIGHT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
 static STATUSBAR_INSET_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static STATUSBAR_LAYOUT_PENDING: std::sync::atomic::AtomicBool =

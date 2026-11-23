@@ -20,6 +20,7 @@ fixtures/*.h264
 # have no system Rust/gcc. Never part of the repo.
 /.toolchain
 /.cargo
+/android_runtime/
 
 # App packages dropped in for testing (plain APKs and Play bundles). These are
 # multi-hundred-MB binaries and must never be committed.

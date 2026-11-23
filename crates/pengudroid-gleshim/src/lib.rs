@@ -510,11 +510,144 @@ fn mapped_elf_base(path: &str) -> Option<usize> {
     None
 }
 
-/// Move Hybris EGL's Bionic TLS key away from guest ART's low glibc keys.
-/// The internal Hybris linker does not expose this DSO through dlmopen, so use
-/// its existing mapping and call the real Bionic pthread functions directly.
+/// AArch64-only Binder/Hybris TLS separation. Every offset in this path is
+/// specific to the verified AArch64 Android 17 GSI and Aurora Hybris builds.
+/// ARMv7 needs its own ELF analysis and must not reuse these values.
+#[cfg(target_arch = "aarch64")]
+fn clear_legacy_tls_key(old: u32) {
+    thread_local! { static CLEARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    CLEARED.with(|cleared| {
+        if cleared.get() { return; }
+        type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
+        let handle = unsafe { libc::dlopen(c"libc.so.6".as_ptr(), libc::RTLD_NOW) };
+        if let Some(clear) = sym_ptr(handle, "pthread_setspecific").and_then(cast_fn) {
+            let clear: SetSpecific = clear;
+            let _ = unsafe { clear(old, std::ptr::null_mut()) };
+        }
+        cleared.set(true);
+    });
+}
+
+#[cfg(target_arch = "aarch64")]
+fn clear_legacy_linux_binder_key(old: u32) {
+    clear_legacy_tls_key(old);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn clear_legacy_hybris_hidl_key(old: u32) {
+    clear_legacy_tls_key(old);
+}
+
+/// Separate guest android::IPCThreadState from Hybris hardware::IPCThreadState
+/// on AArch64. ARMv7 has different object layouts and needs an independent fix.
+#[cfg(target_arch = "aarch64")]
+fn rekey_linux_binder_aarch64() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static LEGACY_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
+    if DONE.load(Ordering::Relaxed) {
+        clear_legacy_linux_binder_key(LEGACY_KEY.load(Ordering::Relaxed));
+        return;
+    }
+    unsafe {
+    let Some(binder) = mapped_elf_base("/data/lib/libbinder.so") else {
+        eprintln!("[gleshim] guest libbinder mapping is absent for TLS separation");
+        return;
+    };
+    // Guest android::IPCThreadState is 496 bytes; Hybris' hardware state is
+    // 520. If both use the same low Bionic key, Hybris reads +512 beyond the
+    // guest object and interprets BR_REPLY as mCallRestriction.
+    if std::ptr::read_unaligned((binder + 0x54458) as *const u64) != 0xa9014ff4a9be7bfd {
+        eprintln!("[gleshim] guest IPCThreadState signature mismatch");
+        return;
+    }
+    type KeyCreate = unsafe extern "C" fn(*mut u32, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
+    type GetSpecific = unsafe extern "C" fn(u32) -> *mut c_void;
+    type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
+    let handle = libc::dlopen(c"libc.so.6".as_ptr(), libc::RTLD_NOW);
+    if handle.is_null() { return; }
+    let (Some(create), Some(get), Some(set)) = (
+        sym_ptr(handle, "pthread_key_create").and_then(cast_fn),
+        sym_ptr(handle, "pthread_getspecific").and_then(cast_fn),
+        sym_ptr(handle, "pthread_setspecific").and_then(cast_fn),
+    ) else { return };
+    let (create, get, set): (KeyCreate, GetSpecific, SetSpecific) = (create, get, set);
+    let key = (binder + 0xe8298) as *mut u32;
+    let old = *key;
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] guest Binder TLS key before separation={old}");
+    }
+    if old >= 16 {
+        DONE.store(true, Ordering::Relaxed);
+        return;
+    }
+    let current = get(old);
+    let mut new = 0u32;
+    while new < 16 {
+        if create(&mut new, None) != 0 { return; }
+    }
+    if set(new, current) != 0 { return; }
+    *key = new;
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] separated guest Binder TLS key {old} -> {new} (state={current:p})");
+    }
+    // Leave no stale state under the old key for Hybris' different 520-byte
+    // hardware::IPCThreadState. Its next self() then constructs its own object.
+    LEGACY_KEY.store(old, Ordering::Relaxed);
+    clear_legacy_linux_binder_key(old);
+    DONE.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn rekey_hybris_hidl_aarch64() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static LEGACY_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
+    if DONE.load(Ordering::Relaxed) {
+        clear_legacy_hybris_hidl_key(LEGACY_KEY.load(Ordering::Relaxed));
+        return;
+    }
+    unsafe {
+    let Some(base) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libhidlbase.so") else { return };
+    if std::ptr::read_unaligned((base + 0x88af0) as *const u64) != 0xa9014ff4a9be7bfd { return; }
+    type KeyCreate = unsafe extern "C" fn(*mut u32, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
+    type SetSpecific = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
+    let handle = libc::dlopen(c"libc.so.6".as_ptr(), libc::RTLD_NOW);
+    if handle.is_null() { return; }
+    let (Some(create), Some(set)) = (
+        sym_ptr(handle, "pthread_key_create").and_then(cast_fn),
+        sym_ptr(handle, "pthread_setspecific").and_then(cast_fn),
+    ) else { return };
+    let (create, set): (KeyCreate, SetSpecific) = (create, set);
+    // Initialize gTLS before replacing it; otherwise the first self() call
+    // overwrites the new key with the library's default low key.
+    type IpcSelf = unsafe extern "C" fn() -> *mut c_void;
+    let self_fn: IpcSelf = std::mem::transmute(base + 0x88af0);
+    let _ = self_fn();
+    let key = (base + 0xa5c9c) as *mut u32;
+    let old = *key;
+    if old >= 16 {
+        DONE.store(true, Ordering::Relaxed);
+        return;
+    }
+    let mut new = 0u32;
+    while new < 16 {
+        if create(&mut new, None) != 0 { return; }
+    }
+    // Do not migrate the corrupt object. A fresh hardware::IPCThreadState must
+    // be constructed under the new key on each thread.
+    let _ = set(old, std::ptr::null_mut());
+    *key = new;
+    LEGACY_KEY.store(old, Ordering::Relaxed);
+    DONE.store(true, Ordering::Relaxed);
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] separated Hybris HIDL TLS key {old} -> {new}");
+    }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn rekey_hybris_egl() {
+    rekey_linux_binder_aarch64();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Relaxed) { return; }
     let Some(egl) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libEGL.so") else {
@@ -3190,7 +3323,44 @@ unsafe fn open_host_gralloc(host: &Host) -> *mut c_void {
     handle
 }
 
+#[cfg(target_arch = "aarch64")]
+unsafe fn log_hybris_ipc_state() {
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_none() { return; }
+    let Some(base) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libhidlbase.so") else { return };
+    if std::ptr::read_unaligned((base + 0x88af0) as *const u64) != 0xa9014ff4a9be7bfd { return; }
+    type IpcSelf = unsafe extern "C" fn() -> *mut c_void;
+    let self_fn: IpcSelf = std::mem::transmute(base + 0x88af0);
+    let state = self_fn();
+    if state.is_null() { return; }
+    let restriction = *((state as *mut u8).add(512) as *const i32);
+    let key = *((base + 0xa5c9c) as *const u32);
+    let guest = mapped_elf_base("/data/lib/libbinder.so").and_then(|guest_base| {
+        if std::ptr::read_unaligned((guest_base + 0x54458) as *const u64) != 0xa9014ff4a9be7bfd {
+            return None;
+        }
+        let self_fn: IpcSelf = std::mem::transmute(guest_base + 0x54458);
+        Some(self_fn())
+    });
+    let process = *(state as *mut *mut u8);
+    let process_restriction = if process.is_null() { -1 } else { *(process.add(192) as *const i32) };
+    let art = mapped_elf_base("/data/lib/libart.so").and_then(|base| {
+        if std::ptr::read_unaligned((base + 0x96d480) as *const u64) != 0x90001608d503245f {
+            return None;
+        }
+        let current: IpcSelf = std::mem::transmute(base + 0x96d480);
+        Some(current())
+    });
+    eprintln!("[gleshim] Hybris HIDL state={state:p} key={key} restriction={restriction} process={process:p} process_restriction={process_restriction} guest={:p} art={:p}", guest.unwrap_or(std::ptr::null_mut()), art.unwrap_or(std::ptr::null_mut()));
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn log_hybris_ipc_state() {}
+
 unsafe fn gralloc_api(host: &Host) -> Result<GrallocApi, String> {
+    // This branch is specific to Linux+Hybris/AArch64/gralloc. The dma-buf
+    // path never enters it; ARMv7hl needs an independently verified fix.
+    #[cfg(target_arch = "aarch64")]
+    if hybris_host() { rekey_hybris_hidl_aarch64(); }
     let handle = open_host_gralloc(host);
     if handle.is_null() {
         return Err("cannot load host libgralloc.so.1".into());
@@ -3212,6 +3382,7 @@ unsafe fn allocate_gralloc(host: &Host, width: u32, height: u32) -> Result<Grall
     let mut handle = std::ptr::null_mut();
     let mut stride = 0u32;
     (api.initialize)(0);
+    log_hybris_ipc_state();
     // HW_RENDER | HW_TEXTURE | SW_READ_OFTEN: request linear CPU-readable data.
     let rc = (api.allocate)(width, height, 5, 0x303, &mut handle, &mut stride);
     if rc != 0 || handle.is_null() {
@@ -3417,7 +3588,8 @@ unsafe fn probe_gralloc() -> Result<(), String> {
         .and_then(cast_fn).ok_or("hybris_gralloc_release is unavailable")?;
     let deinitialize: Deinitialize = sym_ptr(gralloc, "hybris_gralloc_deinitialize")
         .and_then(cast_fn).ok_or("hybris_gralloc_deinitialize is unavailable")?;
-
+    #[cfg(target_arch = "aarch64")]
+    if hybris_host() { rekey_hybris_hidl_aarch64(); }
     let mut handle = std::ptr::null_mut();
     let mut stride = 0u32;
     initialize(0);
@@ -3575,6 +3747,8 @@ pub unsafe extern "C" fn eglInitialize(
     // the caller's (valid or null, which EGL accepts). Hybris may query its
     // real configstore over hwbinder from inside this call.
     let _host_call = HostCallGuard::enter();
+    #[cfg(target_arch = "aarch64")]
+    if hybris_host() { rekey_linux_binder_aarch64(); }
     let ok = (host.initialize)(dpy, major, minor);
     #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
     if hybris_host() { rekey_hybris_egl(); }

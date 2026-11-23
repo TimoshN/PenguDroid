@@ -20,6 +20,8 @@ pengudroid-nativebridge.workspace = true
 pengudroid-daemon.workspace = true
 libc.workspace = true
 miniz_oxide.workspace = true
+flate2 = "1.1.10"
+tar = "0.4.46"
 roxmltree = "0.21.2"
 
 [lib]

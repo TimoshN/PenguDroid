@@ -28,11 +28,53 @@ unsafe fn host_attr(guest: *const c_void) -> Option<libc::pthread_attr_t> {
     }
     let mut host: libc::pthread_attr_t = std::mem::zeroed();
     #[cfg(target_pointer_width = "64")]
-    std::ptr::copy_nonoverlapping(
-        guest as *const u8,
-        &mut host as *mut libc::pthread_attr_t as *mut u8,
-        BIONIC_ATTR_SIZE,
-    );
+    {
+        // Bionic and glibc have different attribute layouts. A raw 56-byte
+        // copy made stack guards and addresses garbage on AArch64. Translate
+        // each field instead; ARMv7 retains its existing independent branch.
+        #[repr(C)]
+        struct GuestAttr {
+            flags: u32,
+            stack_base: *mut c_void,
+            stack_size: usize,
+            guard_size: usize,
+            sched_policy: c_int,
+            sched_priority: c_int,
+        }
+        type AttrInit = unsafe extern "C" fn(*mut libc::pthread_attr_t) -> c_int;
+        type SetState = unsafe extern "C" fn(*mut libc::pthread_attr_t, c_int) -> c_int;
+        type SetSize = unsafe extern "C" fn(*mut libc::pthread_attr_t, usize) -> c_int;
+        type SetParam = unsafe extern "C" fn(*mut libc::pthread_attr_t, *const libc::sched_param) -> c_int;
+        type SetStack = unsafe extern "C" fn(*mut libc::pthread_attr_t, *mut c_void, usize) -> c_int;
+        let init = dlsym_next::<AttrInit>(b"pthread_attr_init\0")?;
+        let set_detach = dlsym_next::<SetState>(b"pthread_attr_setdetachstate\0")?;
+        let set_guard = dlsym_next::<SetSize>(b"pthread_attr_setguardsize\0")?;
+        let set_policy = dlsym_next::<SetState>(b"pthread_attr_setschedpolicy\0")?;
+        let set_param = dlsym_next::<SetParam>(b"pthread_attr_setschedparam\0")?;
+        let set_stack = dlsym_next::<SetStack>(b"pthread_attr_setstack\0")?;
+        let set_stack_size = dlsym_next::<SetSize>(b"pthread_attr_setstacksize\0")?;
+        if init(&mut host) != 0 { return None; }
+        let guest = &*(guest as *const GuestAttr);
+        let detached = if guest.flags & 1 != 0 {
+            libc::PTHREAD_CREATE_DETACHED
+        } else {
+            libc::PTHREAD_CREATE_JOINABLE
+        };
+        if set_detach(&mut host, detached) != 0
+            || set_guard(&mut host, guest.guard_size) != 0
+            || set_policy(&mut host, guest.sched_policy) != 0
+            || set_param(&mut host, &libc::sched_param { sched_priority: guest.sched_priority }) != 0
+        {
+            return None;
+        }
+        if !guest.stack_base.is_null() && guest.stack_size != 0 {
+            if set_stack(&mut host, guest.stack_base, guest.stack_size) != 0 { return None; }
+        } else if guest.stack_size >= 16384
+            && set_stack_size(&mut host, guest.stack_size) != 0
+        {
+            return None;
+        }
+    }
     #[cfg(target_pointer_width = "32")]
     {
         #[repr(C)]
@@ -99,11 +141,21 @@ pub unsafe extern "C" fn __pengudroid_bionic_pthread_attr_init(guest: *mut c_voi
     let result = real(&mut host);
     if result == 0 {
         #[cfg(target_pointer_width = "64")]
-        std::ptr::copy_nonoverlapping(
-            &host as *const libc::pthread_attr_t as *const u8,
-            guest as *mut u8,
-            BIONIC_ATTR_SIZE,
-        );
+        {
+            #[repr(C)]
+            struct GuestAttr {
+                flags: u32,
+                stack_base: *mut c_void,
+                stack_size: usize,
+                guard_size: usize,
+                sched_policy: c_int,
+                sched_priority: c_int,
+            }
+            let out = &mut *(guest as *mut GuestAttr);
+            std::ptr::write_bytes(out, 0, 1);
+            out.stack_size = 1024 * 1024;
+            out.guard_size = 4096;
+        }
         #[cfg(target_pointer_width = "32")]
         {
             #[repr(C)]

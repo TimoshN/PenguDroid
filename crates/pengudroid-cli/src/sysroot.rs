@@ -26,6 +26,27 @@ use crate::nativelib::ensure_compat_dir;
 use crate::runtime::{RuntimeArch, HOST_ARCH};
 use pengudroid_nativebridge::{RuntimeCallbacks, Shorty, Translator};
 
+/// Read the explicit architecture of a data-only runtime. Ordinary sysroots
+/// still prove their identity with ART's ELF header; a manifest alone cannot
+/// enable this mode unless data_only is true.
+fn data_only_arch(root: &Path) -> Option<RuntimeArch> {
+    let manifest = std::fs::read_to_string(root.join("pengudroid-runtime.json")).ok()?;
+    let field = |name: &str| {
+        let key = format!("\"{name}\"");
+        manifest.lines().find_map(|line| {
+            let (key_found, value) = line.trim().split_once(':')?;
+            (key_found.trim() == key).then(|| value.trim().trim_end_matches(',').trim())
+        })
+    };
+    if field("data_only") != Some("true") { return None; }
+    match field("architecture")?.trim_matches('"') {
+        "x86_64" => Some(RuntimeArch::X86_64),
+        "aarch64" | "arm64" => Some(RuntimeArch::Arm64),
+        "arm" | "armv7" => Some(RuntimeArch::Arm),
+        _ => None,
+    }
+}
+
 /// Validate the runtime itself, independently of APK minSdk/targetSdk metadata.
 fn validate_runtime(system: &Path) -> Result<RuntimeArch, String> {
     let props_path = system.join("build.prop");
@@ -59,6 +80,11 @@ fn validate_runtime(system: &Path) -> Result<RuntimeArch, String> {
     } else {
         art32
     };
+    if !art.is_file() {
+        if let Some(root) = system.parent() {
+            if let Some(arch) = data_only_arch(root) { return Ok(arch); }
+        }
+    }
     let mut header = [0u8; 20];
     std::fs::File::open(&art).and_then(|mut file| file.read_exact(&mut header))
         .map_err(|e| format!(
@@ -332,15 +358,31 @@ impl Layout {
         })
     }
 
-    /// Files ART needs, with a description.
+    /// Whether native ELF payloads were deliberately split out of this tree.
+    pub fn data_only(&self) -> bool {
+        data_only_arch(&self.root) == Some(self.arch)
+    }
+
+    /// Files ART needs, with a description. Data-only runtimes inspect the
+    /// exec-capable prepared library directory instead of missing source ELF
+    /// files in the noexec data partition.
     pub fn required(&self) -> Vec<(String, PathBuf)> {
+        let data_only = self.data_only();
         let art_lib = self.arch.lib_dir();
+        let prepared = std::env::var_os("PENGUDROID_ART_LIBS")
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("<PENGUDROID_ART_LIBS>"));
+        let native = if data_only { prepared } else { self.art_root.join(art_lib) };
+        let bionic = if data_only {
+            crate::deps::find_shim().unwrap_or_else(|| PathBuf::from("<libpengudroid_shim.so>"))
+        } else {
+            self.lib_dirs[0].join("libc.so")
+        };
         vec![
-            ("ART runtime".into(), self.art_root.join(art_lib).join("libart.so")),
-            ("ART base".into(), self.art_root.join(art_lib).join("libartbase.so")),
-            ("DEX support".into(), self.art_root.join(art_lib).join("libdexfile.so")),
-            ("JNI helpers".into(), self.art_root.join(art_lib).join("libnativehelper.so")),
-            ("Bionic libc".into(), self.lib_dirs[0].join("libc.so")),
+            ("ART runtime".into(), native.join("libart.so")),
+            ("ART base".into(), native.join("libartbase.so")),
+            ("DEX support".into(), native.join("libdexfile.so")),
+            ("JNI helpers".into(), native.join("libnativehelper.so")),
+            (if data_only { "Bionic shim".into() } else { "Bionic libc".into() }, bionic),
             ("boot image".into(), self.boot_images.join("boot.art")),
             ("boot image (oat)".into(), self.boot_images.join("boot.oat")),
             ("framework classes".into(), self.framework.join("framework.jar")),
@@ -462,6 +504,14 @@ const SHIM_SONAMES: &[&str] = &["libc.so", "libm.so", "libdl.so", "liblog.so", "
 /// `.so`s (packed relocations, Android symbol versions) can be `dlopen`ed.
 pub(crate) fn stage_libraries(root: &Path) -> Result<PathBuf, String> {
     let layout = Layout::detect(root)?;
+    if layout.data_only() {
+        let provisioned = std::env::var_os("PENGUDROID_ART_LIBS")
+            .map(PathBuf::from).ok_or_else(|| {
+                "data-only runtime requires PENGUDROID_ART_LIBS with prepared executable libraries".to_string()
+            })?;
+        if provisioned.join("libart.so").is_file() { return Ok(provisioned); }
+        return Err(format!("PENGUDROID_ART_LIBS={} has no libart.so", provisioned.display()));
+    }
     let work = std::env::temp_dir().join(format!("pengudroid-stage-{}", std::process::id()));
     std::fs::create_dir_all(&work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     prepare_art_libs(&layout, &work)
@@ -954,6 +1004,10 @@ pub fn art_test(args: &[String]) -> i32 {
             }
         }
     } else {
+        if layout.data_only() {
+            eprintln!("pengudroid: data-only runtime requires PENGUDROID_ART_LIBS with prepared executable libraries");
+            return 1;
+        }
         let _ = std::fs::remove_dir_all(&work);
         prune_stale_work_dirs();
         match prepare_art_libs(&layout, &work) {
@@ -3049,6 +3103,27 @@ mod tests {
         let android = Layout::detect(&fixture.0).unwrap();
         assert_eq!(android.arch, RuntimeArch::Arm64);
         assert_eq!(android.boot_images, android.android_root.join("framework/arm64"));
+    }
+
+    #[test]
+    fn data_only_manifest_replaces_only_the_missing_art_identity() {
+        let fixture = Fixture::android17_arch(RuntimeArch::Arm64);
+        std::fs::remove_file(fixture.0.join("system/apex/com.android.art/lib64/libart.so")).unwrap();
+        fixture.write("pengudroid-runtime.json", br#"{
+            "architecture": "aarch64",
+            "data_only": true
+        }"#);
+        let android = Layout::detect(&fixture.0).unwrap();
+        assert_eq!(android.arch, RuntimeArch::Arm64);
+        assert!(android.data_only());
+        assert!(android.required().iter().any(|(_, path)| path.starts_with("<PENGUDROID_ART_LIBS>")));
+
+        fixture.write("pengudroid-runtime.json", br#"{
+            "architecture": "aarch64",
+            "data_only": false
+        }"#);
+        let error = fixture.error();
+        assert!(error.contains("requires an ART ELF header"), "{error}");
     }
 
     #[test]

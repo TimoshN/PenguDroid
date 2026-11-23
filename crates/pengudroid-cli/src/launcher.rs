@@ -886,9 +886,160 @@ fn aurora_theme_pixel_ratio_from_libdconf() -> Option<f64> {
             variant_unref(value);
             Some(ratio)
         })();
-        libc::dlclose(handle);
+        // DConfClient is registered in GLib's global type table. Unloading
+        // libdconf after the first read makes a later read fail during type
+        // registration, so retain the library for this launcher's lifetime.
         result
     }
+}
+
+fn visible_statusbar_inset(visible: bool, statusbar: i32, cutout: i32) -> i32 {
+    let statusbar = if visible { statusbar } else { 0 };
+    statusbar.max(cutout).clamp(0, 4096)
+}
+
+/// Read the optional Lipstick status-bar/cutout heights without a device-
+/// specific fallback. Missing dconf keys contribute zero. The extended app
+/// surface requests a visible status bar; an explicit boolean visibility key,
+/// when present, takes precedence.
+fn aurora_top_inset_from_dconf_using(client: *mut std::ffi::c_void) -> Option<i32> {
+    use std::ffi::{c_char, c_void, CString};
+    type DconfClientNew = unsafe extern "C" fn() -> *mut c_void;
+    type DconfClientRead = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
+    type VariantGetBoolean = unsafe extern "C" fn(*mut c_void) -> i32;
+    type VariantGetInt = unsafe extern "C" fn(*mut c_void) -> i32;
+    type Unref = unsafe extern "C" fn(*mut c_void);
+    unsafe {
+        let library = CString::new("libdconf.so.1").ok()?;
+        let handle = libc::dlopen(library.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+        if handle.is_null() { return None; }
+        let symbol = |name: &str| {
+            let name = CString::new(name).ok()?;
+            let symbol = libc::dlsym(handle, name.as_ptr());
+            (!symbol.is_null()).then_some(symbol)
+        };
+        let new: DconfClientNew = std::mem::transmute(symbol("dconf_client_new")?);
+        let read: DconfClientRead = std::mem::transmute(symbol("dconf_client_read")?);
+        let get_boolean: VariantGetBoolean = std::mem::transmute(symbol("g_variant_get_boolean")?);
+        let get_int: VariantGetInt = std::mem::transmute(symbol("g_variant_get_int32")?);
+        let variant_unref: Unref = std::mem::transmute(symbol("g_variant_unref")?);
+        let object_unref: Unref = std::mem::transmute(symbol("g_object_unref")?);
+        let owned = client.is_null();
+        let client = if owned { new() } else { client };
+        if client.is_null() { return None; }
+        let read_variant = |key: &str| {
+            let key = CString::new(key).ok()?;
+            let value = read(client, key.as_ptr());
+            (!value.is_null()).then_some(value)
+        };
+        let read_bool = |key: &str| {
+            let value = read_variant(key)?;
+            let result = get_boolean(value) != 0;
+            variant_unref(value);
+            Some(result)
+        };
+        let read_int = |key: &str| {
+            let value = read_variant(key)?;
+            let result = get_int(value);
+            variant_unref(value);
+            Some(result)
+        };
+        let as_inset = read_bool(
+            "/desktop/sailfish/silica/statusbar/statusbarAsInset",
+        ).unwrap_or(false);
+        let statusbar = if as_inset {
+            read_int("/desktop/sailfish/silica/statusbar/height").unwrap_or(0)
+        } else { 0 };
+        let cutout = read_int("/desktop/sailfish/silica/cutout_area/height").unwrap_or(0);
+        let visible = read_bool("/desktop/sailfish/silica/statusbar/visible").unwrap_or(true);
+        if owned { object_unref(client); }
+        let inset = visible_statusbar_inset(visible, statusbar, cutout);
+        println!(
+            "pengudroid launch: dconf statusbarAsInset={as_inset} statusbar={statusbar}px cutout={cutout}px visible={visible} -> top inset={inset}px"
+        );
+        Some(inset)
+    }
+}
+
+pub(crate) fn aurora_top_inset_from_dconf() -> Option<i32> {
+    aurora_top_inset_from_dconf_using(std::ptr::null_mut())
+}
+
+pub(crate) fn aurora_top_inset_from_dconf_client(
+    client: *mut std::ffi::c_void,
+) -> Option<i32> {
+    aurora_top_inset_from_dconf_using(client)
+}
+
+unsafe extern "C" fn dconf_inset_changed(
+    client: *mut std::ffi::c_void, _prefix: *const std::ffi::c_char,
+    _changes: *const *const std::ffi::c_char, _tag: *const std::ffi::c_char,
+    user_data: *mut std::ffi::c_void,
+) {
+    let Some(height) = aurora_top_inset_from_dconf_client(client) else { return };
+    let fd = user_data as usize as i32;
+    let bytes = height.to_le_bytes();
+    if libc::write(fd, bytes.as_ptr() as *const std::ffi::c_void, bytes.len()) == 4 {
+        println!("pengudroid launch: forwarded changed dconf top inset={height}px");
+    }
+}
+
+/// Run DConfClient's changed signal in the launcher, where host dconf access is
+/// known to work, and forward only the computed integer to the ART child.
+fn spawn_aurora_dconf_inset_listener(write_fd: i32) {
+    std::thread::spawn(move || {
+        let run = || -> Option<()> {
+            use std::ffi::{c_char, c_void, CString};
+            type New = unsafe extern "C" fn() -> *mut c_void;
+            type Watch = unsafe extern "C" fn(*mut c_void, *const c_char);
+            type LoopNew = unsafe extern "C" fn(*mut c_void, i32) -> *mut c_void;
+            type LoopRun = unsafe extern "C" fn(*mut c_void);
+            type SignalConnect = unsafe extern "C" fn(
+                *mut c_void, *const c_char, *mut c_void, *mut c_void,
+                *mut c_void, i32,
+            ) -> u64;
+            unsafe {
+                let library = CString::new("libdconf.so.1").ok()?;
+                let handle = libc::dlopen(
+                    library.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                );
+                if handle.is_null() { return None; }
+                let symbol = |name: &str| {
+                    let name = CString::new(name).ok()?;
+                    let symbol = libc::dlsym(handle, name.as_ptr());
+                    (!symbol.is_null()).then_some(symbol)
+                };
+                let new: New = std::mem::transmute(symbol("dconf_client_new")?);
+                let watch: Watch = std::mem::transmute(symbol("dconf_client_watch_sync")?);
+                let connect: SignalConnect =
+                    std::mem::transmute(symbol("g_signal_connect_data")?);
+                let loop_new: LoopNew = std::mem::transmute(symbol("g_main_loop_new")?);
+                let loop_run: LoopRun = std::mem::transmute(symbol("g_main_loop_run")?);
+                let client = new();
+                if client.is_null() { return None; }
+                let signal = CString::new("changed").ok()?;
+                if connect(
+                    client, signal.as_ptr(), dconf_inset_changed as *mut c_void,
+                    write_fd as usize as *mut c_void, std::ptr::null_mut(), 0,
+                ) == 0 {
+                    return None;
+                }
+                for path in [
+                    "/desktop/sailfish/silica/statusbar/",
+                    "/desktop/sailfish/silica/cutout_area/",
+                ] {
+                    let path = CString::new(path).ok()?;
+                    watch(client, path.as_ptr());
+                }
+                let main_loop = loop_new(std::ptr::null_mut(), 0);
+                if main_loop.is_null() { return None; }
+                println!("pengudroid launch: listening for dconf status-bar/cutout changes");
+                loop_run(main_loop);
+            }
+            Some(())
+        };
+        let _ = run();
+    });
 }
 
 fn aurora_theme_density_dpi() -> Option<(f64, i32)> {
@@ -987,9 +1138,23 @@ fn apply_aurora_package_env(
     if std::env::var_os("PENGUDROID_NO_CODEC2_SERVICE").is_none() {
         cmd.env("PENGUDROID_NO_CODEC2_SERVICE", "1");
     }
-    if std::env::var_os("PENGUDROID_STATUSBAR_HEIGHT").is_none() {
-        // Dialog-S/Lipstick: max(statusbar, cutout) from dconf = 132 px.
-        cmd.env("PENGUDROID_STATUSBAR_HEIGHT", "132");
+    if !overridden("PENGUDROID_STATUSBAR_HEIGHT") {
+        let height = aurora_top_inset_from_dconf().unwrap_or(0);
+        cmd.env("PENGUDROID_STATUSBAR_HEIGHT", height.to_string());
+        let watch_disabled = std::env::var_os("PENGUDROID_DCONF_STATUSBAR_WATCH").as_deref()
+            == Some(std::ffi::OsStr::new("0"))
+            || configured_env.iter().any(|(key, value)| {
+                key == "PENGUDROID_DCONF_STATUSBAR_WATCH" && value == "0"
+            });
+        if !watch_disabled {
+            let mut fds = [0; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+                cmd.env("PENGUDROID_DCONF_INSET_FD", fds[0].to_string());
+                spawn_aurora_dconf_inset_listener(fds[1]);
+            } else {
+                eprintln!("pengudroid launch: cannot create dconf inset pipe: {}", std::io::Error::last_os_error());
+            }
+        }
     }
     let app_lib = lib.join(package);
     if app_lib.is_dir() {
@@ -1001,6 +1166,86 @@ fn apply_aurora_package_env(
 /// Sailjail grants an application only its organization/application data and
 /// cache directories. Manual SSH launches historically used ~/.*/pengudroid,
 /// but those paths do not exist in the desktop sandbox's mount namespace.
+fn make_packaged_dex_read_only(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if path.is_symlink() { return Ok(()); }
+    if path.is_dir() {
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| format!("cannot inspect unpacked runtime {}: {e}", path.display()))?;
+        for entry in entries {
+            make_packaged_dex_read_only(&entry.map_err(|e| e.to_string())?.path())?;
+        }
+    } else if path.is_file()
+        && matches!(path.extension().and_then(|s| s.to_str()), Some("apk" | "jar"))
+    {
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| format!("cannot inspect DEX permissions {}: {e}", path.display()))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() & !0o222);
+        std::fs::set_permissions(path, permissions)
+            .map_err(|e| format!("cannot make DEX read-only {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Unpack the RPM's runtime without relying on an external tar executable.
+/// Sailjail's private-bin hides /usr/bin/tar, so spawning it fails before ART.
+/// Extract beside the final runtime and publish it atomically only after the
+/// expected API-37 manifest and framework are present.
+fn unpack_packaged_runtime(archive: &Path, parent: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    let unique = format!("{}-{}", crate::runtime::RUNTIME_DIR, std::process::id());
+    let staging = parent.join(format!(".{unique}.unpack"));
+    let runtime = parent.join(crate::runtime::RUNTIME_DIR);
+    let backup = parent.join(format!(".{unique}.incomplete"));
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&backup);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
+    let result = (|| -> Result<PathBuf, String> {
+        let file = std::fs::File::open(archive)
+            .map_err(|e| format!("cannot open {}: {e}", archive.display()))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut tar = tar::Archive::new(decoder);
+        let entries = tar.entries().map_err(|e| format!("cannot read runtime archive: {e}"))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|e| format!("invalid runtime archive entry: {e}"))?;
+            let path = entry.path().map_err(|e| format!("invalid runtime path: {e}"))?.into_owned();
+            let mut components = path.components();
+            if components.next() != Some(Component::Normal(std::ffi::OsStr::new(crate::runtime::RUNTIME_DIR)))
+                || components.any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+            {
+                return Err(format!("unexpected runtime archive path: {}", path.display()));
+            }
+            if !entry.unpack_in(&staging).map_err(|e| format!("cannot unpack {}: {e}", path.display()))? {
+                return Err(format!("runtime archive path escapes its destination: {}", path.display()));
+            }
+        }
+        let extracted = staging.join(crate::runtime::RUNTIME_DIR);
+        for required in ["pengudroid-runtime.json", "system/framework/framework.jar"] {
+            if !extracted.join(required).is_file() {
+                return Err(format!("unpacked runtime is missing {required}"));
+            }
+        }
+        // ART rejects writable DEX files. The archive is data, not a writable
+        // application prefix, so publish APK/JAR inputs read-only.
+        make_packaged_dex_read_only(&extracted)?;
+        if runtime.exists() {
+            std::fs::rename(&runtime, &backup)
+                .map_err(|e| format!("cannot retain incomplete runtime: {e}"))?;
+        }
+        if let Err(error) = std::fs::rename(&extracted, &runtime) {
+            if backup.exists() { let _ = std::fs::rename(&backup, &runtime); }
+            return Err(format!("cannot publish unpacked runtime: {error}"));
+        }
+        Ok(runtime.clone())
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    if result.is_ok() { let _ = std::fs::remove_dir_all(&backup); }
+    result
+}
+
 fn configure_aurora_user_dirs() {
     let Some(package_data) = aurora_package_data_dir() else { return };
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
@@ -1025,12 +1270,9 @@ fn configure_aurora_user_dirs() {
             if let Some(parent) = runtime.parent() {
                 let _ = std::fs::create_dir_all(parent);
                 eprintln!("pengudroid launch: unpacking packaged Android runtime");
-                match std::process::Command::new("tar")
-                    .arg("-xzf").arg(&archive).arg("-C").arg(parent).status()
-                {
-                    Ok(status) if status.success() => {}
-                    Ok(status) => eprintln!("pengudroid launch: runtime unpack failed: {status}"),
-                    Err(error) => eprintln!("pengudroid launch: cannot run tar: {error}"),
+                match unpack_packaged_runtime(&archive, parent) {
+                    Ok(path) => eprintln!("pengudroid launch: Android runtime unpacked to {}", path.display()),
+                    Err(error) => eprintln!("pengudroid launch: runtime unpack failed: {error}"),
                 }
             }
         }
@@ -1458,5 +1700,44 @@ mod tests {
         assert_eq!(theme_scaled_density_dpi(1.0), Some(240));
         assert_eq!(theme_scaled_density_dpi(0.0), None);
         assert_eq!(theme_scaled_density_dpi(f64::NAN), None);
+    }
+
+    #[test]
+    fn statusbar_inset_uses_visibility_and_cutout_without_a_device_constant() {
+        assert_eq!(visible_statusbar_inset(true, 80, 96), 96);
+        assert_eq!(visible_statusbar_inset(true, 96, 80), 96);
+        assert_eq!(visible_statusbar_inset(false, 96, 80), 80);
+        assert_eq!(visible_statusbar_inset(true, 0, 0), 0);
+    }
+
+    #[test]
+    fn packaged_runtime_unpacks_without_an_external_tar() {
+        let base = std::env::temp_dir().join(format!(
+            "pengudroid-runtime-unpack-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let archive_path = base.join("runtime.tar.gz");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, bytes) in [
+            (format!("{}/pengudroid-runtime.json", crate::runtime::RUNTIME_DIR), b"{}".as_slice()),
+            (format!("{}/system/framework/framework.jar", crate::runtime::RUNTIME_DIR), b"framework".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, bytes).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+        let runtime = unpack_packaged_runtime(&archive_path, &base).unwrap();
+        let framework = runtime.join("system/framework/framework.jar");
+        assert_eq!(std::fs::read(&framework).unwrap(), b"framework");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(framework).unwrap().permissions().mode() & 0o222, 0);
+        assert!(!base.join(format!(".{}-{}.unpack", crate::runtime::RUNTIME_DIR, std::process::id())).exists());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

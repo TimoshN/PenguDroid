@@ -64,6 +64,7 @@ mod slot {
     pub const GET_BOOLEAN_FIELD: usize = 96;
     pub const GET_INT_FIELD: usize = 100;
     pub const GET_LONG_FIELD: usize = 101;
+    pub const GET_FLOAT_FIELD: usize = 102;
     pub const SET_OBJECT_FIELD: usize = 104;
     pub const SET_BOOLEAN_FIELD: usize = 105;
     pub const SET_INT_FIELD: usize = 109;
@@ -458,11 +459,84 @@ impl JniEnv {
         unsafe { f(self.0, obj, field, value as u8) }
     }
 
+    /// `GetFloatField(obj, field)`.
+    pub fn get_float_field(&self, obj: JObject, field: JFieldId) -> f32 {
+        #[cfg(target_arch = "arm")]
+        unsafe {
+            // Android's 32-bit JNI uses AAPCS softfp even in this hard-float
+            // host build: a float result is returned in r0, not s0.
+            let function = *self.table().add(slot::GET_FLOAT_FIELD);
+            let bits: u32;
+            core::arch::asm!(
+                "blx {function}",
+                function = in(reg) function,
+                inlateout("r0") self.0 => bits,
+                in("r1") obj,
+                in("r2") field,
+                clobber_abi("C"),
+            );
+            return f32::from_bits(bits);
+        }
+        #[cfg(not(target_arch = "arm"))]
+        unsafe {
+            let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> f32 =
+                self.func(slot::GET_FLOAT_FIELD);
+            f(self.0, obj, field)
+        }
+    }
+
     /// `SetFloatField(obj, field, value)`.
     pub fn set_float_field(&self, obj: JObject, field: JFieldId, value: f32) {
-        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId, f32) =
-            unsafe { self.func(slot::SET_FLOAT_FIELD) };
-        unsafe { f(self.0, obj, field, value) }
+        #[cfg(target_arch = "arm")]
+        unsafe {
+            // The fourth softfp argument is the raw float bits in r3. A normal
+            // extern "C" call from armv7hl passes it in s0, leaving r3 (and
+            // therefore MotionEvent coordinates) as uninitialised data.
+            let function = *self.table().add(slot::SET_FLOAT_FIELD);
+            core::arch::asm!(
+                "blx {function}",
+                function = in(reg) function,
+                in("r0") self.0,
+                in("r1") obj,
+                in("r2") field,
+                in("r3") value.to_bits(),
+                clobber_abi("C"),
+            );
+            return;
+        }
+        #[cfg(not(target_arch = "arm"))]
+        unsafe {
+            let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId, f32) =
+                self.func(slot::SET_FLOAT_FIELD);
+            f(self.0, obj, field, value)
+        }
+    }
+
+    /// `CallFloatMethodA(obj, method, args)`.
+    pub fn call_float(&self, obj: JObject, method: JMethodId, args: &[JValue]) -> Option<f32> {
+        #[cfg(target_arch = "arm")]
+        let value = unsafe {
+            let function = *self.table().add(57);
+            let bits: u32;
+            core::arch::asm!(
+                "blx {function}",
+                function = in(reg) function,
+                inlateout("r0") self.0 => bits,
+                in("r1") obj,
+                in("r2") method,
+                in("r3") args.as_ptr(),
+                clobber_abi("C"),
+            );
+            f32::from_bits(bits)
+        };
+        #[cfg(not(target_arch = "arm"))]
+        let value = unsafe {
+            let f: unsafe extern "C" fn(
+                *mut c_void, JObject, JMethodId, *const JValue,
+            ) -> f32 = self.func(57);
+            f(self.0, obj, method, args.as_ptr())
+        };
+        self.exception_check().then_some(value)
     }
 
     /// `CallVoidMethodA(obj, method, args)`.
