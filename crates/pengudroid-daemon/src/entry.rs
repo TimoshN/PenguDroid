@@ -129,6 +129,7 @@ pub fn real_main(args: &[String]) {
 
     let t0 = Instant::now();
     let daemon = Arc::new(Daemon::new(args.socket.clone(), props_path, args.enable_wayland));
+    let shutdown_daemon = Arc::clone(&daemon);
     let listener = match Listener::bind_or_abstract(&args.socket) {
         Ok(l) => {
             if l.display_path() != args.socket {
@@ -154,6 +155,9 @@ pub fn real_main(args: &[String]) {
         eprintln!("error: daemon loop failed: {e}");
         std::process::exit(1);
     }
+    // Tear down guest processes with the daemon instead of leaving orphaned
+    // `__art` children running after it is gone.
+    shutdown_daemon.kill_all_guests();
 }
 
 /// Connect as a client and do a Ping/Pong to confirm a live daemon.

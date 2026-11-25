@@ -61,10 +61,8 @@ mod imp {
 
     use pengudroid_proto::{abi, BufferCrop};
     use pengudroid_proto::vsync_input_event;
-    use crate::wlegl;
     use crate::wlegl::protocol::imp::android_wlegl::AndroidWlegl;
     use crate::wlegl::protocol::imp::android_wlegl_handle::AndroidWleglHandle;
-    use std::os::fd::BorrowedFd;
     use std::time::Instant;
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{
@@ -120,28 +118,6 @@ mod imp {
         pub position: (i32, i32),
         pub window_state: WindowState,
         desktop_configured: bool,
-    }
-
-    /// Stable identity of one native allocation: the int words are identical
-    /// across the duplicated fds sent with each frame.
-    fn fnv1a_ints(ints: &[i32]) -> u64 {
-        let mut hash = 0xcbf29ce484222325u64;
-        for word in ints {
-            for byte in word.to_le_bytes() {
-                hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
-            }
-        }
-        hash
-    }
-
-    /// `android_wlegl.create_handle` takes the int part of native_handle_t as
-    /// a byte array; the fds travel separately as `add_fd` requests.
-    fn ints_as_bytes(ints: &[i32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(ints.len() * 4);
-        for word in ints {
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        out
     }
 
     struct PendingFrame {
@@ -259,10 +235,8 @@ mod imp {
         /// the global alone only makes it possible.
         pub wlegl_enabled: bool,
         wlegl_name: Option<u32>,
-        /// Reuse one wl_buffer per Android native handle. Creating a fresh
-        /// wl_buffer for every frame makes Lipstick keep showing the first
-        /// imported pixels instead of re-sampling the allocation.
-        wlegl_buffers: HashMap<(u32, u64), (wl_buffer::WlBuffer, Vec<std::os::fd::OwnedFd>)>,
+        /// EGL presenter: owns EGLSurfaces and presents via eglSwapBuffers.
+        egl_presenter: Option<crate::egl::Presenter>,
         /// `wl_subcompositor`, used for child layers (`SurfaceView` video).
         pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
         /// How many `format`/`modifier` events the compositor sent (diagnostic).
@@ -285,8 +259,8 @@ mod imp {
         /// Frames presented per surface, for the FPS meter:
         /// `(frames since the last update, when that was)`.
         fps: HashMap<u32, (u32, std::time::Instant)>,
-        loading_clock: Option<std::time::Instant>,
-        loading_phase: u8,
+        /// Current loading-stage or error text shown on the black placeholder.
+        loading_status: String,
         /// Ids of surfaces the compositor asked us to close.
         pub close_requests: Vec<u32>,
         /// The seat, once the compositor advertises one.
@@ -356,7 +330,7 @@ mod imp {
                 wlegl: None,
                 wlegl_enabled: false,
                 wlegl_name: None,
-                wlegl_buffers: HashMap::new(),
+                egl_presenter: None,
                 subcompositor: None,
                 dmabuf_formats: 0,
                 dmabuf_supported: Vec::new(),
@@ -369,8 +343,7 @@ mod imp {
                 decorations: HashMap::new(),
                 extended_surfaces: HashMap::new(),
                 fps: HashMap::new(),
-                loading_clock: None,
-                loading_phase: 0,
+                loading_status: crate::window::STARTING_STATUS.to_string(),
                 close_requests: Vec::new(),
                 seat: None,
                 data_device_manager: None,
@@ -770,57 +743,41 @@ mod imp {
             if deactivated { self.ime_surface = None; }
         }
 
-        /// Animate a small twelve-dot spinner in early, launcher-created
-        /// surfaces. Only the dots are repainted; the gradient was drawn once
-        /// when the surface was configured.
-        fn tick_loading(&mut self) {
-            let now = std::time::Instant::now();
-            if self.loading_clock.is_some_and(|last| now.duration_since(last).as_millis() < 90) {
-                return;
+        /// Repaint the black loading screen with the current status text.
+        /// Replaces the old spinner: the user sees the current boot stage or
+        /// the error that stopped the launch.
+        fn repaint_loading(&mut self) {
+            if self.wlegl_enabled {
+                return; // no wl_shm loading buffer on the EGL-presented surface
             }
-            self.loading_clock = Some(now);
-            self.loading_phase = self.loading_phase.wrapping_add(1);
-            let phase = self.loading_phase;
+            let status = self.loading_status.clone();
             let ids: Vec<u32> = self.surfaces.iter()
                 .filter_map(|(id, s)| (s.loading && s.configured && !s.closed).then_some(*id))
                 .collect();
             for id in ids {
                 let Some(surface) = self.surfaces.get_mut(&id) else { continue };
-                let (width, height, stride) = (surface.width as i32, surface.height as i32, (surface.width * 4) as i32);
-                let (cx, cy) = (width / 2, height / 2);
+                let (w, h, stride) = (surface.width, surface.height, (surface.width * 4) as i32);
                 if let Ok(mut map) = surface.region.map_mut() {
-                    let bytes = map.as_mut_slice();
-                    for dot in 0..12i32 {
-                        let angle = -std::f32::consts::FRAC_PI_2
-                            + dot as f32 * std::f32::consts::TAU / 12.0;
-                        let dx = (angle.cos() * 64.0) as i32;
-                        let dy = (angle.sin() * 64.0) as i32;
-                        let age = (dot - phase as i32).rem_euclid(12) as u32;
-                        let shade = 90 + (11 - age).min(11) * 12;
-                        for y in (cy + dy - 9)..(cy + dy + 9) {
-                            for x in (cx + dx - 9)..(cx + dx + 9) {
-                                let rx = x - (cx + dx);
-                                let ry = y - (cy + dy);
-                                if rx * rx + ry * ry > 81 || x < 0 || y < 0 || x >= width || y >= height {
-                                    continue;
-                                }
-                                let offset = (y * stride + x * 4) as usize;
-                                if offset + 3 < bytes.len() {
-                                    bytes[offset] = shade as u8;
-                                    bytes[offset + 1] = (shade / 2 + 50) as u8;
-                                    bytes[offset + 2] = 255;
-                                    bytes[offset + 3] = 255;
-                                }
-                            }
-                        }
-                    }
+                    crate::window::paint_status(
+                        map.as_mut_slice(),
+                        stride as u32,
+                        w,
+                        h,
+                        &status,
+                        [200, 200, 200],
+                    );
                 }
                 surface.wl_surface.attach(Some(&surface.buffer), 0, 0);
-                let ox = (cx - 80).max(0);
-                let oy = (cy - 80).max(0);
-                surface.wl_surface.damage(ox, oy, (width - ox).min(160), (height - oy).min(160));
+                surface.wl_surface.damage(0, 0, w as i32, h as i32);
                 surface.wl_surface.commit();
             }
+        }
+
+        /// Update the loading-stage or error text and repaint the placeholder.
+        pub(crate) fn set_loading_status(&mut self, text: String) {
+            if self.loading_status == text { return; }
+            self.loading_status = text;
+            self.repaint_loading();
         }
 
         /// Build the `wl_shm` buffer for a pending surface once the compositor
@@ -837,23 +794,16 @@ mod imp {
             let p = self.pending.remove(idx);
             let Some(shm) = self.shm.as_ref() else { return };
 
-            // Paint a visible placeholder so the window is not blank: a purple
-            // gradient band that makes it obvious this is PenguDroid.
+            // Paint the current boot stage or error before the first guest frame.
             if let Ok(mut map) = p.region.map_mut() {
-                let bytes = map.as_mut_slice();
-                let w = p.width.max(1);
-                for y in 0..p.height {
-                    let t = (y * 255 / p.height.max(1)) as u8;
-                    for x in 0..w {
-                        let o = (y * p.stride + x * 4) as usize;
-                        if o + 3 < bytes.len() {
-                            bytes[o] = 200u8.saturating_sub(t / 2); // B
-                            bytes[o + 1] = 80; // G
-                            bytes[o + 2] = 160u8.saturating_add(t / 3); // R
-                            bytes[o + 3] = 255; // A
-                        }
-                    }
-                }
+                crate::window::paint_status(
+                    map.as_mut_slice(),
+                    p.stride,
+                    p.width,
+                    p.height,
+                    &self.loading_status,
+                    [160, 160, 160],
+                );
             }
 
             let dup = match p.region.try_clone_fd() {
@@ -878,12 +828,14 @@ mod imp {
 
 
 
-            p.wl_surface.attach(Some(&buffer), 0, 0);
-            p.wl_surface.damage(0, 0, p.width as i32, p.height as i32);
-            if let Some(xdg) = p.xdg_surface.as_ref() {
-                xdg.set_window_geometry(0, 0, p.width as i32, p.height as i32);
+            if !self.wlegl_enabled {
+                p.wl_surface.attach(Some(&buffer), 0, 0);
+                p.wl_surface.damage(0, 0, p.width as i32, p.height as i32);
+                if let Some(xdg) = p.xdg_surface.as_ref() {
+                    xdg.set_window_geometry(0, 0, p.width as i32, p.height as i32);
+                }
+                p.wl_surface.commit();
             }
-            p.wl_surface.commit();
 
             self.surfaces.insert(
                 p.id,
@@ -1073,7 +1025,6 @@ mod imp {
         /// Called from the daemon's accept loop; the events are then pushed to
         /// the connection that subscribed for the surface.
         pub fn poll_input(&mut self) -> Vec<(u32, pengudroid_proto::InputKind)> {
-            self.state.tick_loading();
             self.drain_wayland();
             self.state.pump_maliit();
             std::mem::take(&mut self.state.input)
@@ -1211,78 +1162,53 @@ mod imp {
             };
 
             let compositor = self.state.compositor.clone()?;
-            let wm_base = self.state.wm_base.clone();
-            let shell = self.state.shell.clone();
-            if wm_base.is_none() && shell.is_none() { return None; }
             let qh = self.queue.handle();
-
             let id = self.state.alloc_id();
-            let wl_surface = match self.state.frame_compositor.as_ref() {
-                Some(compositor) => compositor.create_surface(&qh),
-                None => compositor.create_surface(&qh, ()),
-            };
-            let mut pending_xdg = None;
-            let mut pending_shell = None;
-            if let Some(wm_base) = wm_base {
-                let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
-                let xdg_toplevel = xdg_surface.get_toplevel(&qh, SurfaceId(id));
-                xdg_toplevel.set_title(title.to_string());
-                // Prefer server-side framing where it is offered, and use a host
-                // client-side frame when the compositor declines or lacks it.
-                if let Some(manager) = self.state.decoration.clone() {
-                    let decoration = manager.get_toplevel_decoration(&xdg_toplevel, &qh, SurfaceId(id));
-                    decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+            let parts = crate::window::create_toplevel(
+                &compositor,
+                self.state.frame_compositor.as_deref(),
+                self.state.wm_base.as_ref(),
+                self.state.shell.as_ref(),
+                self.state.decoration.as_ref(),
+                self.state.surface_extension.as_ref(),
+                &qh,
+                SurfaceId(id),
+                width,
+                height,
+                title,
+                self.state.viewporter.is_some(),
+            )?;
+            let crate::window::ToplevelParts {
+                wl_surface,
+                xdg_surface,
+                xdg_toplevel,
+                shell_surface,
+                decoration,
+                extended,
+            } = parts;
+            let legacy_shell = shell_surface.is_some();
+
+            if let Some(toplevel) = xdg_toplevel {
+                // Prefer server-side framing where offered. Without it,
+                // configure_window installs the host client-side title bar.
+                if let Some(decoration) = decoration {
                     self.state.decorations.insert(id, decoration);
                 } else {
                     self.state.client_decorated.insert(id);
                 }
-                // A viewport can scale existing guest buffers during interactive
-                // resize. Without it, do not advertise unsupported resizing.
-                if self.state.viewporter.is_none() {
-                    xdg_toplevel.set_min_size(width as i32, height as i32);
-                    xdg_toplevel.set_max_size(width as i32, height as i32);
-                } else { xdg_toplevel.set_min_size(160, 120); }
-                self.state.toplevels.insert(id, xdg_toplevel);
-                pending_xdg = Some(xdg_surface);
-            } else if let Some(shell) = shell {
-                let shell_surface = shell.get_shell_surface(&wl_surface, &qh, SurfaceId(id));
-                shell_surface.set_toplevel();
-                shell_surface.set_title(title.to_string());
-                shell_surface.set_class("io.github.denizomer10.PenguDroid".to_string());
-                pending_shell = Some(shell_surface);
+                self.state.toplevels.insert(id, toplevel);
             }
-            let legacy_shell = pending_shell.is_some();
-            if let Some(extension) = self.state.surface_extension.as_ref() {
-                let extended = extension.get_extended_surface(&wl_surface, &qh, SurfaceId(id));
-                extended.set_content_orientation_mask(1 | 2 | 4 | 8);
-                extended.set_window_flags(0);
-                extended.update_generic_property(
-                    "BACKGROUND_VISIBLE".to_string(),
-                    crate::qt_extended_surface::qvariant_bool(true),
-                );
-                extended.update_generic_property(
-                    "WINDOW_OPACITY".to_string(),
-                    crate::qt_extended_surface::qvariant_double(1.0),
-                );
-                extended.update_generic_property(
-                    "WINID".to_string(),
-                    crate::qt_extended_surface::qvariant_u64(wl_surface.id().protocol_id() as u64),
-                );
-                extended.update_generic_property(
-                    "STATUSBAR_VISIBLE".to_string(),
-                    crate::qt_extended_surface::qvariant_bool(true),
-                );
+            if let Some(extended) = extended {
                 self.state.extended_surfaces.insert(id, extended);
                 crate::info!("surface {id} has qt_extended_surface");
             }
-            wl_surface.commit();
 
             self.state.pending.push(Pending {
                 id,
                 width,
                 height,
-                xdg_surface: pending_xdg,
-                shell_surface: pending_shell,
+                xdg_surface,
+                shell_surface,
                 wl_surface,
                 region,
                 stride,
@@ -1684,6 +1610,11 @@ mod imp {
             true
         }
 
+        /// Forward a loading-stage or error message to the placeholder screen.
+        pub fn set_loading_status(&mut self, text: String) {
+            self.state.set_loading_status(text);
+        }
+
         pub fn set_surface_options(&mut self, id: u32, enabled: bool) -> bool {
             let Some(surface) = self.state.surfaces.get_mut(&id) else { return false };
             surface.fps_meter = enabled;
@@ -1753,6 +1684,10 @@ mod imp {
             }
             if self.state.ime_surface == Some(id) {
                 self.state.ime_surface = None;
+            }
+            if let Some(presenter) = self.state.egl_presenter.as_mut() {
+                // wl_egl_window must be destroyed before its wl_surface.
+                presenter.destroy_surface(id);
             }
             let Some(surface) = self.state.surfaces.remove(&id) else { return false };
             if let Some(t) = surface.xdg_toplevel {
@@ -2000,56 +1935,37 @@ mod imp {
             format: i32,
             usage: i32,
         ) -> Result<(), String> {
-            if !self.frame_slot_available(id)? { return Ok(()); }
-            let wlegl = self.state.wlegl.clone()
-                .ok_or("android_wlegl is not advertised by the compositor")?;
             if !self.state.wlegl_enabled {
                 return Err("android_wlegl presentation is disabled".into());
             }
-            // One native handle -> one wl_buffer for the whole surface's life.
-            // The int words identify the allocation even though the fds are
-            // duplicated on every present.
-            let key = (id, fnv1a_ints(&ints));
-            let buffer = if let Some((buffer, _fds)) = self.state.wlegl_buffers.get(&key) {
-                buffer.clone()
-            } else {
-                crate::info!(
-                    "wlegl new wl_buffer: surface={id} key={:#x} ints={ints:?} total={}",
-                    key.1,
-                    self.state.wlegl_buffers.len() + 1
-                );
-                let qh = self.queue.handle();
-                let handle = wlegl.create_handle(fds.len() as i32, ints_as_bytes(&ints), &qh, ());
-                for fd in &fds {
-                    handle.add_fd(fd.as_fd());
+            // The daemon owns a real EGLSurface on the guest's wl_surface and
+            // presents through eglSwapBuffers, so the Wayland EGL driver
+            // handles the compositor fence (which the manual android_wlegl
+            // wl_buffer path could not provide).
+            if self.state.egl_presenter.is_none() {
+                let display_ptr = self.conn.backend().display_ptr() as *mut std::ffi::c_void;
+                match crate::egl::Presenter::new(display_ptr) {
+                    Ok(presenter) => self.state.egl_presenter = Some(presenter),
+                    Err(error) => return Err(format!("EGL presenter init failed: {error}")),
                 }
-                // stride is in pixels for Android native buffers, not bytes.
-                let buffer = wlegl.create_buffer(
-                    width as i32, height as i32, (stride / 4) as i32, format, usage, &handle, &qh, (),
-                );
-                handle.destroy();
-                self.state.wlegl_buffers.insert(key, (buffer.clone(), fds));
-                buffer
-            };
-            let surface = self.state.surfaces.get_mut(&id).ok_or("surface disappeared")?;
-            surface.loading = false;
-            // Lipstick ignores wl_surface buffer transforms, so the guest has
-            // already flipped this buffer on the GPU before presenting it.
-            surface.wl_surface.set_buffer_transform(wl_output::Transform::Normal);
-            surface.wl_surface.attach(Some(&buffer), 0, 0);
-            surface.wl_surface.damage(0, 0, surface.display_width as i32, surface.display_height as i32);
-            surface.wl_surface.commit();
-            surface.pending_frames.push(PendingFrame {
-                buffer,
-                _fd: None,
-                _native_fds: Vec::new(),
-            });
-            self.conn.flush().map_err(|e| e.to_string())?;
+            }
+            let wl_surface = self.state.surfaces.get(&id)
+                .ok_or("surface disappeared")?.wl_surface.clone();
+            let presenter = self.state.egl_presenter.as_mut().unwrap();
+            presenter.create_surface(id, &wl_surface, width, height)?;
+            presenter.present(id, &fds, &ints, width, height, stride / 4, format, usage)?;
+            // eglSwapBuffers issues attach/commit on this same connection.
+            // Flush immediately; otherwise a new UI frame can sit queued until
+            // an unrelated compositor event wakes the daemon.
+            self.conn.flush().map_err(|e| format!("Wayland flush after EGL swap: {e}"))?;
+            if let Some(surface) = self.state.surfaces.get_mut(&id) {
+                surface.loading = false;
+            }
             self.record_frame(id);
             self.vsync_note_present(id);
             static REPORTED: std::sync::Once = std::sync::Once::new();
             REPORTED.call_once(|| {
-                crate::info!("guest frames now presented through android_wlegl (GPU native buffers)");
+                crate::info!("guest frames presented through daemon EGL (eglSwapBuffers)");
             });
             Ok(())
         }

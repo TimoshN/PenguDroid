@@ -90,6 +90,9 @@ pub struct Daemon {
     /// of "its" window without knowing the surface id (the GL shim owns that).
     surface_owner: Mutex<std::collections::HashMap<u32, i32>>,
     surface_processes: Mutex<std::collections::HashMap<i32, crate::lifecycle::GuestProcess>>,
+    /// All guest pids seen in Hello, so a daemon shutdown tears down the whole
+    /// guest tree instead of leaving orphaned `__art` processes behind.
+    guest_pids: Mutex<std::collections::HashSet<i32>>,
     /// Real ViewRoot metadata, keyed by the native Surface consumed by HWUI.
     window_layers: Mutex<std::collections::HashMap<u64, WindowLayerState>>,
     next_window_generation: AtomicU64,
@@ -155,6 +158,7 @@ impl Daemon {
             input_sinks: Mutex::new(std::collections::HashMap::new()),
             surface_owner: Mutex::new(std::collections::HashMap::new()),
             surface_processes: Mutex::new(std::collections::HashMap::new()),
+            guest_pids: Mutex::new(std::collections::HashSet::new()),
             window_layers: Mutex::new(std::collections::HashMap::new()),
             next_window_generation: AtomicU64::new(1),
             vsync_sinks: Mutex::new(std::collections::HashMap::new()),
@@ -181,6 +185,18 @@ impl Daemon {
             self.services.lock().unwrap().count(),
             self.props.lock().unwrap().len(),
         )
+    }
+
+    /// Kill every registered guest (`__art` and its children) so no guest
+    /// outlives the daemon. Called once the accept loop stops.
+    pub fn kill_all_guests(&self) {
+        let pids: Vec<i32> = self.guest_pids.lock().unwrap().drain().collect();
+        for pid in pids {
+            if pid > 0 && pid != std::process::id() as i32 {
+                crate::info!("daemon shutdown: killing guest pid {pid}");
+                unsafe { libc::kill(pid, libc::SIGKILL); }
+            }
+        }
     }
 
     /// Accept loop. Runs until [`SHUTDOWN`] is set (SIGTERM/SIGINT) or `Shutdown`
@@ -383,6 +399,15 @@ impl Daemon {
             run.status = Some(exit);
         }
         crate::info!("guest pid {pid} exited ({})", exit.describe());
+        // Surface the failure on the placeholder instead of a silent spinner.
+        let description = exit.describe();
+        let is_error = !description.contains("0") || description.to_lowercase().contains("error")
+            || description.to_lowercase().contains("signal");
+        if is_error {
+            if let Some(graphics) = self.graphics.lock().unwrap().as_mut() {
+                graphics.set_loading_status(format!("GUEST EXITED: {}", description.to_uppercase()));
+            }
+        }
     }
 
     /// Reap `RunApk` children.
@@ -448,6 +473,12 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
                 "peer connected: role={role:?} pid={pid} (vsync-only={})",
                 pid == 0 && role == pengudroid_proto::Role::Guest
             );
+            if pid > 0 && role == pengudroid_proto::Role::Guest {
+                daemon.guest_pids.lock().unwrap().insert(pid);
+                if let Some(graphics) = daemon.graphics.lock().unwrap().as_mut() {
+                    graphics.set_loading_status("GUEST CONNECTED, STARTING APPLICATION...".into());
+                }
+            }
             (role, pid)
         }
         other => {

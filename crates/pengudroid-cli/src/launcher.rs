@@ -1125,11 +1125,10 @@ fn apply_aurora_package_env(
         if !overridden("PENGUDROID_GRALLOC_SHM") {
             cmd.env("PENGUDROID_GRALLOC_SHM", "1");
         }
-        // android_wlegl stays opt-in: Lipstick accepts the native buffer, but
-        // GPU writes into it are not fenced to the compositor, so a guest that
-        // renders with the GPU would show only the first imported frame.
-        // Enable explicitly with PENGUDROID_GRALLOC_WLEGL=1 for further work
-        // on synchronization; wl_shm is the working default.
+        // The daemon's WLEGL path imports guest gralloc buffers as EGLImages
+        // and presents through its own EGLSurface/eglSwapBuffers. Keep it
+        // opt-in until enough applications are verified on the target driver;
+        // wl_shm remains the working default.
         // The compositor frame clock is likewise opt-in
         // (PENGUDROID_VSYNC_COMPOSITOR=1); the existing hosted
         // requestNextVsync path remains the default.

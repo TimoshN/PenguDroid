@@ -38,6 +38,8 @@ mod runtime;
 mod sysroot;
 mod telephony;
 #[cfg(feature = "wlegl-probe")]
+mod wl_shm;
+#[cfg(feature = "wlegl-probe")]
 mod wlegl;
 
 use pengudroid_proto::{default_socket_path, InputKind, Message, Role, PROTO_VERSION};
@@ -834,7 +836,7 @@ fn print_help() {
          \x20   video-decode-test <one-frame.h264>           verify hardware decode + GPU export\n\
          \x20   gpu-test                                    render offscreen on the GPU + export a dmabuf\n\
          \x20   wlegl-probe [--width W] [--height H] [--seconds S] [--hold]\n\
-         \x20                                              share a gralloc buffer with the compositor via android_wlegl\n\
+         \x20                [--window|--egl|--shm]         test GPU presentation; --window paints red without wl_shm\n\
          \x20   audio-test [--seconds N] [--tone]           play silence (or a tone) through PipeWire\n\
          \x20   nativelib <lib.so> [--call SYM] [--lib-dir D]  de-bionic + dlopen (+ call) a .so\n\
          \x20   nativelib --apk <app.apk> [--abi <abi>]      load an APK's own native libraries\n\

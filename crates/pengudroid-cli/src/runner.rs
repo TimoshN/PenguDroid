@@ -36,7 +36,11 @@ pub fn daemon_command(binary: &Path) -> Command {
         // into the broker process itself; the daemon is spawned before any
         // guest-specific environment is applied.
         // Opt-in only: forward these switches when the caller set them.
-        for name in ["PENGUDROID_GRALLOC_WLEGL", "PENGUDROID_VSYNC_COMPOSITOR"] {
+        for name in [
+            "PENGUDROID_GRALLOC_WLEGL",
+            "PENGUDROID_VSYNC_COMPOSITOR",
+            "PENGUDROID_EGL_RED_TEST",
+        ] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }

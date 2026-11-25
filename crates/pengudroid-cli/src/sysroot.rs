@@ -868,13 +868,23 @@ fn geometry_for_launch(
     height: Option<u32>,
     density: Option<i32>,
 ) -> crate::geometry::Geometry {
-    let inherited = crate::geometry::Geometry::from_env();
+    resolve_launch_geometry(crate::geometry::Geometry::from_env(), width, height, density)
+}
+
+fn resolve_launch_geometry(
+    inherited: crate::geometry::Geometry,
+    width: Option<u32>,
+    height: Option<u32>,
+    density: Option<i32>,
+) -> crate::geometry::Geometry {
     let px = |requested: Option<u32>, fallback: i32| requested.unwrap_or(fallback as u32);
     if width.is_some() || height.is_some() {
         crate::geometry::Geometry::for_window(
             px(width, inherited.width),
             px(height, inherited.height),
-            density,
+            // Pixel-size flags must not discard the density exported by the
+            // Aurora launcher. Only an explicit --density replaces it.
+            Some(density.unwrap_or(inherited.density_dpi)),
         )
     } else if density.is_some() {
         crate::geometry::Geometry::for_window(inherited.width as u32, inherited.height as u32, density)
@@ -2805,6 +2815,19 @@ fn run_main(env: &crate::jni::JniEnv, class: &str, args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pixel_size_preserves_inherited_density() {
+        let inherited = crate::geometry::Geometry::for_window(720, 1280, Some(420));
+        let resolved = resolve_launch_geometry(inherited, Some(1080), Some(2460), None);
+        assert_eq!(resolved.density_dpi, 420);
+        assert_eq!((resolved.width, resolved.height), (1080, 2460));
+        assert_eq!((resolved.width_dp(), resolved.height_dp()), (411, 937));
+
+        let explicit = resolve_launch_geometry(inherited, Some(1080), Some(2460), Some(480));
+        assert_eq!(explicit.density_dpi, 480);
+        assert_eq!(resolve_launch_geometry(inherited, None, None, None), inherited);
+    }
 
     #[test]
     fn binding_without_classpath_fails_before_accessing_jni() {

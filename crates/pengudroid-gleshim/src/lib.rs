@@ -491,8 +491,36 @@ fn hybris_host() -> bool {
         && std::path::Path::new(egl).is_file()
 }
 
+/// Watchdog: if the daemon dies without cleaning up (e.g. SIGKILL), the guest
+/// must not keep running orphaned. Probe the control socket periodically and
+/// exit once the daemon is gone for good.
+fn start_daemon_watchdog() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        std::thread::spawn(|| {
+            let mut failures = 0u32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                match Connection::connect_endpoint(&default_socket_path()) {
+                    Ok(_) => failures = 0,
+                    Err(_) => {
+                        failures += 1;
+                        if failures >= 3 {
+                            eprintln!("[gleshim] daemon disappeared; terminating orphaned guest");
+                            unsafe { libc::_exit(0); }
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+
 fn host() -> Result<&'static Host, String> {
-    HOST.get_or_init(Host::load).as_ref().map_err(Clone::clone)
+    HOST.get_or_init(|| {
+        start_daemon_watchdog();
+        Host::load()
+    }).as_ref().map_err(Clone::clone)
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
@@ -1086,7 +1114,11 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
     }
     let target = rec.targets.iter_mut().find(|t| t.group == info.group).unwrap();
     target.fbos.push((info.serial, fbo));
+    // The daemon's EGL presenter samples the guest texture directly,
+    // so the guest renders its gralloc allocation with no extra flip pass.
+    let direct_wlegl = gralloc::wlegl_requested();
     if target.gralloc.is_some() && target.flip.is_none()
+        && !direct_wlegl
         && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some()
     {
         match gralloc::create_gralloc_flip(host, rec.w, rec.h) {

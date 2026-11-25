@@ -7,6 +7,7 @@
 //! Module map:
 //! * [`server`]   — shared state, accept loop, message dispatch
 //! * [`graphics`] — Wayland translation of the Android surface model
+//! * `window`     — toplevel creation and the dark status-text texture
 //! * [`binder`]   — kernel binder probe + userspace broker wiring
 //! * [`services`] — the service registry and transaction routing
 //! * [`ashmem`]   — `memfd`-backed ashmem regions
@@ -28,6 +29,8 @@ pub mod props;
 pub mod qt_extended_surface;
 pub mod server;
 pub mod wlegl;
+#[cfg(feature = "wayland")]
+mod window;
 pub mod services;
 pub mod stubs;
 mod software;
@@ -36,3 +39,4 @@ mod entry;
 
 pub use server::Daemon;
 pub use entry::real_main;
+pub mod egl;

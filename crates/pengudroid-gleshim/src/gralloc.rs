@@ -49,7 +49,7 @@ fn wlegl_handle(handle: *mut c_void) -> Option<WleglHandle> {
 /// True when the launcher opted into the compositor's native-buffer transport.
 /// It needs no capability probe on the guest side: the daemon decides and
 /// falls back to wl_shm if the compositor lacks `android_wlegl`.
-fn wlegl_requested() -> bool {
+pub(super) fn wlegl_requested() -> bool {
     env_truthy("PENGUDROID_GRALLOC_WLEGL")
 }
 
@@ -339,7 +339,7 @@ unsafe fn shader_flip_draw(
 /// Flip the native texture on the GPU because Lipstick's wl_shell ignores
 /// wl_buffer transforms. No CPU readback is involved.
 pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
-    if std::env::var_os("PENGUDROID_GRALLOC_SHM").is_none() {
+    if std::env::var_os("PENGUDROID_GRALLOC_SHM").is_none() || wlegl_requested() {
         return;
     }
     let rec = &mut *(surface as *mut SurfaceRec);
@@ -376,7 +376,8 @@ pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
     bind(0x8CA8, read_fbo); // GL_READ_FRAMEBUFFER
     bind(0x8CA9, write_fbo); // GL_DRAW_FRAMEBUFFER
     let mut flipped = false;
-    if std::env::var_os("PENGUDROID_GRALLOC_SHADER_FLIP").is_some() {
+    let shader_flip = std::env::var_os("PENGUDROID_GRALLOC_SHADER_FLIP").is_some();
+    if shader_flip {
         flipped = shader_flip_draw(host, info.serial, target.tex, rec.w, rec.h);
     }
     if !flipped {
@@ -438,11 +439,17 @@ pub(super) unsafe fn present_gralloc(surface: EGLSurface) -> Result<(), String> 
         .rev()
         .find(|target| target.group == info.group)
         .and_then(|target| {
-            target
-                .flip
-                .as_ref()
-                .map(|flip| &flip.buffers[flip.last].target)
-                .or(target.gralloc.as_ref())
+            // With android_wlegl the daemon samples this surface allocation
+            // directly, so no auxiliary guest flip target is involved.
+            if wlegl_requested() {
+                target.gralloc.as_ref()
+            } else {
+                target
+                    .flip
+                    .as_ref()
+                    .map(|flip| &flip.buffers[flip.last].target)
+                    .or(target.gralloc.as_ref())
+            }
         })
         .ok_or_else(|| "surface has no gralloc target for the current context".to_string())?;
     let fd = libc::dup(target.fd);
@@ -489,6 +496,8 @@ unsafe fn sync_gralloc_for_present(
         &mut vaddr,
     );
     if rc == 0 {
+        // Cache invalidation only. With WLEGL the daemon samples the native
+        // texture directly, so no pixel write is needed here.
         let _ = (api.unlock)(target.handle);
     }
 }
@@ -948,7 +957,7 @@ struct ProbeNativeWindowBuffer {
     reserved_proc: [*mut c_void; 7],
 }
 
-type GrallocInitialize = unsafe extern "C" fn(c_int) -> c_int;
+type GrallocInitialize = unsafe extern "C" fn(c_int);
 type GrallocAllocate =
     unsafe extern "C" fn(u32, u32, c_int, u32, *mut *mut c_void, *mut u32) -> c_int;
 type GrallocRelease = unsafe extern "C" fn(*mut c_void, c_int);
@@ -1441,7 +1450,7 @@ unsafe fn probe_gralloc() -> Result<(), String> {
             )
         }
     })?;
-    type Initialize = unsafe extern "C" fn(c_int) -> c_int;
+    type Initialize = unsafe extern "C" fn(c_int);
     type Allocate = unsafe extern "C" fn(u32, u32, c_int, u32, *mut *mut c_void, *mut u32) -> c_int;
     type Release = unsafe extern "C" fn(*mut c_void, c_int);
     type Deinitialize = unsafe extern "C" fn();

@@ -40,8 +40,7 @@ use std::time::{Duration, Instant};
 
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_shell, wl_shell_surface,
-    wl_surface,
+    wl_buffer, wl_compositor, wl_registry, wl_shell, wl_shell_surface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 
@@ -54,7 +53,7 @@ const FORMAT_BGRA_8888: i32 = 5;
 /// `GRALLOC_USAGE_SW_READ_OFTEN | SW_WRITE_OFTEN | HW_TEXTURE | HW_RENDER`.
 const USAGE_LINEAR_TEXTURE: u32 = 0x303;
 
-type GrallocInitialize = unsafe extern "C" fn(i32) -> i32;
+type GrallocInitialize = unsafe extern "C" fn(i32);
 type GrallocAllocate =
     unsafe extern "C" fn(u32, u32, i32, u32, *mut *mut c_void, *mut u32) -> i32;
 type GrallocRelease = unsafe extern "C" fn(*mut c_void, i32);
@@ -640,7 +639,7 @@ unsafe fn resolve_proc<T: Copy>(get_proc: EglGetProcAddress, symbol: &str) -> Re
 }
 
 #[derive(Default)]
-struct State {
+pub(crate) struct State {
     releases: u32,
     pings: u32,
 }
@@ -662,8 +661,6 @@ macro_rules! empty_dispatch {
 }
 
 empty_dispatch!(wl_compositor::WlCompositor);
-empty_dispatch!(wl_shm::WlShm);
-empty_dispatch!(wl_shm_pool::WlShmPool);
 // `registry_queue_init` keeps the global list itself, so the registry object
 // only needs to accept the bookkeeping events it never delivers here.
 impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for State {
@@ -766,6 +763,9 @@ struct Options {
     /// Render each frame on the GPU into the presented gralloc allocation
     /// (EGLImage -> FBO) instead of writing pixels with the CPU.
     egl: bool,
+    /// Test a real wl_egl_window + eglCreateWindowSurface + eglSwapBuffers
+    /// instead of the manual android_wlegl buffer path.
+    window: bool,
 }
 
 impl Options {
@@ -780,6 +780,7 @@ impl Options {
             reimport: false,
             shm: false,
             egl: false,
+            window: false,
         };
         let mut index = 0;
         while index < args.len() {
@@ -809,6 +810,10 @@ impl Options {
                 }
                 "--egl" => {
                     options.egl = true;
+                    index += 1;
+                }
+                "--window" => {
+                    options.window = true;
                     index += 1;
                 }
                 "--shm" => {
@@ -876,23 +881,45 @@ fn probe(args: &[String]) -> Result<(), String> {
         }
     });
 
-    let Some(wlegl_name) = wlegl_name else {
-        return Err(
-            "the compositor does not advertise android_wlegl; this transport is unavailable"
-                .into(),
-        );
-    };
-    println!("android_wlegl: global {wlegl_name} v{wlegl_version}");
-
     let compositor: wl_compositor::WlCompositor = globals
         .bind(&qh, 1..=4, ())
         .map_err(|e| format!("wl_compositor unavailable: {e}"))?;
     let shell: wl_shell::WlShell = globals
         .bind(&qh, 1..=1, ())
         .map_err(|e| format!("wl_shell unavailable (needed for the Aurora window role): {e}"))?;
-    let wlegl: AndroidWlegl = globals
-        .registry()
-        .bind(wlegl_name, wlegl_version.min(1), &qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let shell_surface = shell.get_shell_surface(&surface, &qh, ());
+    shell_surface.set_toplevel();
+    shell_surface.set_title(if options.window {
+        "PenguDroid EGL red-window probe".to_string()
+    } else {
+        "PenguDroid android_wlegl probe".to_string()
+    });
+    shell_surface.set_class("io.github.denizomer10.PenguDroid.wlegl-probe".to_string());
+
+    // The EGL window test deliberately has no dependency on wl_shm,
+    // android_wlegl, or gralloc. Keep it ahead of all native-buffer setup so a
+    // failure in those unrelated paths cannot prevent this basic test.
+    if options.window {
+        return unsafe { run_window_test(&conn, &mut queue, &surface, &options) };
+    }
+
+    let wlegl = if options.shm {
+        None
+    } else {
+        let Some(wlegl_name) = wlegl_name else {
+            return Err(
+                "the compositor does not advertise android_wlegl; this transport is unavailable"
+                    .into(),
+            );
+        };
+        println!("android_wlegl: global {wlegl_name} v{wlegl_version}");
+        Some(
+            globals
+                .registry()
+                .bind(wlegl_name, wlegl_version.min(1), &qh, ()),
+        )
+    };
 
     let mut buffers = Vec::with_capacity(options.buffers);
     for _ in 0..options.buffers {
@@ -908,12 +935,6 @@ fn probe(args: &[String]) -> Result<(), String> {
         first.ints.len(),
         buffers.len()
     );
-
-    let surface = compositor.create_surface(&qh, ());
-    let shell_surface = shell.get_shell_surface(&surface, &qh, ());
-    shell_surface.set_toplevel();
-    shell_surface.set_title("PenguDroid android_wlegl probe".to_string());
-    shell_surface.set_class("io.github.denizomer10.PenguDroid.wlegl-probe".to_string());
 
     // The compositor keeps whatever buffer it is displaying and releases it
     // only once another buffer replaces it, so a single buffer can never
@@ -934,19 +955,25 @@ fn probe(args: &[String]) -> Result<(), String> {
 
     let mut wl_buffers = Vec::with_capacity(buffers.len());
     if options.shm {
-        let shm: wl_shm::WlShm = globals
-            .bind(&qh, 1..=2, ())
-            .map_err(|e| format!("wl_shm unavailable: {e}"))?;
+        let shm = crate::wl_shm::bind(&globals, &qh)?;
         for buffer in &buffers {
-            wl_buffers.push(create_shm_buffer(&shm, buffer, &qh)?);
+            wl_buffers.push(crate::wl_shm::create_buffer(
+                &shm,
+                buffer.shm_fd,
+                buffer.width,
+                buffer.height,
+                buffer.stride,
+                &qh,
+            )?);
         }
         println!(
             "wl_shm: created {} buffers from the same gralloc allocation",
             wl_buffers.len()
         );
     } else {
+        let wlegl = wlegl.as_ref().expect("bound above for the wlegl path");
         for buffer in &buffers {
-            wl_buffers.push(create_buffer(&wlegl, buffer, &qh)?);
+            wl_buffers.push(create_buffer(wlegl, buffer, &qh)?);
         }
         println!(
             "android_wlegl: created {} wl_buffers from the native handles",
@@ -983,7 +1010,11 @@ fn probe(args: &[String]) -> Result<(), String> {
             }
             if options.reimport && !options.shm {
                 // A new wl_buffer forces a new import on the compositor side.
-                let fresh = create_buffer(&wlegl, &buffers[index], &qh)?;
+                let fresh = create_buffer(
+                    wlegl.as_ref().expect("bound above for the wlegl path"),
+                    &buffers[index],
+                    &qh,
+                )?;
                 present_frame(&surface, &fresh, options.width, options.height)?;
                 wl_buffers[index] = fresh;
             } else {
@@ -1093,44 +1124,6 @@ fn dispatch_with_timeout(
     Ok(())
 }
 
-/// Present the very same gralloc allocation the way the guest path does: as a
-/// `wl_shm` pool created from a mmap-able fd. Lipstick then reads the pixels
-/// from CPU-visible memory instead of importing a GPU buffer.
-fn create_shm_buffer(
-    shm: &wl_shm::WlShm,
-    buffer: &NativeBuffer,
-    qh: &QueueHandle<State>,
-) -> Result<wl_buffer::WlBuffer, String> {
-    if buffer.shm_fd < 0 {
-        return Err("the gralloc allocation has no mmap-able fd for wl_shm".into());
-    }
-    let duplicate = unsafe { libc::dup(buffer.shm_fd) };
-    if duplicate < 0 {
-        return Err(format!(
-            "cannot duplicate the gralloc fd: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let size = buffer.stride as i32 * buffer.height as i32 * 4;
-    // SAFETY: `duplicate` is a fresh fd owned by this scope; the pool request
-    // passes it to the compositor over SCM_RIGHTS.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(duplicate) };
-    let pool = shm.create_pool(borrowed, size, qh, ());
-    let wl_buffer = pool.create_buffer(
-        0,
-        buffer.width as i32,
-        buffer.height as i32,
-        buffer.stride as i32 * 4,
-        wl_shm::Format::Xrgb8888,
-        qh,
-        (),
-    );
-    pool.destroy();
-    // The compositor holds its own reference to the pool memory.
-    unsafe { libc::close(duplicate) };
-    Ok(wl_buffer)
-}
-
 fn create_buffer(
     wlegl: &AndroidWlegl,
     buffer: &NativeBuffer,
@@ -1158,4 +1151,175 @@ fn create_buffer(
     );
     handle.destroy();
     Ok(wl_buffer)
+}
+
+/// Isolated red-window check: wl_shell + wl_egl_window + EGL/GLES only.
+/// No wl_shm pool, android_wlegl handle, gralloc allocation, or CPU pixel
+/// buffer is involved. eglSwapBuffers attaches the GPU-rendered frame directly
+/// to the wl_surface.
+unsafe fn run_window_test(
+    conn: &wayland_client::Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    surface: &wl_surface::WlSurface,
+    options: &Options,
+) -> Result<(), String> {
+    type GetPlatformDisplay =
+        unsafe extern "C" fn(u32, *mut c_void, *const isize) -> *mut c_void;
+    type BindApi = unsafe extern "C" fn(u32) -> u32;
+    type CreateWindowSurface = unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *const i32,
+    ) -> *mut c_void;
+    type SwapBuffers = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+    type DestroySurface = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+    type DestroyContext = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+    type Terminate = unsafe extern "C" fn(*mut c_void) -> u32;
+
+    let width = options.width;
+    let height = options.height;
+    println!("window probe: creating a {width}x{height} red EGL window (no wl_shm)");
+    // Establish the wl_shell role before the EGL driver attaches its first
+    // buffer. This is an empty commit, not a wl_shm presentation.
+    surface.commit();
+    conn.flush().map_err(|e| format!("initial Wayland flush: {e}"))?;
+
+    let window = wayland_egl::WlEglSurface::new(surface.id(), width as i32, height as i32)
+        .map_err(|e| format!("wl_egl_window_create: {e:?}"))?;
+    println!("window probe: wl_egl_window ptr={:p}", window.ptr());
+
+    let egl = libc::dlopen(c"libEGL.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+    if egl.is_null() {
+        return Err(format!("libEGL unavailable: {}", dl_error()));
+    }
+    let gles = libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+    if gles.is_null() {
+        return Err(format!("libGLESv2 unavailable: {}", dl_error()));
+    }
+
+    let get_display: GetPlatformDisplay = resolve(egl, "eglGetPlatformDisplay")?;
+    let get_error: EglGetError = resolve(egl, "eglGetError")?;
+    let initialize: EglInitialize = resolve(egl, "eglInitialize")?;
+    let bind_api: BindApi = resolve(egl, "eglBindAPI")?;
+    let choose_config: EglChooseConfig = resolve(egl, "eglChooseConfig")?;
+    let create_window: CreateWindowSurface = resolve(egl, "eglCreateWindowSurface")?;
+    let create_context: EglCreateContext = resolve(egl, "eglCreateContext")?;
+    let make_current: EglMakeCurrent = resolve(egl, "eglMakeCurrent")?;
+    let swap_buffers: SwapBuffers = resolve(egl, "eglSwapBuffers")?;
+    let destroy_surface: DestroySurface = resolve(egl, "eglDestroySurface")?;
+    let destroy_context: DestroyContext = resolve(egl, "eglDestroyContext")?;
+    let terminate: Terminate = resolve(egl, "eglTerminate")?;
+    let viewport: GlViewport = resolve(gles, "glViewport")?;
+    let clear_color: GlClearColor = resolve(gles, "glClearColor")?;
+    let clear: GlClear = resolve(gles, "glClear")?;
+
+    let display = get_display(
+        0x31D8, // EGL_PLATFORM_WAYLAND
+        conn.display().id().as_ptr() as *mut c_void,
+        std::ptr::null(),
+    );
+    if display.is_null() {
+        return Err(format!("eglGetPlatformDisplay returned null: {:#x}", get_error()));
+    }
+    println!("window probe: eglGetPlatformDisplay -> {display:p}");
+    let (mut major, mut minor) = (0, 0);
+    if initialize(display, &mut major, &mut minor) != 1 {
+        return Err(format!("eglInitialize failed: {:#x}", get_error()));
+    }
+    println!("window probe: EGL {major}.{minor} initialized");
+    if bind_api(0x30A0) != 1 {
+        return Err(format!("eglBindAPI(EGL_OPENGL_ES_API) failed: {:#x}", get_error()));
+    }
+
+    let attributes = [
+        0x3033, 0x0004, // EGL_SURFACE_TYPE, EGL_WINDOW_BIT
+        0x3040, 0x0004, // EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT
+        0x3024, 8, // EGL_RED_SIZE
+        0x3023, 8, // EGL_GREEN_SIZE
+        0x3022, 8, // EGL_BLUE_SIZE
+        0x3021, 8, // EGL_ALPHA_SIZE
+        EGL_NONE,
+    ];
+    let mut config = std::ptr::null_mut();
+    let mut count = 0;
+    if choose_config(display, attributes.as_ptr(), &mut config, 1, &mut count) != 1 || count < 1 {
+        return Err(format!("eglChooseConfig found no window ES2 config: {:#x}", get_error()));
+    }
+    let egl_surface = create_window(display, config, window.ptr() as *mut c_void, std::ptr::null());
+    if egl_surface.is_null() {
+        return Err(format!("eglCreateWindowSurface failed: {:#x}", get_error()));
+    }
+    println!("window probe: eglCreateWindowSurface -> {egl_surface:p}");
+
+    let context_attributes = [EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE];
+    let context = create_context(
+        display,
+        config,
+        std::ptr::null_mut(),
+        context_attributes.as_ptr(),
+    );
+    if context.is_null() {
+        return Err(format!("eglCreateContext failed: {:#x}", get_error()));
+    }
+    if make_current(display, egl_surface, egl_surface, context) != 1 {
+        return Err(format!("eglMakeCurrent failed: {:#x}", get_error()));
+    }
+    viewport(0, 0, width as i32, height as i32);
+    clear_color(1.0, 0.0, 0.0, 1.0);
+    println!("window probe: ES2 context ready; presenting solid red frames");
+
+    let started = Instant::now();
+    let budget = if options.hold {
+        Duration::from_secs(u32::MAX as u64)
+    } else {
+        Duration::from_secs_f32(options.seconds.max(1.0))
+    };
+    let interval = Duration::from_millis(options.interval_ms);
+    let mut next_present = Instant::now();
+    let mut frames = 0u64;
+    let mut state = State::default();
+    while started.elapsed() < budget {
+        let now = Instant::now();
+        if now >= next_present {
+            clear(0x4000); // GL_COLOR_BUFFER_BIT
+            if swap_buffers(display, egl_surface) != 1 {
+                return Err(format!(
+                    "eglSwapBuffers failed on frame {}: {:#x}",
+                    frames + 1,
+                    get_error()
+                ));
+            }
+            conn.flush().map_err(|e| format!("Wayland flush after swap: {e}"))?;
+            frames += 1;
+            if frames == 1 {
+                println!("window probe: SUCCESS (first red frame swapped)");
+            }
+            next_present += interval;
+            if next_present < now {
+                next_present = now + interval;
+            }
+        }
+        let wait_ms = next_present
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(16) as i32;
+        dispatch_with_timeout(conn, queue, &mut state, wait_ms)?;
+    }
+    println!(
+        "window probe: done, {frames} red frames in {:.1}s, pings={}",
+        started.elapsed().as_secs_f32(),
+        state.pings
+    );
+
+    make_current(
+        display,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    destroy_surface(display, egl_surface);
+    destroy_context(display, context);
+    terminate(display);
+    Ok(())
 }
