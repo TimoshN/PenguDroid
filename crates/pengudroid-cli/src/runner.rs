@@ -40,6 +40,7 @@ pub fn daemon_command(binary: &Path) -> Command {
             "PENGUDROID_GRALLOC_WLEGL",
             "PENGUDROID_VSYNC_COMPOSITOR",
             "PENGUDROID_EGL_RED_TEST",
+            "PENGUDROID_FPS_LOG",
         ] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

@@ -906,6 +906,16 @@ mod imp {
             std::env::var(name).ok().is_some_and(|v| v != "0" && !v.is_empty())
         }
 
+        fn hybris_host() -> bool {
+            let egl = if cfg!(target_arch = "arm") {
+                "/usr/libexec/droid-hybris/system/lib/libEGL.so"
+            } else {
+                "/usr/libexec/droid-hybris/system/lib64/libEGL.so"
+            };
+            std::path::Path::new("/usr/lib/libhybris-common.so.1").is_file()
+                && std::path::Path::new(egl).is_file()
+        }
+
         pub fn connect() -> Option<Graphics> {
             let conn = match Connection::connect_to_env() {
                 Ok(c) => c,
@@ -943,7 +953,13 @@ mod imp {
             // v3 adds format modifiers, which we need to import GPU buffers.
             // Bind v3 for the format/modifier events. v4 requires the feedback
             // protocol instead and no longer guarantees these advertisements.
-            state.wlegl_enabled = Self::env_enabled("PENGUDROID_GRALLOC_WLEGL");
+            // The daemon may start before the launcher applies guest env.
+            // Default to native presentation on Hybris itself; explicit 0
+            // still forces the wl_shm fallback on either side.
+            state.wlegl_enabled = match std::env::var("PENGUDROID_GRALLOC_WLEGL") {
+                Ok(_) => Self::env_enabled("PENGUDROID_GRALLOC_WLEGL"),
+                Err(_) => cfg!(target_arch = "aarch64") && Self::hybris_host(),
+            };
             state.vsync_enabled = match std::env::var("PENGUDROID_VSYNC_COMPOSITOR") {
                 Ok(value) => value != "0" && !value.is_empty(),
                 // Auto: on where the native-buffer transport exists (Lipstick).
@@ -983,7 +999,8 @@ mod imp {
                     if state.wlegl_enabled { "enabled" } else { "available but disabled" }
                 );
             } else if state.wlegl_enabled {
-                crate::warn!("PENGUDROID_GRALLOC_WLEGL set but the compositor lacks android_wlegl; using wl_shm");
+                crate::warn!("compositor lacks android_wlegl; using wl_shm");
+                state.wlegl_enabled = false;
             }
             globals.contents().with_list(|list| {
                 for global in list.iter().filter(|global| global.interface == "wl_output") {
@@ -1628,7 +1645,9 @@ mod imp {
             let Some(surface) = self.state.surfaces.get(&id) else { return };
             let parent = surface.parent_id.unwrap_or(id);
             let Some(root) = self.state.surfaces.get(&parent) else { return };
-            if !root.fps_meter { return; }
+            static LOG_FPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let log_fps = *LOG_FPS.get_or_init(|| Self::env_enabled("PENGUDROID_FPS_LOG"));
+            if !root.fps_meter && !log_fps { return; }
             // If video has a separate child layer, count decoder frames rather
             // than summing UI swaps with video frames.
             if id == parent && self.state.surfaces.values().any(|s| s.parent_id == Some(parent)) { return; }
@@ -1637,10 +1656,13 @@ mod imp {
             entry.0 += 1;
             let elapsed = now.duration_since(entry.1).as_secs_f32();
             if elapsed >= 1.0 {
-                let _fps = entry.0 as f32 / elapsed;
+                let fps = entry.0 as f32 / elapsed;
                 entry.0 = 0; entry.1 = now;
-                // FPS meter overlay is rendered in-frame via MangoHud (`MANGOHUD=1`),
-                // leaving the window title clean.
+                if log_fps {
+                    // Count only frames whose present completed. Unlike the
+                    // guest overlay, this adds no GL work to the measured path.
+                    crate::info!("surface {id}: {fps:.1} FPS");
+                }
             }
         }
 

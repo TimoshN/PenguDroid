@@ -53,6 +53,15 @@ pub(super) fn wlegl_requested() -> bool {
     env_truthy("PENGUDROID_GRALLOC_WLEGL")
 }
 
+/// WLEGL uses fenced async presentation by default. The legacy SHM path keeps
+/// its historical opt-in; an explicit 0/false disables either async path.
+pub(super) fn async_requested() -> bool {
+    std::env::var("PENGUDROID_GRALLOC_ASYNC").map(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    }).unwrap_or_else(|_| wlegl_requested())
+}
+
 #[cfg(target_arch = "aarch64")]
 use super::mapped_elf_base;
 use super::{
@@ -339,7 +348,8 @@ unsafe fn shader_flip_draw(
 /// Flip the native texture on the GPU because Lipstick's wl_shell ignores
 /// wl_buffer transforms. No CPU readback is involved.
 pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
-    if std::env::var_os("PENGUDROID_GRALLOC_SHM").is_none() || wlegl_requested() {
+    if std::env::var_os("PENGUDROID_GRALLOC_SHM").is_none()
+        || (wlegl_requested() && !async_requested()) {
         return;
     }
     let rec = &mut *(surface as *mut SurfaceRec);
@@ -376,7 +386,10 @@ pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
     bind(0x8CA8, read_fbo); // GL_READ_FRAMEBUFFER
     bind(0x8CA9, write_fbo); // GL_DRAW_FRAMEBUFFER
     let mut flipped = false;
-    let shader_flip = std::env::var_os("PENGUDROID_GRALLOC_SHADER_FLIP").is_some();
+    // WLEGL async uses this pass only to select/copy into an alternate output
+    // buffer. The source is already upright, so a flipping shader is wrong.
+    let shader_flip = std::env::var_os("PENGUDROID_GRALLOC_SHADER_FLIP").is_some()
+        && !wlegl_requested();
     if shader_flip {
         flipped = shader_flip_draw(host, info.serial, target.tex, rec.w, rec.h);
     }
@@ -396,15 +409,20 @@ pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
                 disable(GL_SCISSOR_TEST);
             }
         }
+        let (dst_y0, dst_y1) = if wlegl_requested() {
+            (0, rec.h as i32) // direct copy: no second orientation flip
+        } else {
+            (rec.h as i32, 0)
+        };
         blit(
             0,
             0,
             rec.w as i32,
             rec.h as i32,
             0,
-            rec.h as i32,
+            dst_y0,
             rec.w as i32,
-            0,
+            dst_y1,
             GL_COLOR_BUFFER_BIT,
             GL_NEAREST as u32,
         );
@@ -414,7 +432,7 @@ pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
             }
         }
     }
-    if std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_none() {
+    if !async_requested() {
         if let Some(finish) = host.gl_finish {
             finish();
         }

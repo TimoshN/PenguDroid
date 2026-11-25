@@ -758,11 +758,18 @@ pub fn launch(args: &[String]) -> i32 {
                      (set PENGUDROID_NATIVE_BRIDGE_LIB)"
                 );
             }
-            // The JIT previously crashed in `nterp_op_invoke_virtual` on this
-            // framework build. Keep the safe interpreter default, but allow a
-            // controlled performance experiment without changing normal RPMs.
-            let jit = std::env::var_os("PENGUDROID_ART_JIT").is_some()
-                || env.iter().any(|(key, value)| key == "PENGUDROID_ART_JIT" && value != "0");
+            // JIT improves warm scrolling, but nterp recovery is not reliable
+            // during cold Sailjail launches (and ARM32 cannot create its code
+            // cache). Keep Xint as the safe default; explicit 1 enables the
+            // performance experiment, explicit 0 forces the interpreter.
+            let jit_flag = |value: &str| {
+                let value = value.trim();
+                value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+            };
+            let jit = std::env::var("PENGUDROID_ART_JIT").ok().map(|v| jit_flag(&v))
+                .or_else(|| env.iter().find(|(key, _)| key == "PENGUDROID_ART_JIT")
+                    .map(|(_, value)| jit_flag(value)))
+                .unwrap_or(false);
             if !jit {
                 cmd.arg("--vm-option").arg("-Xint");
             } else {
@@ -1126,9 +1133,13 @@ fn apply_aurora_package_env(
             cmd.env("PENGUDROID_GRALLOC_SHM", "1");
         }
         // The daemon's WLEGL path imports guest gralloc buffers as EGLImages
-        // and presents through its own EGLSurface/eglSwapBuffers. Keep it
-        // opt-in until enough applications are verified on the target driver;
-        // wl_shm remains the working default.
+        // and presents through its own EGLSurface/eglSwapBuffers. Use it by
+        // default on Hybris; PENGUDROID_GRALLOC_WLEGL=0 restores wl_shm.
+        if cfg!(target_arch = "aarch64") && !overridden("PENGUDROID_GRALLOC_WLEGL") {
+            // This device API set is complete on AArch64. The tested ARM32
+            // stack lacks gralloc import and EGL fence entry points.
+            cmd.env("PENGUDROID_GRALLOC_WLEGL", "1");
+        }
         // The compositor frame clock is likewise opt-in
         // (PENGUDROID_VSYNC_COMPOSITOR=1); the existing hosted
         // requestNextVsync path remains the default.

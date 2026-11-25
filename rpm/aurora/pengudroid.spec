@@ -6,7 +6,7 @@
 AutoReqProv:    no
 Name:           io.github.denizomer10.MaxNext
 Version:        0.2.1
-Release:        94.aurora
+Release:        168.aurora
 Summary:        Experimental Android compatibility layer for Aurora OS
 License:        Apache-2.0
 URL:            https://github.com/denizomer10/PenguDroid
@@ -37,6 +37,6 @@ cp -a usr %{buildroot}/
 /usr/share/icons/hicolor/*/apps/io.github.denizomer10.MaxNext.png
 
 %changelog
-* Wed Nov 25 2026 PenguDroid contributors - 0.2.1-94.aurora
+* Thu Nov 26 2026 PenguDroid contributors - 0.2.1-168.aurora
 - Add the android_wlegl transport probe (`wlegl-probe`)
 - Initial experimental AArch64 Aurora OS package.

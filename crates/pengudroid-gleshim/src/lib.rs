@@ -1116,7 +1116,7 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
     target.fbos.push((info.serial, fbo));
     // The daemon's EGL presenter samples the guest texture directly,
     // so the guest renders its gralloc allocation with no extra flip pass.
-    let direct_wlegl = gralloc::wlegl_requested();
+    let direct_wlegl = gralloc::wlegl_requested() && !gralloc::async_requested();
     if target.gralloc.is_some() && target.flip.is_none()
         && !direct_wlegl
         && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some()
@@ -1131,7 +1131,7 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
             }
             Err(error) => eprintln!("[gleshim:gralloc] GPU Y-flip unavailable: {error}"),
         }
-        if std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_some() {
+        if gralloc::async_requested() {
             let flip = target.flip.as_mut().unwrap();
             if flip.buffers.len() == 1 {
                 match gralloc::create_gralloc_flip_buffer(host, rec.w, rec.h) {
@@ -4219,7 +4219,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
     let gralloc_active = std::env::var_os("PENGUDROID_FORCE_DMABUF").is_none()
         && gralloc::has_target(surface, host);
     let async_gralloc = gralloc_active
-        && std::env::var_os("PENGUDROID_GRALLOC_ASYNC").is_some()
+        && gralloc::async_requested()
         && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some();
     if async_gralloc {
         gralloc::wait_gralloc_async_slot(surface);
