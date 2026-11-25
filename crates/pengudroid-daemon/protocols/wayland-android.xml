@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sailfish/hybris `android_wlegl`: share an Android native (gralloc) buffer with
+  the compositor as a plain wl_buffer, without wl_shm and without a dma-buf
+  global. Copied verbatim from libhybris
+  (hybris/platforms/common/wayland-android.xml, master) so the wire format is
+  the one Lipstick on Aurora actually implements.
+
+  Requests used by `pengudroid wlegl-probe`:
+    create_handle(num_fds, ints) + android_wlegl_handle.add_fd(fd)* ...
+      ints are the int32 part of Android's native_handle_t *after* the fds
+      (server rebuilds native_handle_create(num_fds, numInts)).
+    create_buffer(new_id wl_buffer, width, height, stride, format, usage, handle)
+      stride and format follow Android gralloc conventions (stride in pixels,
+      format is HAL_PIXEL_FORMAT_*), not Wayland wl_shm conventions.
+-->
+<protocol name="android">
+
+  <copyright>
+    Copyright © 2012 Collabora, Ltd.
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+    THE AUTHORS AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+    OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+    ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+    OTHER DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <interface name="android_wlegl" version="2">
+    <description summary="Android EGL graphics buffer support">
+      Interface used in the Android wrapper libEGL to share
+      graphics buffers between the server and the client.
+    </description>
+
+    <enum name="error">
+      <entry name="bad_handle" value="0" />
+      <entry name="bad_value" value="1" />
+    </enum>
+
+    <request name="create_handle">
+      <description summary="Create an Android native_handle_t object">
+        This creator method initialises the native_handle_t object
+        with everything except the file descriptors, which have to be
+        submitted separately.
+      </description>
+
+      <arg name="id" type="new_id" interface="android_wlegl_handle" />
+      <arg name="num_fds" type="int" />
+      <arg name="ints" type="array" summary="an array of int32_t" />
+    </request>
+
+    <request name="create_buffer">
+      <description summary="Create a wl_buffer from the native handle">
+        Pass the Android native_handle_t to the server and attach it
+        to the new wl_buffer object.
+
+        The android_wlegl_handle object must be destroyed immediately
+        after this request.
+      </description>
+
+      <arg name="id" type="new_id" interface="wl_buffer" />
+      <arg name="width" type="int" />
+      <arg name="height" type="int" />
+      <arg name="stride" type="int" />
+      <arg name="format" type="int" />
+      <arg name="usage" type="int" />
+      <arg name="native_handle" type="object" interface="android_wlegl_handle" />
+    </request>
+
+    <request name="get_server_buffer_handle" since="2">
+      <arg name="id" type="new_id" interface="android_wlegl_server_buffer_handle"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="format" type="int"/>
+      <arg name="usage" type="int"/>
+    </request>
+
+  </interface>
+
+  <interface name="android_wlegl_handle" version="1">
+    <description summary="An Android native_handle_t object">
+      The Android native_handle_t is a semi-opaque object, that
+      contains an EGL implementation specific number of int32
+      values and file descriptors.
+
+      We cannot send a variable size array of file descriptors
+      over the Wayland protocol, so we send them one by one.
+    </description>
+
+    <enum name="error">
+      <entry name="too_many_fds" value="0" />
+    </enum>
+
+    <request name="add_fd">
+      <arg name="fd" type="fd" />
+    </request>
+
+    <request name="destroy" type="destructor" />
+
+  </interface>
+
+  <interface name="android_wlegl_server_buffer_handle" version="1">
+    <description summary="a server allocated buffer">
+      On creation a server_side_buffer object will immediately send
+      the buffer_fd and buffer_ints events needed by the client to
+      reference the gralloc buffer, followed by the buffer event carrying
+      the wl_buffer object.
+    </description>
+    <event name="buffer_fd">
+      <arg name="fd" type="fd"/>
+    </event>
+    <event name="buffer_ints">
+      <arg name="ints" type="array"/>
+    </event>
+    <event name="buffer">
+      <description summary="the wl_buffer">
+        This event will be sent after the ints and all the fds have been sent
+      </description>
+      <arg name="buffer" type="new_id" interface="wl_buffer"/>
+      <arg name="format" type="int"/>
+      <arg name="stride" type="int"/>
+    </event>
+  </interface>
+
+</protocol>

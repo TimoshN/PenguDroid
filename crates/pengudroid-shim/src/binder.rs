@@ -18,9 +18,12 @@
 use std::ffi::CStr;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, Once, OnceLock};
 
 use libc::{c_int, c_ulong, c_void};
+
+use pengudroid_proto::{default_socket_path, InputKind, Message, Role, PROTO_VERSION};
+use pengudroid_socket::Connection;
 
 use crate::mediasession::Operation;
 
@@ -2235,6 +2238,10 @@ fn require_api37() -> Result<(), String> {
 
 /// The measured API-37 event layout; only the preferred timeline is populated.
 fn vsync_event(vsync_time: i64, frame: u32) -> [u8; DISPLAY_EVENT_SIZE] {
+    vsync_event_with_interval(vsync_time, frame, frame_interval_ns())
+}
+
+fn vsync_event_with_interval(vsync_time: i64, frame: u32, interval_ns: i64) -> [u8; DISPLAY_EVENT_SIZE] {
     let mut event = [0u8; DISPLAY_EVENT_SIZE];
     event[0..4].copy_from_slice(&DISPLAY_EVENT_VSYNC.to_ne_bytes());
     // displayId stays 0 (the hosted display).
@@ -2251,6 +2258,193 @@ fn vsync_event(vsync_time: i64, frame: u32) -> [u8; DISPLAY_EVENT_SIZE] {
     event
 }
 
+// ---------------------------------------------------------------------------
+// Compositor-clocked vsync (daemon `wl_surface.frame` -> DisplayEvent)
+// ---------------------------------------------------------------------------
+
+/// Latest compositor frame pulse and how to wait for the next one.
+struct CompositorClock {
+    state: Mutex<(i64, i64, u64)>,
+    ready: Condvar,
+}
+
+fn compositor_clock() -> &'static CompositorClock {
+    static CLOCK: OnceLock<CompositorClock> = OnceLock::new();
+    CLOCK.get_or_init(|| CompositorClock {
+        state: Mutex::new((0, VSYNC_FRAME_INTERVAL_NS, 0)),
+        ready: Condvar::new(),
+    })
+}
+
+fn compositor_vsync_requested() -> bool {
+    // Auto: on Hybris (Aurora), where the daemon presents native buffers.
+    // `PENGUDROID_VSYNC_COMPOSITOR=0` disables it explicitly, `=1` forces it on
+    // a desktop compositor as well.
+    match std::env::var("PENGUDROID_VSYNC_COMPOSITOR") {
+        Ok(value) => value != "0" && !value.is_empty(),
+        Err(_) => std::env::var_os("PENGUDROID_HYBRIS").is_some()
+            || std::env::var_os("PENGUDROID_GRALLOC").is_some(),
+    }
+}
+
+/// Subscribe a private connection for compositor-frame pulses. The daemon
+/// forwards one frame per `wl_surface.frame` callback; a wake-up reuses the
+/// connection's own input subscription mechanism.
+fn start_compositor_vsync() {
+    static STARTED: Once = Once::new();
+    eprintln!("[binder] compositor vsync: start requested");
+    STARTED.call_once(|| {
+        if !compositor_vsync_requested() {
+            eprintln!("[binder] compositor vsync: disabled by environment");
+            return;
+        }
+        eprintln!("[binder] compositor vsync: spawning pulse thread");
+        std::thread::Builder::new()
+            .name("pengudroid-vsync".into())
+            .spawn(|| {
+                eprintln!("[binder] compositor vsync: pulse thread started");
+                let conn = match Connection::connect_endpoint(&default_socket_path()) {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        unsafe { diag(&format!("[binder] compositor vsync: no daemon: {error}\n")) };
+                        return;
+                    }
+                };
+                let hello = Message::Hello {
+                    version: PROTO_VERSION,
+                    role: Role::Guest,
+                    // pid 0 marks a pure vsync pulse receiver, so the daemon
+                    // can leave it out of the ordinary request/timeout path.
+                    pid: 0,
+                };
+                eprintln!("[binder] compositor vsync: connecting to daemon");
+                if conn.send_message(&hello, &[]).is_err() {
+                    return;
+                }
+                let _ = conn.recv_message();
+                eprintln!("[binder] compositor vsync: welcome received");
+                let flags = unsafe { libc::fcntl(conn.as_raw_fd(), libc::F_GETFL) };
+                eprintln!("[binder] compositor vsync: handshake done fd={} flags={flags:#x}", conn.as_raw_fd());
+                let rc = unsafe {
+                    libc::setsockopt(
+                        conn.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVTIMEO,
+                        std::ptr::null::<libc::c_void>(),
+                        0,
+                    )
+                };
+                eprintln!("[binder] compositor vsync: cleared SO_RCVTIMEO rc={rc}");
+                // A second connection is only a pulse receiver; the daemon
+                // still needs one surface to subscribe to, and the latest
+                // window id is a safe default.
+                let surface = std::env::var("PENGUDROID_LAST_SURFACE_ID")
+                    .ok()
+                    .or_else(|| std::env::var("PENGUDROID_SURFACE_ID").ok())
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                if conn.send_message(&Message::SubscribeInput { surface_id: surface }, &[]).is_err() {
+                    return;
+                }
+                let reply = conn.recv_message();
+                eprintln!("[binder] compositor vsync: subscribe reply: {:?}", reply.as_ref().map(|(m, _)| format!("{m:?}")));
+                eprintln!("[binder] compositor vsync: subscribed on surface {surface}");
+                // A blocking receiver is the whole point: a timeout on this
+                // socket also turns the daemon's writer non-blocking (EAGAIN),
+                // which kills the pulse stream after a few frames.
+                // recvmsg on a blocking Unix seqpacket socket must not return
+                // EAGAIN; if it ever does, the fd has a timeout/non-blocking
+                // flag from somewhere else, which is worth reporting instead
+                // of silently spinning.
+                eprintln!("[binder] compositor vsync: waiting for frames");
+                loop {
+                    let (body, fds) = match conn.recv_frame() {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            eprintln!("[binder] compositor vsync: connection closed: {error}");
+                            break;
+                        }
+                    };
+                    if body.is_empty() {
+                        continue;
+                    }
+                    for fd in fds {
+                        unsafe { libc::close(fd) };
+                    }
+                    static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let frame_no = FRAMES.fetch_add(1, Ordering::Relaxed);
+                    if frame_no < 3 || frame_no % 60 == 0 {
+                        eprintln!("[binder] compositor vsync: raw frame #{frame_no} ({} bytes)", body.len());
+                    }
+                    let Some((_surface, event)) = pengudroid_proto::decode_input_kind(&body) else {
+                        continue;
+                    };
+                    if let InputKind::Vsync { vsync_time_ns, interval_ns } = event {
+                        let clock = compositor_clock();
+                        let mut state = match clock.state.lock() {
+                            Ok(state) => state,
+                            Err(poisoned) => {
+                                eprintln!("[binder] compositor vsync: clock mutex poisoned; recovering");
+                                poisoned.into_inner()
+                            }
+                        };
+                        state.0 = vsync_time_ns;
+                        state.1 = interval_ns.max(1_000_000);
+                        state.2 = state.2.wrapping_add(1);
+                        clock.ready.notify_all();
+                        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+                        if n < 3 || n % 60 == 0 {
+                            eprintln!("[binder] compositor vsync pulse #{n} ts={vsync_time_ns} interval={interval_ns}");
+                        }
+                        // The gleshim input thread owns clock updates; only
+                        // wake any waiter here. `send_vsync_impl` is invoked by
+                        // the binder/request path itself, so one frame edge
+                        // yields exactly one DisplayEvent, not two.
+                        if let Err(error) = send_vsync_impl(false, None) {
+                            eprintln!("[binder] compositor vsync: event send failed: {error}");
+                        }
+                    }
+                }
+            })
+            .ok();
+    });
+}
+
+/// Entry point for the gleshim's input subscription thread: one compositor
+/// frame pulse, already timestamped by the daemon's `wl_surface.frame`.
+#[no_mangle]
+pub extern "C" fn __pengudroid_vsync_compositor_pulse(vsync_time_ns: i64, interval_ns: i64) {
+    let clock = compositor_clock();
+    {
+        let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 = vsync_time_ns;
+        state.1 = interval_ns.max(1_000_000);
+        state.2 = state.2.wrapping_add(1);
+    }
+    clock.ready.notify_all();
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+    if n < 3 || n % 60 == 0 {
+        eprintln!("[binder] compositor vsync pulse #{n} ts={vsync_time_ns} interval={interval_ns}");
+    }
+    unsafe { send_vsync_impl(false, None) };
+}
+
+/// Wait for the next compositor frame pulse (bounded, so a lost daemon can
+/// never deadlock the RenderThread).
+fn wait_compositor_vsync() -> bool {
+    let clock = compositor_clock();
+    let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
+    let generation = state.2;
+    let timeout = std::time::Duration::from_millis(50);
+    let (state, _) = clock
+        .ready
+        .wait_timeout_while(state, timeout, |state| state.2 == generation)
+        .unwrap_or_else(|e| e.into_inner());
+    state.2 != generation
+}
+
 /// Deliver one vsync event on every open `BitTube`.
 ///
 /// The client's `DisplayEventReceiver::getEvents` does a `recv` on the socket
@@ -2264,6 +2458,9 @@ fn send_vsync() -> Result<(), String> {
 /// producer's rate limiter. Present-driven mode uses the same event encoder,
 /// but completes only the currently outstanding request.
 fn send_requested_vsync() -> Result<(), String> {
+    // Never block the RenderThread on the compositor: the pulse only updates
+    // the shared clock. A missed frame must not stall rendering.
+    start_compositor_vsync();
     send_vsync_impl(false, None)
 }
 
@@ -2274,12 +2471,15 @@ fn send_requested_vsync_to(connection: u32) -> Result<(), String> {
         std::sync::LazyLock::new(Default::default);
     static DELAYED: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
         std::sync::LazyLock::new(Default::default);
+    // The compositor clock, when present, defines the minimum spacing too:
+    // never answer two requests inside one display frame.
+    let clock_interval = compositor_clock().state.lock().unwrap_or_else(|e| e.into_inner()).1;
     let now = monotonic_ns();
     let previous = LAST_REQUEST.lock().unwrap_or_else(|e| e.into_inner())
         .get(&connection).copied();
     if let Some(previous) = previous {
         let elapsed = now.saturating_sub(previous);
-        let minimum = frame_interval_ns() / 2;
+        let minimum = (clock_interval.max(frame_interval_ns())) / 2;
         if elapsed < minimum {
             // DisplayEventReceiver requests the next event while dispatching
             // the current one. An immediate answer would recurse as fast as
@@ -2335,12 +2535,21 @@ fn send_vsync_impl(enforce_interval: bool, connection: Option<u32>) -> Result<()
     // `CLOCK_MONOTONIC` is already monotonic, so reading it is all that is needed.
     static FRAME: AtomicU32 = AtomicU32::new(0);
 
+    // With a compositor clock the timestamp is the frame edge the compositor
+    // reported, not the time we happened to process the request; that is what
+    // Choreographer schedules its next frame against.
+    let compositor_time = {
+        let state = compositor_clock().state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.0 != 0).then_some((state.0, state.1))
+    };
+
     let vsync_time = {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: `ts` is a valid `timespec` for `clock_gettime` to fill.
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
         (ts.tv_sec as i64) * 1_000_000_000 + ts.tv_nsec as i64
     };
+    let vsync_time = compositor_time.map(|(time, _)| time).unwrap_or(vsync_time);
 
     // `send_vsync` is called from the 60 Hz thread *and* on every
     // `requestNextVsync`. Emitting both puts two pulses inside one frame
@@ -2360,7 +2569,11 @@ fn send_vsync_impl(enforce_interval: bool, connection: Option<u32>) -> Result<()
 
     // Real timestamps and a populated preferred timeline keep Choreographer
     // from treating every frame as late or in the future.
-    let event = vsync_event(vsync_time, frame);
+    let event = if let Some((time, interval)) = compositor_time {
+        vsync_event_with_interval(time, frame, interval)
+    } else {
+        vsync_event(vsync_time, frame)
+    };
 
     let fds = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
     let channels = fds.iter().filter(|(owner, _)| connection.is_none_or(|h| *owner == h)).count();
@@ -2405,6 +2618,7 @@ static LAST_INPUT_WAKEUP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// slot with Android; it does not invalidate views or force a redraw.
 #[no_mangle]
 pub extern "C" fn __pengudroid_vsync_request(_connection: usize) {
+    start_compositor_vsync();
     if std::env::var_os("PENGUDROID_TRACE_VSYNC").is_some() {
         unsafe { diag("[binder]   <- hosted display requestNextVsync\n") };
     }

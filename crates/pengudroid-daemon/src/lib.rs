@@ -27,6 +27,7 @@ pub mod parcel;
 pub mod props;
 pub mod qt_extended_surface;
 pub mod server;
+pub mod wlegl;
 pub mod services;
 pub mod stubs;
 mod software;

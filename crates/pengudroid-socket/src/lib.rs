@@ -72,6 +72,11 @@ pub type Result<T> = std::result::Result<T, SocketError>;
 /// single thread (the daemon spawns one per client).
 pub struct Connection {
     fd: OwnedFd,
+    /// Serialize writes across a request/reply loop and any dedicated writer
+    /// thread (compositor frame pulses). Two writers on one Unix socket must
+    /// never interleave: the peer would read a length prefix from one frame
+    /// followed by another frame's body and reject it as an unknown kind.
+    write_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl Connection {
@@ -80,12 +85,18 @@ impl Connection {
     /// # Safety
     /// `fd` must be a connected stream socket and must not be closed elsewhere.
     pub unsafe fn from_raw_fd(fd: RawFd) -> Connection {
-        Connection { fd: OwnedFd::from_raw_fd(fd) }
+        Connection {
+            fd: OwnedFd::from_raw_fd(fd),
+            write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        }
     }
 
     /// Wrap an already-connected [`UnixStream`].
     pub fn from_stream(s: UnixStream) -> Connection {
-        Connection { fd: OwnedFd::from(s) }
+        Connection {
+            fd: OwnedFd::from(s),
+            write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        }
     }
 
     /// Connect to a listening control socket.
@@ -103,6 +114,21 @@ impl Connection {
             Some(name) => Ok(Connection::from_stream(connect_abstract(name)?)),
             None => Connection::connect(endpoint),
         }
+    }
+
+    /// Duplicate the endpoint, for a dedicated writer thread. Reads and writes
+    /// still have to be serialized by the caller per connection: this only
+    /// gives a second owner of the same socket.
+    pub fn try_clone(&self) -> io::Result<Connection> {
+        let fd = unsafe { libc::dup(self.fd.as_raw_fd()) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Connection {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            // Both owners of the same socket share one write lock.
+            write_lock: self.write_lock.clone(),
+        })
     }
 
     pub fn as_raw_fd(&self) -> RawFd {
@@ -146,6 +172,7 @@ impl Connection {
 
     /// Write one framed message with optional attached fds.
     pub fn send_frame(&self, body: &[u8], fds: &[RawFd]) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut frame = Vec::with_capacity(body.len() + 4);
         frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
         frame.extend_from_slice(body);
@@ -154,6 +181,7 @@ impl Connection {
 
     /// Convenience: encode and send a protocol message.
     pub fn send_message(&self, msg: &pengudroid_proto::Message, fds: &[RawFd]) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let frame = msg.to_frame();
         // `to_frame` includes the length prefix already.
         send_all_with_fds(self.fd.as_raw_fd(), &frame, fds)

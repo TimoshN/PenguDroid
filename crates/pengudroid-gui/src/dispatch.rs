@@ -18,6 +18,7 @@ pub fn run() {
         "input", "info", "inspect", "deps", "doctor", "keymap-preset", "sysroot",
         "runtime", "art-test", "__art", "geometry", "gpu-info", "gpu-test",
         "video-decode-test", "audio-test", "input-test", "libpath", "de-bionic",
+        "wlegl-probe",
         "nativelib", "native", "__native", "__dlopen", "getprop", "setprop",
         "services", "telephony", "daemon", "stop", "status", "__guest", "__daemon",
         "-V", "--version", "-h", "--help",

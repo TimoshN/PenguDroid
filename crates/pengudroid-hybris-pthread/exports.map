@@ -6,3 +6,8 @@ LIBC {
         pthread_setspecific;
         pthread_once;
 };
+
+PENGUDROID_HYBRIS_PTHREAD_1.0 {
+    global:
+        __pengudroid_hybris_pthread_stats;
+};

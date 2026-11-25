@@ -37,6 +37,8 @@ mod runner;
 mod runtime;
 mod sysroot;
 mod telephony;
+#[cfg(feature = "wlegl-probe")]
+mod wlegl;
 
 use pengudroid_proto::{default_socket_path, InputKind, Message, Role, PROTO_VERSION};
 
@@ -72,6 +74,8 @@ pub fn real_main(args: &[String]) -> i32 {
         "geometry" => geometry::run(&args[2..]),
         "gpu-info" => gpu::info(),
         "gpu-test" => gpu::test(),
+        #[cfg(feature = "wlegl-probe")]
+        "wlegl-probe" => wlegl::run(&args[2..]),
         "video-decode-test" => gpu::video_test(&args[2..]),
         "audio-test" => audio::test(&args[2..]),
         "input-test" => input::test(&args[2..]),
@@ -829,6 +833,8 @@ fn print_help() {
          \x20   gpu-info                                    report host EGL/GLES/GPU capabilities\n\
          \x20   video-decode-test <one-frame.h264>           verify hardware decode + GPU export\n\
          \x20   gpu-test                                    render offscreen on the GPU + export a dmabuf\n\
+         \x20   wlegl-probe [--width W] [--height H] [--seconds S] [--hold]\n\
+         \x20                                              share a gralloc buffer with the compositor via android_wlegl\n\
          \x20   audio-test [--seconds N] [--tone]           play silence (or a tone) through PipeWire\n\
          \x20   nativelib <lib.so> [--call SYM] [--lib-dir D]  de-bionic + dlopen (+ call) a .so\n\
          \x20   nativelib --apk <app.apk> [--abi <abi>]      load an APK's own native libraries\n\

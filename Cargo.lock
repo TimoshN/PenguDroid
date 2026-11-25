@@ -2999,6 +2999,9 @@ dependencies = [
  "pengudroid-socket",
  "roxmltree",
  "tar",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
 ]
 
 [[package]]

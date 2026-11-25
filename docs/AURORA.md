@@ -502,13 +502,22 @@ Bionic and glibc independently allocated the same pthread key; on MAX's
 `OneVideoRenderT`, Hybris `eglGetError` consequently received Android
 libbinder's `IPCThreadState*` as its EGL error record and overwrote `mProcess`
 with `EGL_SUCCESS`. A later `flushCommands()` crashed. The development package
-now loads `libpengudroid_hybris_pthread.so` before `libhybris-common`: its five
+loads `libpengudroid_hybris_pthread.so` before `libhybris-common`: its five
 Bionic `LIBC` pthread-key/once exports branch to explicitly versioned
-`GLIBC_2.34` implementations, so both graphics and Binder use glibc's single
-key allocator. No EGL API is intercepted by this bridge. GDB watchpoint
-evidence is `target/aurora/maxnext-video-gdb-object4.out`; the fixed 90-second
-run is `target/aurora/maxnext-hybris-pthread-fixed.log`, with live ART/daemon,
-continuing presents, and no `OneVideoRenderT` fatal.
+`GLIBC_2.34` implementations for callers whose symbol resolution reaches the
+bridge. No EGL API is intercepted. This does not guarantee coverage of DSOs
+loaded later by Hybris' internal Android linker, so it is not treated as a
+replacement for the explicit Binder/Hybris TLS separation.
+
+`PENGUDROID_HYBRIS_TLS_BRIDGE=1` is an opt-in diagnostic that bypasses only the
+HIDL rekey and reports allocation-free bridge counters. On the release-163
+AArch64 probe, repeated successful gralloc allocations still reported
+`create=0 get=0 set=0 once=0`, proving that this particular internal-linker
+path bypassed the bridge. The same run worked because guest Binder had already
+released the colliding key, but that is not enough evidence to remove the
+fallback on other Hybris builds. The default therefore retains the verified
+HIDL rekey; ordinary launches never enable the diagnostic bypass. Evidence:
+`target/aurora/so-usage/aarch64-163-bridge.log`.
 
 Launch the package normally:
 

@@ -60,6 +60,12 @@ mod imp {
     use std::os::fd::AsFd;
 
     use pengudroid_proto::{abi, BufferCrop};
+    use pengudroid_proto::vsync_input_event;
+    use crate::wlegl;
+    use crate::wlegl::protocol::imp::android_wlegl::AndroidWlegl;
+    use crate::wlegl::protocol::imp::android_wlegl_handle::AndroidWleglHandle;
+    use std::os::fd::BorrowedFd;
+    use std::time::Instant;
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
@@ -116,10 +122,43 @@ mod imp {
         desktop_configured: bool,
     }
 
+    /// Stable identity of one native allocation: the int words are identical
+    /// across the duplicated fds sent with each frame.
+    fn fnv1a_ints(ints: &[i32]) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for word in ints {
+            for byte in word.to_le_bytes() {
+                hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        hash
+    }
+
+    /// `android_wlegl.create_handle` takes the int part of native_handle_t as
+    /// a byte array; the fds travel separately as `add_fd` requests.
+    fn ints_as_bytes(ints: &[i32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ints.len() * 4);
+        for word in ints {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
     struct PendingFrame {
         buffer: wl_buffer::WlBuffer,
         /// Direct PresentShm keeps the guest memfd alive until release.
         _fd: Option<std::os::fd::OwnedFd>,
+        /// All fds of an Android native handle, held until `wl_buffer.release`.
+        _native_fds: Vec<std::os::fd::OwnedFd>,
+    }
+
+    /// Per-surface compositor clock: one outstanding `wl_surface.frame`.
+    struct VsyncState {
+        callback: Option<wl_callback::WlCallback>,
+        /// Last callback time in CLOCK_MONOTONIC nanoseconds.
+        last_ns: i64,
+        last_present_ns: i64,
+        frames: u64,
     }
 
     struct ClipboardSource {
@@ -174,7 +213,6 @@ mod imp {
         fn wl_surface(&self) -> &wl_surface::WlSurface { &self.0 }
     }
 
-    #[derive(Default)]
     pub struct State {
         pub compositor: Option<wl_compositor::WlCompositor>,
         pub shm: Option<wl_shm::WlShm>,
@@ -213,6 +251,18 @@ mod imp {
         /// `zwp_linux_dmabuf_v1`, when the compositor advertises it (v3+, which
         /// carries format modifiers).
         pub dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+        /// Sailfish/hybris `android_wlegl`: hand the compositor an Android
+        /// native (gralloc) buffer as a GPU texture instead of a CPU wl_shm
+        /// read. Lipstick advertises it; other compositors simply lack it.
+        pub wlegl: Option<AndroidWlegl>,
+        /// Opt-in: the launcher asks for the native transport; the presence of
+        /// the global alone only makes it possible.
+        pub wlegl_enabled: bool,
+        wlegl_name: Option<u32>,
+        /// Reuse one wl_buffer per Android native handle. Creating a fresh
+        /// wl_buffer for every frame makes Lipstick keep showing the first
+        /// imported pixels instead of re-sampling the allocation.
+        wlegl_buffers: HashMap<(u32, u64), (wl_buffer::WlBuffer, Vec<std::os::fd::OwnedFd>)>,
         /// `wl_subcompositor`, used for child layers (`SurfaceView` video).
         pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
         /// How many `format`/`modifier` events the compositor sent (diagnostic).
@@ -260,9 +310,141 @@ mod imp {
         pointer_pos: (f64, f64),
         /// Input waiting to be forwarded to the guest that owns the surface.
         pub input: Vec<(u32, pengudroid_proto::InputKind)>,
+        /// Encoded compositor-clock pulses, delivered as-is (no re-encoding).
+        pub raw_vsync: Vec<(u32, Vec<u8>)>,
+        /// A compositor frame callback per surface: the display clock the
+        /// guest paces its rendering by, rather than a free-running timer.
+        vsync: HashMap<u32, VsyncState>,
+        /// Measured frame interval, for the guest's vsync timeline.
+        vsync_interval_ns: i64,
+        vsync_enabled: bool,
+        vsync_stats: (u32, Instant),
+        vsync_enabled_explicit: bool,
+    }
+
+    impl Default for State {
+        fn default() -> Self {
+            State {
+                compositor: None,
+                shm: None,
+                wm_base: None,
+                shell: None,
+                surface_extension: None,
+                maliit: None,
+                ime_surface: None,
+                viewporter: None,
+                cursor_manager: None,
+                cursor: None,
+                pointer_constraints: None,
+                relative_manager: None,
+                relative_pointer: None,
+                pointer_lock: None,
+                pointer_serial: 0,
+                output_manager: None,
+                outputs: HashMap::new(),
+                output_proxies: HashMap::new(),
+                frame_compositor: None,
+                frame_subcompositor: None,
+                frame_shm: None,
+                frames: HashMap::new(),
+                client_decorated: Default::default(),
+                configured: HashMap::new(),
+                wm_capabilities: HashMap::new(),
+                frame_focus: None,
+                decoration: None,
+                dmabuf: None,
+                wlegl: None,
+                wlegl_enabled: false,
+                wlegl_name: None,
+                wlegl_buffers: HashMap::new(),
+                subcompositor: None,
+                dmabuf_formats: 0,
+                dmabuf_supported: Vec::new(),
+                dmabuf_created: false,
+                dmabuf_failed: false,
+                next_id: 0,
+                surfaces: HashMap::new(),
+                pending: Vec::new(),
+                toplevels: HashMap::new(),
+                decorations: HashMap::new(),
+                extended_surfaces: HashMap::new(),
+                fps: HashMap::new(),
+                loading_clock: None,
+                loading_phase: 0,
+                close_requests: Vec::new(),
+                seat: None,
+                data_device_manager: None,
+                data_device: None,
+                clipboard_sources: HashMap::new(),
+                clipboard_offers: HashMap::new(),
+                clipboard_offer: None,
+                clipboard_contents: None,
+                clipboard_read_cache: None,
+                clipboard_selection_serial: None,
+                pointer: None,
+                touch: None,
+                touch_points: HashMap::new(),
+                keyboard: None,
+                pointer_focus: None,
+                keyboard_focus: None,
+                held_keys: Default::default(),
+                pointer_pos: (0.0, 0.0),
+                input: Vec::new(),
+                raw_vsync: Vec::new(),
+                vsync: HashMap::new(),
+                vsync_interval_ns: 16_666_666,
+                vsync_enabled: false,
+                vsync_stats: (0, Instant::now()),
+                vsync_enabled_explicit: false,
+            }
+        }
     }
 
     impl State {
+        /// Send a compositor-timed vsync pulse to the surface's subscribers.
+        /// The compositor's frame edge, on CLOCK_MONOTONIC.
+        pub fn monotonic_ns() -> i64 {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+        }
+
+        /// One frame callback completed: timestamp it, measure the interval,
+        /// and queue the next one. The pulse goes to the surface's subscribers
+        /// as a raw encoded frame so its clock is never rewritten.
+        pub fn on_vsync_done(&mut self, id: u32, _callback_data: u32) {
+            let now = Self::monotonic_ns();
+            let mut send = None;
+            if let Some(state) = self.vsync.get_mut(&id) {
+                state.callback = None;
+                let previous = state.last_ns;
+                state.last_ns = now;
+                state.frames += 1;
+                if previous != 0 {
+                    let delta = now - previous;
+                    if (1_000_000..=1_000_000_000).contains(&delta) {
+                        self.vsync_interval_ns = delta;
+                    }
+                }
+                let interval = self.vsync_interval_ns.max(1_000_000);
+                send = Some(vsync_input_event(id, now, interval));
+            }
+            if let Some(frame) = send {
+                self.raw_vsync.push((id, frame));
+            }
+            self.vsync_stats.0 += 1;
+            let elapsed = self.vsync_stats.1.elapsed();
+            if elapsed.as_secs() >= 5 {
+                crate::info!(
+                    "compositor vsync: {} callbacks/5s, interval {} ns, surfaces {}",
+                    self.vsync_stats.0,
+                    self.vsync_interval_ns,
+                    self.vsync.len()
+                );
+                self.vsync_stats = (0, Instant::now());
+            }
+        }
+
         fn alloc_id(&mut self) -> u32 {
             self.next_id += 1;
             self.next_id
@@ -765,6 +947,13 @@ mod imp {
 
         /// Connect to the compositor named by `WAYLAND_DISPLAY`. Returns `None`
         /// if there is no Wayland session (the daemon then runs graphics-less).
+        /// `wl_shm`/`android_wlegl` choice and the frame clock are environment
+        /// switches so an unverified transport never silently becomes the only
+        /// path: the launcher opts in, and wl_shm remains available.
+        fn env_enabled(name: &str) -> bool {
+            std::env::var(name).ok().is_some_and(|v| v != "0" && !v.is_empty())
+        }
+
         pub fn connect() -> Option<Graphics> {
             let conn = match Connection::connect_to_env() {
                 Ok(c) => c,
@@ -802,6 +991,19 @@ mod imp {
             // v3 adds format modifiers, which we need to import GPU buffers.
             // Bind v3 for the format/modifier events. v4 requires the feedback
             // protocol instead and no longer guarantees these advertisements.
+            state.wlegl_enabled = Self::env_enabled("PENGUDROID_GRALLOC_WLEGL");
+            state.vsync_enabled = match std::env::var("PENGUDROID_VSYNC_COMPOSITOR") {
+                Ok(value) => value != "0" && !value.is_empty(),
+                // Auto: on where the native-buffer transport exists (Lipstick).
+                Err(_) => true,
+            };
+            state.vsync_enabled_explicit = state.vsync_enabled;
+            state.wlegl_name = globals.contents().with_list(|list| {
+                list.iter()
+                    .find(|g| g.interface == "android_wlegl")
+                    .map(|g| g.name)
+            });
+            state.vsync_stats = (0, Instant::now());
             state.dmabuf = globals.bind(&qh, 3..=3, ()).ok();
             state.subcompositor = globals.bind(&qh, 1..=1, ()).ok();
             state.viewporter = globals.bind(&qh, 1..=1, ()).ok();
@@ -815,12 +1017,22 @@ mod imp {
             state.frame_shm = state.shm.clone().map(Shm::from);
             state.output_manager = globals.bind(&qh, 1..=3, ()).ok();
             globals.contents().with_list(|list| {
-                for name in ["wl_drm", "zwp_linux_dmabuf_v1", "qt_surface_extension"] {
+                for name in ["wl_drm", "zwp_linux_dmabuf_v1", "qt_surface_extension", "android_wlegl"] {
                     if let Some(global) = list.iter().find(|global| global.interface == name) {
                         crate::info!("Wayland global {name} v{}", global.version);
                     }
                 }
             });
+            if let Some(name) = state.wlegl_name {
+                let wlegl: AndroidWlegl = globals.registry().bind(name, 1, &qh, ());
+                state.wlegl = Some(wlegl);
+                crate::info!(
+                    "android_wlegl available; guest native-buffer transport {}",
+                    if state.wlegl_enabled { "enabled" } else { "available but disabled" }
+                );
+            } else if state.wlegl_enabled {
+                crate::warn!("PENGUDROID_GRALLOC_WLEGL set but the compositor lacks android_wlegl; using wl_shm");
+            }
             globals.contents().with_list(|list| {
                 for global in list.iter().filter(|global| global.interface == "wl_output") {
                     let output: wl_output::WlOutput = globals.registry().bind(global.name, global.version.min(4), &qh, global.name);
@@ -867,6 +1079,16 @@ mod imp {
             std::mem::take(&mut self.state.input)
         }
 
+        /// Compositor-clock pulses awaiting delivery to guest subscribers.
+        /// Whether the compositor clock is currently being forwarded.
+        pub fn vsync_available(&self) -> bool {
+            self.state.vsync_enabled
+        }
+
+        pub fn take_vsync_frames(&mut self) -> Vec<(u32, Vec<u8>)> {
+            std::mem::take(&mut self.state.raw_vsync)
+        }
+
         /// Read whatever the compositor has already sent, without blocking.
         ///
         /// `dispatch_pending` alone only replays events that a *previous* read
@@ -875,6 +1097,36 @@ mod imp {
         /// `wl_pointer::Enter`/`Button` event ever reached the state machine, so
         /// `pointer_focus` stayed `None` and `push_input` dropped everything.
         ///
+        fn vsync_enabled_now(&self) -> bool {
+            // Auto mode: on only when the compositor advertises android_wlegl.
+            // `PENGUDROID_VSYNC_COMPOSITOR=1` forces it anywhere (desktop).
+            self.state.vsync_enabled
+        }
+
+        fn queue_vsync(&mut self, id: u32) {
+            if !self.vsync_enabled_now() { return; }
+            let qh = self.queue.handle();
+            let Some((wl_surface, entry)) = (|| {
+                let surface = self.state.surfaces.get(&id)?;
+                let wl_surface = surface.wl_surface.clone();
+                Some((wl_surface, id))
+            })() else { return };
+            let state = self.state.vsync.entry(entry).or_insert_with(|| VsyncState {
+                callback: None,
+                last_ns: 0,
+                last_present_ns: 0,
+                frames: 0,
+            });
+            if state.callback.is_some() { return; }
+            state.callback = Some(wl_surface.frame(&qh, ()));
+        }
+
+        /// Record one present and ask the compositor for the next frame edge.
+        fn vsync_note_present(&mut self, id: u32) {
+            if !self.vsync_enabled_now() { return; }
+            self.queue_vsync(id);
+        }
+
         /// The read is non-blocking: the daemon loop must stay responsive, and a
         /// `WouldBlock` simply means there was nothing to read.
         fn drain_wayland(&mut self) {
@@ -903,6 +1155,14 @@ mod imp {
             }
             let _ = self.queue.dispatch_pending(&mut self.state);
             let _ = self.conn.flush();
+            // Re-arm the frame callbacks only after dispatch: creating one in
+            // the middle of an event would recurse into the same state.
+            if self.state.vsync_enabled {
+                let ids: Vec<u32> = self.state.surfaces.keys().copied().collect();
+                for id in ids {
+                    self.queue_vsync(id);
+                }
+            }
         }
 
         /// The surface that currently has pointer focus, if any.
@@ -1220,7 +1480,10 @@ mod imp {
             // Flush errors mean the compositor is gone; report the frame as lost
             // rather than pretending it was shown.
             let presented = self.conn.flush().is_ok();
-            if presented { self.record_frame(id); }
+            if presented {
+                self.record_frame(id);
+                self.vsync_note_present(id);
+            }
             presented
         }
 
@@ -1711,12 +1974,83 @@ mod imp {
             surface.wl_surface.attach(Some(&buffer), 0, 0);
             surface.wl_surface.damage(0, 0, surface.display_width as i32, surface.display_height as i32);
             surface.wl_surface.commit();
-            surface.pending_frames.push(PendingFrame { buffer, _fd: Some(fd) });
+            surface.pending_frames.push(PendingFrame { buffer, _fd: Some(fd), _native_fds: Vec::new() });
             self.conn.flush().map_err(|e| e.to_string())?;
             self.record_frame(id);
+            self.vsync_note_present(id);
             if native_gpu_buffer {
                 Self::profile_native_import(profile_started.elapsed());
             }
+            Ok(())
+        }
+
+        /// Present a whole Android native handle through `android_wlegl`.
+        ///
+        /// The guest sends every fd of its gralloc `native_handle_t` plus the
+        /// int words; the compositor imports that as a GPU texture, so no
+        /// `wl_shm` pool and no CPU-visible read is involved.
+        pub fn present_wlegl(
+            &mut self,
+            id: u32,
+            fds: Vec<std::os::fd::OwnedFd>,
+            ints: Vec<i32>,
+            width: u32,
+            height: u32,
+            stride: u32,
+            format: i32,
+            usage: i32,
+        ) -> Result<(), String> {
+            if !self.frame_slot_available(id)? { return Ok(()); }
+            let wlegl = self.state.wlegl.clone()
+                .ok_or("android_wlegl is not advertised by the compositor")?;
+            if !self.state.wlegl_enabled {
+                return Err("android_wlegl presentation is disabled".into());
+            }
+            // One native handle -> one wl_buffer for the whole surface's life.
+            // The int words identify the allocation even though the fds are
+            // duplicated on every present.
+            let key = (id, fnv1a_ints(&ints));
+            let buffer = if let Some((buffer, _fds)) = self.state.wlegl_buffers.get(&key) {
+                buffer.clone()
+            } else {
+                crate::info!(
+                    "wlegl new wl_buffer: surface={id} key={:#x} ints={ints:?} total={}",
+                    key.1,
+                    self.state.wlegl_buffers.len() + 1
+                );
+                let qh = self.queue.handle();
+                let handle = wlegl.create_handle(fds.len() as i32, ints_as_bytes(&ints), &qh, ());
+                for fd in &fds {
+                    handle.add_fd(fd.as_fd());
+                }
+                // stride is in pixels for Android native buffers, not bytes.
+                let buffer = wlegl.create_buffer(
+                    width as i32, height as i32, (stride / 4) as i32, format, usage, &handle, &qh, (),
+                );
+                handle.destroy();
+                self.state.wlegl_buffers.insert(key, (buffer.clone(), fds));
+                buffer
+            };
+            let surface = self.state.surfaces.get_mut(&id).ok_or("surface disappeared")?;
+            surface.loading = false;
+            // Lipstick ignores wl_surface buffer transforms, so the guest has
+            // already flipped this buffer on the GPU before presenting it.
+            surface.wl_surface.set_buffer_transform(wl_output::Transform::Normal);
+            surface.wl_surface.attach(Some(&buffer), 0, 0);
+            surface.wl_surface.damage(0, 0, surface.display_width as i32, surface.display_height as i32);
+            surface.wl_surface.commit();
+            surface.pending_frames.push(PendingFrame {
+                buffer,
+                _fd: None,
+                _native_fds: Vec::new(),
+            });
+            self.conn.flush().map_err(|e| e.to_string())?;
+            self.record_frame(id);
+            self.vsync_note_present(id);
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                crate::info!("guest frames now presented through android_wlegl (GPU native buffers)");
+            });
             Ok(())
         }
 
@@ -1780,7 +2114,7 @@ mod imp {
             s.wl_surface.attach(Some(&buffer), 0, 0);
             s.wl_surface.damage(0, 0, s.display_width as i32, s.display_height as i32);
             s.wl_surface.commit();
-            s.pending_frames.push(PendingFrame { buffer, _fd: None });
+            s.pending_frames.push(PendingFrame { buffer, _fd: None, _native_fds: Vec::new() });
             // The pool request sends its own fd. Wayland retains the snapshot
             // independently of the Android buffer, which may now be recycled.
             self.conn.flush().map_err(|e| e.to_string())?;
@@ -1816,7 +2150,7 @@ mod imp {
             surface.wl_surface.attach(Some(&buffer), 0, 0);
             surface.wl_surface.damage(0, 0, surface.display_width as i32, surface.display_height as i32);
             surface.wl_surface.commit();
-            surface.pending_frames.push(PendingFrame { buffer, _fd: None });
+            surface.pending_frames.push(PendingFrame { buffer, _fd: None, _native_fds: Vec::new() });
             self.conn.flush().map_err(|e| e.to_string())?;
             self.record_frame(id);
             Ok(Some(released))
@@ -1908,7 +2242,7 @@ mod imp {
             s.wl_surface.attach(Some(&buffer), 0, 0);
             s.wl_surface.damage(0, 0, s.display_width as i32, s.display_height as i32);
             s.wl_surface.commit();
-            s.pending_frames.push(PendingFrame { buffer, _fd: None });
+            s.pending_frames.push(PendingFrame { buffer, _fd: None, _native_fds: Vec::new() });
             s.dmabuf_fd = Some(fd);
             let _ = self.conn.flush();
 
@@ -2071,7 +2405,29 @@ mod imp {
     ignore_events!(wl_buffer::WlBuffer, ());
     ignore_events!(wl_surface::WlSurface, ());
     ignore_events!(wl_region::WlRegion, ());
-    ignore_events!(wl_callback::WlCallback, ());
+    // The compositor's frame callback is the guest's display clock.
+    impl Dispatch<wl_callback::WlCallback, ()> for State {
+        fn event(state: &mut Self, callback: &wl_callback::WlCallback,
+            event: <wl_callback::WlCallback as wayland_client::Proxy>::Event,
+            _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_callback::Event::Done { callback_data } = event {
+            let id = state.vsync.iter()
+                .find_map(|(id, entry)| {
+                    entry.callback.as_ref().is_some_and(|c| c == callback).then_some(*id)
+                });
+            if let Some(id) = id {
+                state_on_vsync(state, id, callback_data);
+            }
+            }
+        }
+    }
+
+    fn state_on_vsync(state: &mut State, id: u32, callback_ns: u32) {
+        state.on_vsync_done(id, callback_ns);
+    }
+
+    ignore_events!(AndroidWlegl, ());
+    ignore_events!(AndroidWleglHandle, ());
     ignore_events!(wl_subcompositor::WlSubcompositor, ());
     ignore_events!(wl_subsurface::WlSubsurface, ());
 

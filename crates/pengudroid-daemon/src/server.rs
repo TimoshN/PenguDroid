@@ -63,6 +63,9 @@ struct WindowLayerState {
     generation: u64,
 }
 
+/// A per-connection compositor-clock queue plus its writer thread's wakeup.
+type VsyncQueue = std::sync::Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>;
+
 pub struct Daemon {
     pub start: Instant,
     props: Mutex<Props>,
@@ -90,6 +93,8 @@ pub struct Daemon {
     /// Real ViewRoot metadata, keyed by the native Surface consumed by HWUI.
     window_layers: Mutex<std::collections::HashMap<u64, WindowLayerState>>,
     next_window_generation: AtomicU64,
+    /// Guest connections that receive compositor-frame pulses, keyed by pid.
+    vsync_sinks: Mutex<std::collections::HashMap<i32, (Sender<Message>, VsyncQueue)>>,
 }
 
 pub(crate) struct SpawnedRun {
@@ -152,6 +157,7 @@ impl Daemon {
             surface_processes: Mutex::new(std::collections::HashMap::new()),
             window_layers: Mutex::new(std::collections::HashMap::new()),
             next_window_generation: AtomicU64::new(1),
+            vsync_sinks: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -259,6 +265,7 @@ impl Daemon {
             owners.retain(|id, _| gfx.contains_surface(*id));
         }
         self.input_sinks.lock().unwrap().retain(|_, (owner, _, _)| *owner != pid);
+        self.vsync_sinks.lock().unwrap().remove(&pid);
         self.window_layers.lock().unwrap().retain(|_, layer| layer.pid != pid);
     }
 
@@ -311,6 +318,19 @@ impl Daemon {
     ///
     /// Called from the accept loop, which is also what drives the Wayland
     /// event queue, so a pointer event reaches the guest within one poll.
+    /// True when the compositor clock is available and should be forwarded.
+    pub fn compositor_vsync_enabled(&self) -> bool {
+        self.graphics.lock().unwrap().as_ref().is_some_and(|gfx| gfx.vsync_available())
+    }
+
+    /// Register a peer as a receiver of the compositor's frame pulses. The
+    /// writer thread uses `vsync_frames`; `input_sinks` continues to carry
+    /// ordinary pointer/key events.
+    pub fn register_vsync_sink(&self, pid: i32, inbox: std::sync::mpsc::Sender<Message>,
+        frames: VsyncQueue) {
+        self.vsync_sinks.lock().unwrap().insert(pid, (inbox, frames));
+    }
+
     pub fn pump_input(&self) {
         let events = {
             let mut guard = self.graphics.lock().unwrap();
@@ -319,6 +339,32 @@ impl Daemon {
                 None => return,
             }
         };
+        // Compositor-clock pulses: fan out to every subscribed guest. The
+        // writer thread on each connection serializes them with input events
+        // and replies, so a guest never sees a partial frame.
+        let pulses = {
+            let mut guard = self.graphics.lock().unwrap();
+            guard.as_mut().map(|gfx| gfx.take_vsync_frames()).unwrap_or_default()
+        };
+        if !pulses.is_empty() {
+            let sinks = self.vsync_sinks.lock().unwrap();
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 || n % 60 == 0 {
+                crate::info!("compositor vsync: fanout pulse #{n} to {} peers", sinks.len());
+            }
+            for (_surface, frame) in pulses {
+                for (_pid, (_inbox, queue)) in sinks.iter() {
+                    let (lock, ready) = &**queue;
+                    let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    // One frame edge supersedes the previous one; never build
+                    // a backlog that would make the guest render stale frames.
+                    pending.clear();
+                    pending.push(frame.clone());
+                    ready.notify_one();
+                }
+            }
+        }
         if events.is_empty() {
             return;
         }
@@ -398,6 +444,10 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
                 &Message::Welcome { version: PROTO_VERSION, pid: std::process::id() as i32 },
                 &[],
             );
+            crate::info!(
+                "peer connected: role={role:?} pid={pid} (vsync-only={})",
+                pid == 0 && role == pengudroid_proto::Role::Guest
+            );
             (role, pid)
         }
         other => {
@@ -415,8 +465,72 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
     let peer = Peer { pid, connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed), inbox, pending };
     // `inbox_tx` is cloned into every service registration; keeping the original
     // alive means the receiver is never spuriously disconnected.
-    let _keepalive = tx;
+    let _keepalive = tx.clone();
     let mut video = video::VideoConnection::default();
+
+    // Compositor-frame pulses: the accept loop owns the Wayland connection, so
+    // it also owns timestamping; a short forwarding thread delivers them to
+    // the peer without racing its synchronous PresentShm request/reply pairs.
+    let vsync_frames = std::sync::Arc::new((std::sync::Mutex::new(Vec::<Vec<u8>>::new()),
+        std::sync::Condvar::new()));
+    // Only the shim's dedicated pulse connection (Hello pid 0) is vsync-only;
+    // every other peer keeps the ordinary request/reply loop even when it also
+    // receives frame pulses. Treating all peers as pulse-only silently skips
+    // their PresentShm/SubscribeInput handling.
+    let peer_is_vsync_only = pid == 0 && daemon.compositor_vsync_enabled();
+    if peer_is_vsync_only {
+        let writer = conn.try_clone().ok();
+        let frames = std::sync::Arc::clone(&vsync_frames);
+        std::thread::spawn(move || {
+            let Some(mut writer) = writer else { return };
+            let (lock, ready) = &*frames;
+            loop {
+                let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while pending.is_empty() {
+                    pending = ready.wait(pending).unwrap_or_else(|e| e.into_inner());
+                }
+                let batch = std::mem::take(&mut *pending);
+                drop(pending);
+                if batch.is_empty() { continue; }
+                for frame in batch {
+                    static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 3 {
+                        crate::info!("compositor vsync: writer send frame #{n} ({} bytes)", frame.len());
+                    }
+                    if let Err(error) = writer.send_frame(&frame, &[]) {
+                        crate::info!("compositor vsync: writer failed after {n} frames: {error}");
+                        return;
+                    }
+                }
+            }
+        });
+        daemon.register_vsync_sink(pid, tx.clone(), std::sync::Arc::clone(&vsync_frames));
+        crate::info!("compositor vsync: peer pid={pid} registered for frame pulses");
+    }
+
+    // A pure vsync subscriber never sends requests after the handshake, so a
+    // read timeout on its socket would only turn the pulse writer non-blocking
+    // (SO_SNDTIMEO) and kill the stream with EAGAIN. Give it a dedicated
+    // blocking read path and skip the request loop entirely.
+    if peer_is_vsync_only {
+        crate::info!(
+            "compositor vsync: pulse-only peer pid={} enters blocking read loop",
+            peer.pid
+        );
+        loop {
+            match conn.recv_frame() {
+                Ok((_, fds)) => {
+                    for fd in fds { unsafe { libc::close(fd); } }
+                }
+                Err(error) => {
+                    crate::info!("compositor vsync: pulse-only peer closed: {error}");
+                    break;
+                }
+            }
+        }
+        return Ok(());
+    }
 
     // Blocking reads are the common case; a timeout lets the loop notice both
     // forwarded calls and (from the peer's side) the socket going away.
@@ -446,12 +560,59 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
                 crate::debug!("client closed connection");
                 break Ok(());
             }
-            Err(e) => break Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+            Err(e) => {
+                // A decode error is fatal to the stream: the peer is now at an
+                // unknown byte offset, so any later request would be garbage.
+                // Close the connection instead of sending an error reply into
+                // an already desynchronised socket.
+                crate::info!(
+                    "peer pid={} stream error: {e}; closing connection",
+                    peer.pid
+                );
+                break Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+            }
         };
         let (msg, raw_fds) = received;
         let (reply, out_fds, close) = match msg {
             Message::PresentShm { surface_id, width, height, stride, format, native_window, crop } => {
                 let owned: Vec<OwnedFd> = raw_fds.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
+                // An android_wlegl native handle carries all of its fds plus
+                // the int words in a following frame, rather than a single
+                // mmap-able fd. `WLEGL_FD_FLAG` marks that wire format.
+                if format & pengudroid_proto::abi::WLEGL_FD_FLAG != 0 {
+                    let mut fds = owned.into_iter();
+                    let ints = match conn.recv_frame() {
+                        Ok((body, extra)) => {
+                            for fd in extra { unsafe { libc::close(fd); } }
+                            Some(body)
+                        }
+                        Err(e) => {
+                            let _ = conn.send_message(&Message::Error { code: -22,
+                                message: format!("android_wlegl native ints: {e}") }, &[]);
+                            None
+                        }
+                    };
+                    let Some(ints) = ints else {
+                        continue;
+                    };
+                    let ints: Vec<i32> = ints.chunks_exact(4)
+                        .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+                    let fds: Vec<OwnedFd> = fds.collect();
+                    let result = match daemon.graphics.lock().unwrap().as_mut() {
+                        Some(gfx) => gfx.present_wlegl(
+                            surface_id, fds, ints, width, height, stride,
+                            (format & !(pengudroid_proto::abi::NATIVE_FD_FLAG
+                                | pengudroid_proto::abi::WLEGL_FD_FLAG)) as i32,
+                            pengudroid_proto::abi::GRALLOC_USAGE_LINEAR_TEXTURE,
+                        ),
+                        None => Err("graphics unavailable".into()),
+                    };
+                    let reply = match result {
+                        Ok(()) => Message::Ack,
+                        Err(message) => Message::Error { code: -22, message },
+                    };
+                    (Some(reply), vec![], false)
+                } else {
                 let mut fds = owned.into_iter();
                 let result = if daemon.stale_window_frame(native_window, pid) {
                     crate::debug!("retired Android root frame dropped: native={native_window:#x} surface={surface_id}");
@@ -468,6 +629,7 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
                     Err(message) => Message::Error { code: -22, message },
                 };
                 (Some(reply), vec![], false)
+                }
             }
             Message::PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset, top_down } => {
                 // SAFETY: these fds arrived via SCM_RIGHTS and are now ours.

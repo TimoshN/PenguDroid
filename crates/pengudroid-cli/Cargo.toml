@@ -19,10 +19,20 @@ pengudroid-hostgpu.workspace = true
 pengudroid-nativebridge.workspace = true
 pengudroid-daemon.workspace = true
 libc.workspace = true
+wayland-client = { workspace = true, optional = true }
+wayland-scanner = { version = "0.31.7", optional = true }
+wayland-backend = { version = "0.3", optional = true }
 miniz_oxide.workspace = true
 flate2 = "1.1.10"
 tar = "0.4.46"
 roxmltree = "0.21.2"
+
+[features]
+# The `pengudroid` binary (desktop and the release packaging) enables these;
+# pengudroid-gui links the library only to dispatch CLI commands and does not
+# need the Wayland probe machinery.
+default = ["wlegl-probe"]
+wlegl-probe = ["dep:wayland-client", "dep:wayland-backend", "dep:wayland-scanner"]
 
 [lib]
 name = "pengudroid_cli"

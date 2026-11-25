@@ -284,6 +284,10 @@ pub enum InputKind {
     ClipboardAction { action: u8 },
     /// Actual compositor visibility for a mapped Android window.
     WindowVisibility { visible: bool },
+    /// One compositor frame callback: the guest's display clock is paced by
+    /// this, not by a free-running timer. `vsync_time_ns` is CLOCK_MONOTONIC,
+    /// `interval_ns` the measured compositor frame period.
+    Vsync { vsync_time_ns: i64, interval_ns: i64 },
 }
 
 impl InputKind {
@@ -301,8 +305,38 @@ impl InputKind {
             InputKind::FinishComposing => 10,
             InputKind::ClipboardAction { .. } => 11,
             InputKind::WindowVisibility { .. } => 12,
+            InputKind::Vsync { .. } => 13,
         }
     }
+}
+
+/// Small public helpers used by the frame/vsync channel, which shares the
+/// `InputEvent` wire format with real pointer/key events but is produced by
+/// the daemon rather than by the compositor's input devices.
+pub fn vsync_input_event(surface_id: u32, vsync_time_ns: i64, interval_ns: i64) -> Vec<u8> {
+    let mut encoder = Encoder::new(MsgKind::InputEvent);
+    encoder.u32(surface_id);
+    encoder.u8(13); // InputKind::Vsync
+    encoder.u64(vsync_time_ns as u64);
+    encoder.u64(interval_ns as u64);
+    encoder.into_frame()
+}
+
+pub fn decode_input_kind(body: &[u8]) -> Option<(u32, InputKind)> {
+    let mut decoder = Decoder::new(body);
+    let kind = decoder.u8().ok()?;
+    if MsgKind::from_u8(kind).ok()? != MsgKind::InputEvent {
+        return None;
+    }
+    let surface_id = decoder.u32().ok()?;
+    let event = match decoder.u8().ok()? {
+        13 => InputKind::Vsync {
+            vsync_time_ns: decoder.u64().ok()? as i64,
+            interval_ns: decoder.u64().ok()? as i64,
+        },
+        _ => return None,
+    };
+    Some((surface_id, event))
 }
 
 /// Visible source pixels in allocation coordinates, with exclusive right/bottom.
@@ -857,6 +891,10 @@ impl Message {
                     InputKind::FinishComposing => {}
                     InputKind::ClipboardAction { action } => e.u8(*action),
                     InputKind::WindowVisibility { visible } => e.u8(u8::from(*visible)),
+                    InputKind::Vsync { vsync_time_ns, interval_ns } => {
+                        e.u64(*vsync_time_ns as u64);
+                        e.u64(*interval_ns as u64);
+                    }
                 }
             }
         }
@@ -1068,6 +1106,10 @@ impl Message {
                     10 => InputKind::FinishComposing,
                     11 => InputKind::ClipboardAction { action: d.u8()? },
                     12 => InputKind::WindowVisibility { visible: d.u8()? != 0 },
+                    13 => InputKind::Vsync {
+                        vsync_time_ns: d.u64()? as i64,
+                        interval_ns: d.u64()? as i64,
+                    },
                     other => return Err(ProtoError::BadKind(other)),
                 };
                 InputEvent { surface_id, event }
@@ -1215,6 +1257,14 @@ pub mod abi {
     pub const ANDROID_RGBA_8888: u32 = 1;
     /// PresentShm carries a linear native/gralloc fd, not a CPU memfd image.
     pub const NATIVE_FD_FLAG: u32 = 0x8000_0000;
+    /// PresentShm fd count: the native handle holds all its fds, not just one.
+    /// Next comes `native_handle_ints` (u32 count + int32 words), matching the
+    /// wire format `android_wlegl.create_handle` expects.
+    pub const WLEGL_FD_FLAG: u32 = 0x4000_0000;
+    /// HAL_PIXEL_FORMAT_BGRA_8888, the format android_wlegl/gralloc speaks.
+    pub const HAL_BGRA_8888: i32 = 5;
+    /// GRALLOC_USAGE_SW_READ_OFTEN|SW_WRITE_OFTEN|HW_TEXTURE|HW_RENDER.
+    pub const GRALLOC_USAGE_LINEAR_TEXTURE: i32 = 0x303;
 
     /// Android 17 (API 37) runtime identity.
     pub const ANDROID_API_LEVEL: i32 = 37;

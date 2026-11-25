@@ -7,9 +7,51 @@ use std::ffi::{CString, c_char, c_int, c_void};
 use std::os::fd::RawFd;
 use std::sync::{Condvar, Mutex, OnceLock};
 
-use pengudroid_proto::abi::{ANDROID_RGBA_8888, NATIVE_FD_FLAG};
+use pengudroid_proto::abi::{ANDROID_RGBA_8888, HAL_BGRA_8888,
+    NATIVE_FD_FLAG, WLEGL_FD_FLAG};
 use pengudroid_proto::{BufferCrop, Message};
 use pengudroid_socket::Connection;
+
+/// `PresentShm`'s `native_window` field carries an Android native handle for
+/// `android_wlegl` rather than a window id when it carries this marker.
+const WLEGL_MAGIC: u64 = 0x776c_6567_6c00_0000;
+
+/// `android_wlegl` needs the whole `native_handle_t`, not just one mmap-able
+/// fd: `create_handle(num_fds, ints)` plus one `add_fd` per descriptor.
+/// Keeping the two pieces next to the target makes both presentation paths
+/// (wl_shm and android_wlegl) usable on the very same allocation.
+#[derive(Clone)]
+struct WleglHandle {
+    fds: Vec<RawFd>,
+    ints: Vec<i32>,
+}
+
+fn wlegl_handle(handle: *mut c_void) -> Option<WleglHandle> {
+    if handle.is_null() {
+        return None;
+    }
+    let header = handle as *const i32;
+    let (num_fds, num_ints) = unsafe { (*header.add(1), *header.add(2)) };
+    if !(1..=64).contains(&num_fds) || !(0..=1024).contains(&num_ints) {
+        return None;
+    }
+    let mut fds = Vec::with_capacity(num_fds as usize);
+    for index in 0..num_fds as usize {
+        fds.push(unsafe { *header.add(3 + index) });
+    }
+    let mut ints = Vec::with_capacity(num_ints as usize);
+    for index in 0..num_ints as usize {
+        ints.push(unsafe { *header.add(3 + num_fds as usize + index) });
+    }
+    Some(WleglHandle { fds, ints })
+}
+
+/// True when the launcher opted into the compositor's native-buffer transport.
+/// It needs no capability probe on the guest side: the daemon decides and
+/// falls back to wl_shm if the compositor lacks `android_wlegl`.
+fn wlegl_requested() -> bool {
+    env_truthy("PENGUDROID_GRALLOC_WLEGL")
+}
 
 #[cfg(target_arch = "aarch64")]
 use super::mapped_elf_base;
@@ -26,6 +68,8 @@ pub(super) struct GrallocTarget {
     pub(super) handle: *mut c_void,
     pub(super) fd: RawFd,
     pub(super) stride: u32,
+    /// Full native handle, used when the daemon presents via android_wlegl.
+    wlegl: Option<WleglHandle>,
 }
 
 pub(super) struct GrallocFlipBuffer {
@@ -379,7 +423,7 @@ pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
 
 /// Present the native gralloc allocation through wl_shm. Unlike PresentDmabuf
 /// this needs no compositor dma-buf global; wl_shm accepts any mmap-able fd.
-pub(super) unsafe fn present_gralloc_shm(surface: EGLSurface) -> Result<(), String> {
+pub(super) unsafe fn present_gralloc(surface: EGLSurface) -> Result<(), String> {
     let host = host()?;
     let rec = &mut *(surface as *mut SurfaceRec);
     let current = host
@@ -408,14 +452,55 @@ pub(super) unsafe fn present_gralloc_shm(surface: EGLSurface) -> Result<(), Stri
             std::io::Error::last_os_error()
         ));
     }
-    let result = present_gralloc_fd(fd, rec, target.stride * 4);
+    let stride_bytes = target.stride * 4;
+    let wlegl = target.wlegl.clone();
+    if wlegl_requested() {
+        sync_gralloc_for_present(host, target, rec.w, rec.h);
+    }
+    let result = present_gralloc_fd(fd, rec, stride_bytes, wlegl.as_ref());
     libc::close(fd);
     result
 }
 
+/// Invalidate the compositor's view of the native buffer after a GPU write.
+///
+/// Lipstick imports the gralloc buffer as an EGLImage once; without a
+/// `hybris_gralloc_lock`/`unlock` pair it keeps showing the pixels that were
+/// present at import time, so a GPU-rendered guest appears frozen while its
+/// FBO content keeps changing. The CPU paint path did this implicitly, which
+/// is why the probe worked and the guest did not.
+unsafe fn sync_gralloc_for_present(
+    host: &Host,
+    target: &GrallocTarget,
+    width: u32,
+    height: u32,
+) {
+    let Ok(api) = gralloc_api(host) else {
+        return;
+    };
+    let mut vaddr: *mut c_void = std::ptr::null_mut();
+    let rc = (api.lock)(
+        target.handle,
+        0x303,
+        0,
+        0,
+        width as i32,
+        height as i32,
+        &mut vaddr,
+    );
+    if rc == 0 {
+        let _ = (api.unlock)(target.handle);
+    }
+}
+
 /// Send one already-synchronized native buffer. The caller retains ownership
 /// of `fd`; the socket duplicates it into the daemon during SCM_RIGHTS send.
-fn present_gralloc_fd(fd: RawFd, rec: &mut SurfaceRec, stride: u32) -> Result<(), String> {
+fn present_gralloc_fd(
+    fd: RawFd,
+    rec: &mut SurfaceRec,
+    stride: u32,
+    wlegl: Option<&WleglHandle>,
+) -> Result<(), String> {
     let mut st = lock_state();
     let surface_id = ensure_surface_id(&mut st, rec)?;
     let mut conn = st
@@ -435,6 +520,7 @@ fn present_gralloc_fd(fd: RawFd, rec: &mut SurfaceRec, stride: u32) -> Result<()
         stride,
         fd,
         native_window,
+        wlegl,
     );
     if result.is_err() {
         st.conn = None;
@@ -453,6 +539,7 @@ fn present_gralloc_metadata(
     stride: u32,
     fd: RawFd,
     native_window: u64,
+    wlegl: Option<&WleglHandle>,
 ) -> Result<(), String> {
     let mut st = lock_state();
     let mut conn = st
@@ -467,6 +554,7 @@ fn present_gralloc_metadata(
         stride,
         fd,
         native_window,
+        wlegl,
     );
     if result.is_err() {
         st.conn = None;
@@ -485,28 +573,66 @@ fn transmit_gralloc(
     stride: u32,
     fd: RawFd,
     native_window: u64,
+    wlegl: Option<&WleglHandle>,
 ) -> Result<(), String> {
-    let message = Message::PresentShm {
-        surface_id,
-        width,
-        height,
-        stride,
-        format: ANDROID_RGBA_8888 | NATIVE_FD_FLAG,
-        native_window,
-        crop: BufferCrop::full(width as i32, height as i32),
-    };
-    conn.send_message(&message, &[fd])
-        .map_err(|e| format!("gralloc wl_shm send failed: {e}"))?;
+    let use_wlegl = wlegl_requested();
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        eprintln!(
+            "[gleshim:gralloc] presentation transport: {}",
+            if use_wlegl && wlegl.is_some() { "android_wlegl" } else { "wl_shm" }
+        );
+    });
+    match wlegl.filter(|_| use_wlegl) {
+        Some(handle) => {
+            // android_wlegl needs every fd of the native handle plus its ints;
+            // the daemon builds `create_handle`/`add_fd`/`create_buffer` from
+            // this instead of importing the fd into a wl_shm pool.
+            let message = Message::PresentShm {
+                surface_id,
+                width,
+                height,
+                stride,
+                format: HAL_BGRA_8888 as u32 | NATIVE_FD_FLAG | WLEGL_FD_FLAG,
+                native_window: WLEGL_MAGIC | handle.ints.len() as u64,
+                crop: BufferCrop::full(width as i32, height as i32),
+            };
+            conn.send_message(&message, &handle.fds)
+                .map_err(|e| format!("android_wlegl native handle send failed: {e}"))?;
+            // The int words ride in a small extra frame right after the fd
+            // list, so no protocol struct changes and the receiver can tell
+            // the two parts apart by WLEGL_MAGIC.
+            let mut ints = Vec::with_capacity(handle.ints.len() * 4);
+            for word in &handle.ints {
+                ints.extend_from_slice(&word.to_le_bytes());
+            }
+            conn.send_frame(&ints, &[])
+                .map_err(|e| format!("android_wlegl native ints send failed: {e}"))?;
+        }
+        None => {
+            let message = Message::PresentShm {
+                surface_id,
+                width,
+                height,
+                stride,
+                format: ANDROID_RGBA_8888 | NATIVE_FD_FLAG,
+                native_window,
+                crop: BufferCrop::full(width as i32, height as i32),
+            };
+            conn.send_message(&message, &[fd])
+                .map_err(|e| format!("gralloc wl_shm send failed: {e}"))?;
+        }
+    }
     let (reply, fds) = conn
         .recv_message()
-        .map_err(|e| format!("gralloc wl_shm reply failed: {e}"))?;
+        .map_err(|e| format!("gralloc present reply failed: {e}"))?;
     close_fds(&fds);
     match reply {
         Message::Ack => Ok(()),
         Message::Error { code, message } => {
-            Err(format!("gralloc wl_shm rejected ({code}): {message}"))
+            Err(format!("gralloc present rejected ({code}): {message}"))
         }
-        other => Err(format!("unexpected gralloc wl_shm reply: {other:?}")),
+        other => Err(format!("unexpected gralloc present reply: {other:?}")),
     }
 }
 
@@ -518,6 +644,7 @@ struct PendingGrallocFrame {
     stride: u32,
     fd: RawFd,
     native_window: u64,
+    wlegl: Option<WleglHandle>,
     display: usize,
     sync: usize,
     frame: u64,
@@ -561,6 +688,7 @@ fn async_presenter() -> &'static std::sync::mpsc::Sender<PendingGrallocFrame> {
                         present_gralloc_metadata(
                             frame.surface_id, frame.width, frame.height, frame.stride, frame.fd,
                             frame.native_window,
+                            frame.wlegl.as_ref(),
                         )
                     } else {
                         Err(format!("async GPU fence did not signal: {waited:?}"))
@@ -647,6 +775,9 @@ pub(super) unsafe fn queue_gralloc_async(surface: EGLSurface, host: &Host) -> Re
         ));
     }
     let (width, height, stride) = (rec.w, rec.h, output.stride * 4);
+    // The async worker owns its own copy of the native handle description; the
+    // fds themselves are duplicated by SCM_RIGHTS on every present.
+    let wlegl = output.wlegl.clone();
     let display = lock_state().display;
     let sync = create(display as EGLDisplay, 0x30F9, std::ptr::null()); // EGL_SYNC_FENCE_KHR
     if sync.is_null() {
@@ -690,6 +821,7 @@ pub(super) unsafe fn queue_gralloc_async(surface: EGLSurface, host: &Host) -> Re
         } else {
             0
         },
+        wlegl,
         display,
         sync: sync as usize,
         frame,
@@ -821,12 +953,17 @@ type GrallocAllocate =
     unsafe extern "C" fn(u32, u32, c_int, u32, *mut *mut c_void, *mut u32) -> c_int;
 type GrallocRelease = unsafe extern "C" fn(*mut c_void, c_int);
 type GrallocDeinitialize = unsafe extern "C" fn();
+type GrallocLock =
+    unsafe extern "C" fn(*mut c_void, i32, i32, i32, i32, i32, *mut *mut c_void) -> i32;
+type GrallocUnlock = unsafe extern "C" fn(*mut c_void) -> i32;
 
 struct GrallocApi {
     initialize: GrallocInitialize,
     allocate: GrallocAllocate,
     release: GrallocRelease,
     deinitialize: GrallocDeinitialize,
+    lock: GrallocLock,
+    unlock: GrallocUnlock,
 }
 
 /// Check the actually loaded GL stack and the complete native-buffer API.
@@ -945,10 +1082,82 @@ unsafe fn log_hybris_ipc_state() {
 #[cfg(not(target_arch = "aarch64"))]
 unsafe fn log_hybris_ipc_state() {}
 
+#[repr(C)]
+struct BridgeStats {
+    key_creates: usize,
+    key_deletes: usize,
+    getspecific: usize,
+    setspecific: usize,
+    once: usize,
+    last_key: usize,
+}
+
+fn trace_pthread_bridge(host: &Host, phase: &str) {
+    if std::env::var_os("PENGUDROID_HYBRIS_TLS_BRIDGE").is_none() || !host.gl_isolated {
+        return;
+    }
+    let Some(gleshim) = std::env::var_os("PENGUDROID_GLESHIM") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(gleshim)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("libpengudroid_hybris_pthread.so");
+    let Ok(c_path) = CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    let handle = unsafe {
+        libc::dlmopen(
+            host.gl_namespace,
+            c_path.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NOLOAD,
+        )
+    };
+    if handle.is_null() {
+        eprintln!("[gleshim:bridge] {phase}: bridge is not mapped in the Hybris namespace");
+        return;
+    }
+    type StatsFn = unsafe extern "C" fn(*mut BridgeStats);
+    let Some(stats_fn) =
+        sym_ptr(handle, "__pengudroid_hybris_pthread_stats").and_then(cast_fn::<StatsFn>)
+    else {
+        eprintln!("[gleshim:bridge] {phase}: stats symbol is unavailable");
+        return;
+    };
+    let mut stats = BridgeStats {
+        key_creates: 0,
+        key_deletes: 0,
+        getspecific: 0,
+        setspecific: 0,
+        once: 0,
+        last_key: usize::MAX,
+    };
+    unsafe { stats_fn(&mut stats) };
+    eprintln!(
+        "[gleshim:bridge] {phase}: create={} delete={} get={} set={} once={} last_key={:#x}",
+        stats.key_creates,
+        stats.key_deletes,
+        stats.getspecific,
+        stats.setspecific,
+        stats.once,
+        stats.last_key,
+    );
+}
+
+fn prepare_hybris_tls(host: &Host) {
+    if std::env::var_os("PENGUDROID_HYBRIS_TLS_BRIDGE").is_some() {
+        // Opt-in experiment: the bridge must prove that it serves HIDL instead
+        // of falling back to the verified runtime gTLS rewrite.
+        trace_pthread_bridge(host, "before HIDL allocation");
+    } else {
+        hybris_tls::rekey_gralloc();
+    }
+}
+
 unsafe fn gralloc_api(host: &Host) -> Result<GrallocApi, String> {
     // Only Linux+Hybris/gralloc enters this architecture-specific workaround.
     // Ordinary Linux and the dma-buf path never call it.
-    hybris_tls::rekey_gralloc();
+    prepare_hybris_tls(host);
     let handle = open_host_gralloc(host);
     if handle.is_null() {
         return Err("cannot load host libgralloc.so.1".into());
@@ -966,6 +1175,12 @@ unsafe fn gralloc_api(host: &Host) -> Result<GrallocApi, String> {
         deinitialize: sym_ptr(handle, "hybris_gralloc_deinitialize")
             .and_then(cast_fn)
             .ok_or("hybris_gralloc_deinitialize is unavailable")?,
+        lock: sym_ptr(handle, "hybris_gralloc_lock")
+            .and_then(cast_fn)
+            .ok_or("hybris_gralloc_lock is unavailable")?,
+        unlock: sym_ptr(handle, "hybris_gralloc_unlock")
+            .and_then(cast_fn)
+            .ok_or("hybris_gralloc_unlock is unavailable")?,
     })
 }
 
@@ -974,9 +1189,11 @@ unsafe fn allocate_gralloc(host: &Host, width: u32, height: u32) -> Result<Grall
     let mut handle = std::ptr::null_mut();
     let mut stride = 0u32;
     (api.initialize)(0);
+    trace_pthread_bridge(host, "after gralloc initialize");
     log_hybris_ipc_state();
     // HW_RENDER | HW_TEXTURE | SW_READ_OFTEN: request linear CPU-readable data.
     let rc = (api.allocate)(width, height, 5, 0x303, &mut handle, &mut stride);
+    trace_pthread_bridge(host, "after gralloc allocate");
     if rc != 0 || handle.is_null() {
         (api.deinitialize)();
         return Err(format!(
@@ -1041,7 +1258,7 @@ unsafe fn allocate_gralloc(host: &Host, width: u32, height: u32) -> Result<Grall
         (api.deinitialize)();
         return Err("gralloc handle has an invalid file descriptor".into());
     }
-    Ok(GrallocTarget { handle, fd, stride })
+    Ok(GrallocTarget { handle, fd, stride, wlegl: wlegl_handle(handle) })
 }
 
 fn native_window_buffer(
@@ -1240,7 +1457,7 @@ unsafe fn probe_gralloc() -> Result<(), String> {
     let deinitialize: Deinitialize = sym_ptr(gralloc, "hybris_gralloc_deinitialize")
         .and_then(cast_fn)
         .ok_or("hybris_gralloc_deinitialize is unavailable")?;
-    hybris_tls::rekey_gralloc();
+    prepare_hybris_tls(host);
     let mut handle = std::ptr::null_mut();
     let mut stride = 0u32;
     initialize(0);

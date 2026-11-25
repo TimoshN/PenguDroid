@@ -32,6 +32,15 @@ pub fn daemon_command(binary: &Path) -> Command {
     let mut command = Command::new(binary);
     if option_env!("PENGUDROID_AURORA_UNIFIED").is_some() {
         command.arg("__daemon");
+        // Propagate the verified native-buffer transport and compositor clock
+        // into the broker process itself; the daemon is spawned before any
+        // guest-specific environment is applied.
+        // Opt-in only: forward these switches when the caller set them.
+        for name in ["PENGUDROID_GRALLOC_WLEGL", "PENGUDROID_VSYNC_COMPOSITOR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
     }
     command
 }

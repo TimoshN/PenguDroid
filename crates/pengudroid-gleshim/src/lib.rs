@@ -1703,6 +1703,25 @@ pub extern "C" fn pengudroid_input_inject_key(keycode: u32, pressed: i32) {
 /// reader thread only ever appends to [`INPUT_QUEUE`].
 fn subscribe_input(surface_id: u32) {
     HAS_WINDOW.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Start the compositor-clock subscription as soon as a real window exists,
+    // independently of the first requestNextVsync (which some apps never
+    // issue, e.g. MAX).
+    if std::env::var_os("PENGUDROID_VSYNC_COMPOSITOR").is_some() {
+        let ptr = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                b"__pengudroid_vsync_request\0".as_ptr().cast(),
+            )
+        };
+        if ptr.is_null() {
+            eprintln!("[gleshim] compositor vsync: shim hook unavailable");
+        } else {
+            eprintln!("[gleshim] compositor vsync: starting via shim hook (surface {surface_id})");
+            let hook: unsafe extern "C" fn(usize) = unsafe { std::mem::transmute(ptr) };
+            unsafe { hook(0) };
+            eprintln!("[gleshim] compositor vsync: shim hook returned");
+        }
+    }
     std::thread::spawn(move || {
         let conn = match Connection::connect_endpoint(&default_socket_path()) {
             Ok(c) => c,
@@ -1735,6 +1754,23 @@ fn subscribe_input(surface_id: u32) {
             match conn.recv_message() {
                 Ok((Message::InputEvent { surface_id, event }, fds)) => {
                     close_fds(&fds);
+                    if let pengudroid_proto::InputKind::Vsync { vsync_time_ns, interval_ns } = event {
+                        // A compositor frame pulse is the display clock, not
+                        // user input: deliver it straight to the shim's clock
+                        // instead of queueing it as a pointer/key event.
+                        let ptr = unsafe {
+                            libc::dlsym(
+                                libc::RTLD_DEFAULT,
+                                b"__pengudroid_vsync_compositor_pulse\0".as_ptr().cast(),
+                            )
+                        };
+                        if !ptr.is_null() {
+                            let hook: unsafe extern "C" fn(i64, i64) =
+                                unsafe { std::mem::transmute(ptr) };
+                            unsafe { hook(vsync_time_ns, interval_ns) };
+                        }
+                        continue;
+                    }
                     record_touch_debug(&event);
                     record_frame_touch(&event);
                     if std::env::var_os("PENGUDROID_TRACE_INPUT_TIMING").is_some() {
@@ -1949,6 +1985,9 @@ pub unsafe extern "C" fn pengudroid_input_poll(out: *mut u8) -> i32 {
             if visible { notify_input_wakeup_vsync(); }
             (12, if visible { 1.0 } else { 0.0 }, 0.0)
         }
+        // Compositor frame pulses are consumed by the input subscription
+        // thread itself; one that survives to here is simply not input.
+        pengudroid_proto::InputKind::Vsync { .. } => (13, 0.0, 0.0),
     };
     let buf = std::slice::from_raw_parts_mut(out, 16);
     buf[0..4].copy_from_slice(&surface_id.to_le_bytes());
@@ -4180,11 +4219,11 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
                 Err(error) => {
                     eprintln!("[gleshim:gralloc] async queue failed, using synchronous fence fallback: {error}");
                     if let Some(finish) = host.gl_finish { finish(); }
-                    gralloc::present_gralloc_shm(surface)
+                    gralloc::present_gralloc(surface)
                 }
             }
         } else {
-            gralloc::present_gralloc_shm(surface)
+            gralloc::present_gralloc(surface)
         };
         let present_elapsed = present_started.elapsed();
         let gralloc_presented = presented.is_ok();

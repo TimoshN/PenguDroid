@@ -1,59 +1,131 @@
 //! Unify Hybris/Bionic pthread keys with the host glibc key allocator.
 //!
-//! Aurora's isolated Hybris namespace otherwise loads its own Bionic libc.
-//! Bionic and glibc can then both allocate (for example) key 2.  When their
-//! per-thread slots coincide, Hybris `eglGetError` treats Android libbinder's
-//! `IPCThreadState*` as its EGL error record and overwrites `mProcess`.
-//!
-//! This DSO is deliberately tiny and contains no EGL entry points.  It is
-//! loaded first into the isolated namespace.  Its LIBC exports satisfy Hybris'
-//! Bionic references, while each body branches to the explicitly versioned
-//! host-glibc implementation.  Caller-owned `pthread_once_t` and destructor
-//! callbacks retain their normal C ABI.
+//! The LIBC exports satisfy Hybris' Bionic references and branch to explicitly
+//! versioned host-glibc implementations. Counters are deliberately tiny and
+//! allocation-free so gleshim can verify whether an internal-Hybris DSO really
+//! resolves pthread calls through this bridge instead of assuming it does.
+
+use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(target_arch = "aarch64")]
-std::arch::global_asm!(r#"
-    .text
-    .p2align 2
-
-    .macro HYBRIS_PTHREAD_FORWARD name, host
-    .global __pengudroid_hybris_\name
-    .type __pengudroid_hybris_\name, %function
-    .symver __pengudroid_hybris_\name, \name@LIBC
-    .symver __pengudroid_host_\name, \host@GLIBC_2.34
-__pengudroid_hybris_\name:
-    b __pengudroid_host_\name
-    .size __pengudroid_hybris_\name, .-__pengudroid_hybris_\name
-    .endm
-
-    HYBRIS_PTHREAD_FORWARD pthread_key_create, pthread_key_create
-    HYBRIS_PTHREAD_FORWARD pthread_key_delete, pthread_key_delete
-    HYBRIS_PTHREAD_FORWARD pthread_getspecific, pthread_getspecific
-    HYBRIS_PTHREAD_FORWARD pthread_setspecific, pthread_setspecific
-    HYBRIS_PTHREAD_FORWARD pthread_once, pthread_once
-"#);
+std::arch::global_asm!(
+    r#"
+    .symver pengudroid_hybris_key_create, pthread_key_create@LIBC
+    .symver pengudroid_hybris_key_delete, pthread_key_delete@LIBC
+    .symver pengudroid_hybris_getspecific, pthread_getspecific@LIBC
+    .symver pengudroid_hybris_setspecific, pthread_setspecific@LIBC
+    .symver pengudroid_hybris_once, pthread_once@LIBC
+    .symver __pengudroid_host_key_create, pthread_key_create@GLIBC_2.34
+    .symver __pengudroid_host_key_delete, pthread_key_delete@GLIBC_2.34
+    .symver __pengudroid_host_getspecific, pthread_getspecific@GLIBC_2.34
+    .symver __pengudroid_host_setspecific, pthread_setspecific@GLIBC_2.34
+    .symver __pengudroid_host_once, pthread_once@GLIBC_2.34
+"#
+);
 
 #[cfg(target_arch = "arm")]
-std::arch::global_asm!(r#"
-    .syntax unified
-    .arch armv7-a
-    .arm
-    .text
-    .p2align 2
+std::arch::global_asm!(
+    r#"
+    .symver pengudroid_hybris_key_create, pthread_key_create@LIBC
+    .symver pengudroid_hybris_key_delete, pthread_key_delete@LIBC
+    .symver pengudroid_hybris_getspecific, pthread_getspecific@LIBC
+    .symver pengudroid_hybris_setspecific, pthread_setspecific@LIBC
+    .symver pengudroid_hybris_once, pthread_once@LIBC
+    .symver __pengudroid_host_key_create, pthread_key_create@GLIBC_2.4
+    .symver __pengudroid_host_key_delete, pthread_key_delete@GLIBC_2.4
+    .symver __pengudroid_host_getspecific, pthread_getspecific@GLIBC_2.4
+    .symver __pengudroid_host_setspecific, pthread_setspecific@GLIBC_2.4
+    .symver __pengudroid_host_once, pthread_once@GLIBC_2.4
+"#
+);
 
-    .macro HYBRIS_PTHREAD_FORWARD name
-    .global __pengudroid_hybris_\name
-    .type __pengudroid_hybris_\name, %function
-    .symver __pengudroid_hybris_\name, \name@LIBC
-    .symver __pengudroid_host_\name, \name@GLIBC_2.4
-__pengudroid_hybris_\name:
-    b __pengudroid_host_\name
-    .size __pengudroid_hybris_\name, .-__pengudroid_hybris_\name
-    .endm
+extern "C" {
+    #[link_name = "__pengudroid_host_key_create"]
+    fn host_key_create(
+        key: *mut u32,
+        destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> c_int;
+    #[link_name = "__pengudroid_host_key_delete"]
+    fn host_key_delete(key: u32) -> c_int;
+    #[link_name = "__pengudroid_host_getspecific"]
+    fn host_getspecific(key: u32) -> *mut c_void;
+    #[link_name = "__pengudroid_host_setspecific"]
+    fn host_setspecific(key: u32, value: *mut c_void) -> c_int;
+    #[link_name = "__pengudroid_host_once"]
+    fn host_once(once: *mut c_int, routine: Option<unsafe extern "C" fn()>) -> c_int;
+}
 
-    HYBRIS_PTHREAD_FORWARD pthread_key_create
-    HYBRIS_PTHREAD_FORWARD pthread_key_delete
-    HYBRIS_PTHREAD_FORWARD pthread_getspecific
-    HYBRIS_PTHREAD_FORWARD pthread_setspecific
-    HYBRIS_PTHREAD_FORWARD pthread_once
-"#);
+static KEY_CREATES: AtomicUsize = AtomicUsize::new(0);
+static KEY_DELETES: AtomicUsize = AtomicUsize::new(0);
+static GETSPECIFIC: AtomicUsize = AtomicUsize::new(0);
+static SETSPECIFIC: AtomicUsize = AtomicUsize::new(0);
+static ONCE: AtomicUsize = AtomicUsize::new(0);
+static LAST_KEY: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+#[repr(C)]
+pub struct BridgeStats {
+    pub key_creates: usize,
+    pub key_deletes: usize,
+    pub getspecific: usize,
+    pub setspecific: usize,
+    pub once: usize,
+    pub last_key: usize,
+}
+
+/// Return an allocation-free snapshot for gleshim diagnostics. The layout is
+/// native word-sized independently on AArch64 and ARMv7.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_hybris_pthread_stats(out: *mut BridgeStats) {
+    if out.is_null() {
+        return;
+    }
+    out.write(BridgeStats {
+        key_creates: KEY_CREATES.load(Ordering::Relaxed),
+        key_deletes: KEY_DELETES.load(Ordering::Relaxed),
+        getspecific: GETSPECIFIC.load(Ordering::Relaxed),
+        setspecific: SETSPECIFIC.load(Ordering::Relaxed),
+        once: ONCE.load(Ordering::Relaxed),
+        last_key: LAST_KEY.load(Ordering::Relaxed),
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pengudroid_hybris_key_create(
+    key: *mut u32,
+    destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> c_int {
+    KEY_CREATES.fetch_add(1, Ordering::Relaxed);
+    let result = host_key_create(key, destructor);
+    if result == 0 && !key.is_null() {
+        LAST_KEY.store(key.read() as usize, Ordering::Relaxed);
+    }
+    result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pengudroid_hybris_key_delete(key: u32) -> c_int {
+    KEY_DELETES.fetch_add(1, Ordering::Relaxed);
+    host_key_delete(key)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pengudroid_hybris_getspecific(key: u32) -> *mut c_void {
+    GETSPECIFIC.fetch_add(1, Ordering::Relaxed);
+    host_getspecific(key)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pengudroid_hybris_setspecific(key: u32, value: *mut c_void) -> c_int {
+    SETSPECIFIC.fetch_add(1, Ordering::Relaxed);
+    host_setspecific(key, value)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pengudroid_hybris_once(
+    once: *mut c_int,
+    routine: Option<unsafe extern "C" fn()>,
+) -> c_int {
+    ONCE.fetch_add(1, Ordering::Relaxed);
+    host_once(once, routine)
+}
