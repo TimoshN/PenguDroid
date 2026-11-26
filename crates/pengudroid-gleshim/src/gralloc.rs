@@ -81,8 +81,6 @@ pub(super) fn async_requested() -> bool {
     }).unwrap_or_else(|_| wlegl_requested())
 }
 
-#[cfg(target_arch = "aarch64")]
-use super::mapped_elf_base;
 use super::{
     CURRENT_CONTEXT, EGL_CONDITION_SATISFIED_KHR, EGLClientBuffer, EGLDisplay, EGLSurface, EGLSync,
     FRAME_TRACE_STATE, GL_COLOR_ATTACHMENT0, GL_COLOR_BUFFER_BIT, GL_FRAMEBUFFER,
@@ -1085,55 +1083,58 @@ unsafe fn open_host_gralloc(host: &Host) -> *mut c_void {
     handle
 }
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn log_hybris_ipc_state() {
+/// Portable attribution of the Hybris/HIDL binder TLS state.
+///
+/// The earlier version recognised `IPCThreadState::self()` in libhidlbase by a
+/// byte signature at a fixed offset and read fields at fixed offsets; that
+/// silently stopped working on every other droid-stack build (the two
+/// MediaTeк devices here both failed the signature). Both libraries export
+/// `IPCThreadState::selfOrNull()` and `process()`, so the state is resolved
+/// by symbol and only the one field that matters is read through the exported
+/// accessor: no offsets, no signatures.
+pub(super) unsafe fn log_hybris_ipc_state() {
     if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_none() {
         return;
     }
-    let Some(base) = mapped_elf_base("/usr/libexec/droid-hybris/system/lib64/libhidlbase.so")
-    else {
-        return;
-    };
-    if std::ptr::read_unaligned((base + 0x88af0) as *const u64) != 0xa9014ff4a9be7bfd {
-        return;
-    }
-    type IpcSelf = unsafe extern "C" fn() -> *mut c_void;
-    let self_fn: IpcSelf = std::mem::transmute(base + 0x88af0);
-    let state = self_fn();
-    if state.is_null() {
-        return;
-    }
-    let restriction = *((state as *mut u8).add(512) as *const i32);
-    let key = *((base + 0xa5c9c) as *const u32);
-    let guest = mapped_elf_base("/data/lib/libbinder.so").and_then(|guest_base| {
-        if std::ptr::read_unaligned((guest_base + 0x54458) as *const u64) != 0xa9014ff4a9be7bfd {
-            return None;
+    let Ok(host) = host() else { return };
+    let report = |label: &str, library: &str| {
+        let Ok(name) = CString::new(library) else { return };
+        // The library is already mapped in the isolated Hybris namespace; NOLOAD
+        // only hands back its handle, it must not pull anything new in.
+        let handle = libc::dlmopen(
+            host.gl_namespace,
+            name.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NOLOAD,
+        );
+        if handle.is_null() {
+            return;
         }
-        let self_fn: IpcSelf = std::mem::transmute(guest_base + 0x54458);
-        Some(self_fn())
-    });
-    let process = *(state as *mut *mut u8);
-    let process_restriction = if process.is_null() {
-        -1
-    } else {
-        *(process.add(192) as *const i32)
+        type SelfFn = unsafe extern "C" fn() -> *mut c_void;
+        type ProcessFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+        let Some(self_fn) = sym_ptr(handle, "_ZN7android8hardware14IPCThreadState10selfOrNullEv")
+            .or_else(|| sym_ptr(handle, "_ZN7android14IPCThreadState10selfOrNullEv"))
+            .and_then(cast_fn::<SelfFn>)
+        else {
+            eprintln!("[gleshim] {label}: {library}: IPCThreadState::selfOrNull is not exported");
+            return;
+        };
+        let state = unsafe { self_fn() };
+        let process = sym_ptr(handle, "_ZN7android8hardware14IPCThreadState7processEv")
+            .or_else(|| sym_ptr(handle, "_ZN7android14IPCThreadState7processEv"))
+            .and_then(cast_fn::<ProcessFn>)
+            .map(|process| unsafe { process(state) });
+        eprintln!(
+            "[gleshim] {label}: {library} IPCThreadState={:p} process={}",
+            state,
+            process.map_or("n/a".to_string(), |p| format!("{p:p}")),
+        );
     };
-    let art = mapped_elf_base("/data/lib/libart.so").and_then(|base| {
-        if std::ptr::read_unaligned((base + 0x96d480) as *const u64) != 0x90001608d503245f {
-            return None;
-        }
-        let current: IpcSelf = std::mem::transmute(base + 0x96d480);
-        Some(current())
-    });
-    eprintln!(
-        "[gleshim] Hybris HIDL state={state:p} key={key} restriction={restriction} process={process:p} process_restriction={process_restriction} guest={:p} art={:p}",
-        guest.unwrap_or(std::ptr::null_mut()),
-        art.unwrap_or(std::ptr::null_mut())
-    );
+    let libdir = if cfg!(target_arch = "arm") { "lib" } else { "lib64" };
+    let hidl = format!("/usr/libexec/droid-hybris/system/{libdir}/libhidlbase.so");
+    let binder = format!("/usr/libexec/droid-hybris/system/{libdir}/libbinder.so");
+    report("hybris-hidl", &hidl);
+    report("hybris-binder", &binder);
 }
-
-#[cfg(not(target_arch = "aarch64"))]
-unsafe fn log_hybris_ipc_state() {}
 
 #[repr(C)]
 struct BridgeStats {
@@ -1145,7 +1146,7 @@ struct BridgeStats {
     last_key: usize,
 }
 
-fn trace_pthread_bridge(host: &Host, phase: &str) {
+pub(super) fn trace_pthread_bridge(host: &Host, phase: &str) {
     if std::env::var_os("PENGUDROID_HYBRIS_TLS_BRIDGE").is_none() || !host.gl_isolated {
         return;
     }
@@ -1195,6 +1196,42 @@ fn trace_pthread_bridge(host: &Host, phase: &str) {
         stats.once,
         stats.last_key,
     );
+    // Who allocated which key: the attribution that makes a TLS collision
+    // between Bionic and Hybris visible without any per-device offsets.
+    #[repr(C)]
+    struct KeyOwner {
+        key: u32,
+        _pad: u32,
+        library: [u8; 96],
+        symbol: [u8; 64],
+        caller: usize,
+    }
+    type OwnersFn = unsafe extern "C" fn(*mut KeyOwner, usize) -> usize;
+    if let Some(owners_fn) =
+        sym_ptr(handle, "__pengudroid_hybris_pthread_key_owners").and_then(cast_fn::<OwnersFn>)
+    {
+        let mut owners: [KeyOwner; 16] = std::array::from_fn(|_| KeyOwner {
+            key: 0,
+            _pad: 0,
+            library: [0; 96],
+            symbol: [0; 64],
+            caller: 0,
+        });
+        let n = unsafe { owners_fn(owners.as_mut_ptr(), owners.len()) };
+        let cstr = |b: &[u8]| {
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(&b[..end]).into_owned()
+        };
+        for owner in &owners[..n.min(owners.len())] {
+            eprintln!(
+                "[gleshim:bridge]   key={:<3} {}!{} caller={:#x}",
+                owner.key,
+                cstr(&owner.library),
+                cstr(&owner.symbol),
+                owner.caller,
+            );
+        }
+    }
 }
 
 fn prepare_hybris_tls(host: &Host) {

@@ -467,6 +467,22 @@ impl Host {
     }
 }
 
+/// Attribution snapshot taken as soon as the isolated Hybris namespace
+/// exists, before the vendor driver's own loader work can go wrong. On the
+/// MT6771 device the first MediaTeк gralloc `dlopen` issues a binder call
+/// through the Hybris libbinder and aborts on an uninitialised
+/// `IPCThreadState`, long before any buffer allocation: the TLS-key map
+/// and the `IPCThreadState` pointers are what attribute that.
+fn trace_early_tls(host: &Host) {
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_none() {
+        return;
+    }
+    if host.gl_isolated {
+        gralloc::trace_pthread_bridge(host, "after host EGL load");
+    }
+    unsafe { gralloc::log_hybris_ipc_state() };
+}
+
 static HOST: OnceLock<Result<Host, String>> = OnceLock::new();
 
 /// Load the host driver at process start.
@@ -531,7 +547,10 @@ fn start_daemon_watchdog() {
 fn host() -> Result<&'static Host, String> {
     HOST.get_or_init(|| {
         start_daemon_watchdog();
-        Host::load()
+        Host::load().map(|host| {
+            trace_early_tls(&host);
+            host
+        })
     }).as_ref().map_err(Clone::clone)
 }
 
@@ -614,6 +633,19 @@ fn configure_hybris_sdr_properties(namespace: &mut libc::Lmid_t) {
         )
     } != 0 {
         return;
+    }
+    // Hybris' own linker logs every dlopen it serves together with the
+    // caller, but only at its DEBUG level, which is set programmatically.
+    // On the MT6771 device a vendor module's loader work is what issues the
+    // fatal oneway binder call, so this is the attribution that names it.
+    if std::env::var_os("PENGUDROID_TRACE_HYBRIS_LINKER").is_some() {
+        type SetLogLevel = unsafe extern "C" fn(c_int);
+        if let Some(set_level) =
+            sym_ptr(common, "hybris_set_log_level").and_then(cast_fn::<SetLogLevel>)
+        {
+            unsafe { set_level(0) }; // HYBRIS_LOG_DEBUG
+            eprintln!("[gleshim] Hybris linker debug logging enabled");
+        }
     }
     type PropertySet = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
     let Some(set) = sym_ptr(common, "my_property_set").and_then(cast_fn) else {
