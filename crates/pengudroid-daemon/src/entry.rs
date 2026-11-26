@@ -276,6 +276,185 @@ extern "C" fn on_signal(_sig: libc::c_int) {
     server::SHUTDOWN.store(true, Ordering::Relaxed);
 }
 
+/// Diagnostic crash handler. On-device gdbserver cannot start the
+/// multi-call binary under this ld.so (it dies in `_dl_start_user` before
+/// main), and ptrace attach is blocked by Yama, so a plain signal handler is
+/// the only practical way to learn where a Hybris vendor library crashed the
+/// daemon. Everything here is async-signal-safe: raw `write(2)` to fd 2 and a
+/// hand-rolled hex encoder. No `core::fmt`, no `Stderr` lock, no allocation:
+/// a formatting path inside the handler faulted on ARM32 and masked the real
+/// crash twice, so the handler must be dumber than the crash.
+struct RawOut {
+    buf: [u8; 96],
+    len: usize,
+}
+
+impl RawOut {
+    const fn new() -> Self {
+        Self { buf: [0; 96], len: 0 }
+    }
+
+    fn flush(&mut self) {
+        if self.len > 0 {
+            unsafe {
+                libc::write(2, self.buf.as_ptr() as *const libc::c_void, self.len);
+            }
+            self.len = 0;
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.len == self.buf.len() {
+                self.flush();
+            }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+    }
+
+    fn push_hex(&mut self, mut value: usize) {
+        let mut digits = [0u8; 2 * std::mem::size_of::<usize>()];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b"0123456789abcdef"[value & 0xf];
+            value >>= 4;
+            if value == 0 || i == 0 {
+                break;
+            }
+        }
+        self.push(b"0x");
+        self.push(&digits[i..]);
+    }
+}
+
+extern "C" fn on_crash(sig: libc::c_int) {
+    let mut out = RawOut::new();
+    out.push(b"[pengudroid-daemon] signal ");
+    out.push_hex(sig as usize);
+    out.push(b"\n");
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    {
+        let (pc, lr, sp): (usize, usize, usize);
+        unsafe {
+            #[cfg(target_arch = "arm")]
+            std::arch::asm!(
+                "mov {0}, pc", "mov {1}, lr", "mov {2}, sp",
+                out(reg) pc, out(reg) lr, out(reg) sp,
+                options(nomem, nostack, preserves_flags)
+            );
+            #[cfg(target_arch = "aarch64")]
+            std::arch::asm!(
+                "adr {0}, .", "mov {1}, x30", "mov {2}, sp",
+                out(reg) pc, out(reg) lr, out(reg) sp,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        out.push(b"[pengudroid-daemon] pc=");
+        out.push_hex(pc);
+        out.push(b" lr=");
+        out.push_hex(lr);
+        out.push(b" sp=");
+        out.push_hex(sp);
+        out.push(b"\n");
+        // Thumb frame pointers on ARM32 are unreliable inside vendor code; a
+        // raw stack window is the practical way to recover return addresses.
+        // Only the words of the mapping that holds `sp` are read, so the
+        // handler cannot fault on a guard page.
+        let stack_top = stack_mapping_top(sp);
+        out.push(b"[pengudroid-daemon] stack:\n");
+        let mut addr = sp & !3;
+        while addr + 4 <= stack_top && addr < sp + 1024 {
+            let word = unsafe { std::ptr::read_volatile(addr as *const usize) };
+            out.push(b"  ");
+            out.push_hex(word);
+            out.push(b"\n");
+            addr += 4;
+        }
+    }
+    out.flush();
+    // Raw maps so `pc`/`lr` can be resolved to a library after the fact.
+    unsafe {
+        let fd = libc::open(c"/proc/self/maps".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd >= 0 {
+            out.push(b"[pengudroid-daemon] maps:\n");
+            out.flush();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                if n <= 0 {
+                    break;
+                }
+                libc::write(2, buf.as_ptr() as *const libc::c_void, n as usize);
+            }
+            libc::close(fd);
+        }
+    }
+    unsafe { libc::_exit(128 + sig) };
+}
+
+/// Async-signal-safe lookup of the end address of the mapping that contains
+/// `addr` according to /proc/self/maps. Returns 0 when it cannot be found.
+fn stack_mapping_top(addr: usize) -> usize {
+    unsafe {
+        let fd = libc::open(c"/proc/self/maps".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return 0;
+        }
+        let hex = |b: u8| -> Option<usize> {
+            match b {
+                b'0'..=b'9' => Some((b - b'0') as usize),
+                b'a'..=b'f' => Some((b - b'a' + 10) as usize),
+                _ => None,
+            }
+        };
+        // State machine over the stream: parse "lo-hi" per line.
+        let mut lo = 0usize;
+        let mut hi = 0usize;
+        let mut in_lo = true;
+        let mut top = 0usize;
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len());
+            if n <= 0 {
+                break;
+            }
+            for &b in &chunk[..n as usize] {
+                match b {
+                    b'\n' => {
+                        if lo <= addr && addr < hi {
+                            top = hi;
+                        }
+                        lo = 0;
+                        hi = 0;
+                        in_lo = true;
+                    }
+                    b'-' => in_lo = false,
+                    b' ' => break,
+                    _ => {
+                        if let Some(d) = hex(b) {
+                            if in_lo {
+                                lo = lo.wrapping_mul(16) | d;
+                            } else {
+                                hi = hi.wrapping_mul(16) | d;
+                            }
+                        }
+                    }
+                }
+                if top != 0 {
+                    break;
+                }
+            }
+            if top != 0 {
+                break;
+            }
+        }
+        libc::close(fd);
+        top
+    }
+}
+
 fn install_signal_handlers() {
     // SAFETY: `on_signal` has the correct `extern "C"` signature for a handler.
     unsafe {
@@ -283,6 +462,16 @@ fn install_signal_handlers() {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         // A guest closing the pipe must not kill the daemon with SIGPIPE.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        // ARM32 Hybris vendor libraries can crash the daemon inside EGL/gralloc
+        // calls; on-device gdbserver cannot start this binary under the old
+        // ld.so, so keep a raw pc/lr reporter armed there by default.
+        let crash_bt = cfg!(target_arch = "arm")
+            || std::env::var_os("PENGUDROID_CRASH_BT").is_some();
+        if crash_bt {
+            libc::signal(libc::SIGSEGV, on_crash as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGBUS, on_crash as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGABRT, on_crash as *const () as libc::sighandler_t);
+        }
     }
 }
 

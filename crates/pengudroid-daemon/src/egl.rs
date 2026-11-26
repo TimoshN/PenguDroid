@@ -266,21 +266,70 @@ impl Api {
 }
 
 type GrallocImport = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
+type GrallocRetain = unsafe extern "C" fn(*mut c_void) -> c_int;
 type GrallocRelease = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type GrallocInitialize = unsafe extern "C" fn(c_int);
 
+/// How a guest native handle is registered with this process's gralloc module.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrallocImportMode {
+    /// Modern libhybris: `hybris_gralloc_import_buffer(handle, &out)` returns a
+    /// process-local handle reference.
+    Import,
+    /// Gralloc0-era libhybris (ARM32 devices): only
+    /// `hybris_gralloc_retain(handle)` (registerBuffer) exists. The rebuilt
+    /// handle itself becomes the retained reference; release(handle, 0)
+    /// unregisters it.
+    Retain,
+}
+
 struct GrallocApi {
-    _library: *mut c_void,
-    import: GrallocImport,
+    /// Extra libraries kept loaded for the lifetime of the API (the
+    /// eglplatformcommon preload that provides native_handle_* on older
+    /// libhybris builds).
+    _libraries: Vec<*mut c_void>,
+    import_mode: GrallocImportMode,
+    import_buffer: Option<GrallocImport>,
+    retain: Option<GrallocRetain>,
     release: GrallocRelease,
 }
 
 impl GrallocApi {
     unsafe fn load() -> Result<Self, String> {
-        let library = libc::dlopen(
-            c"libgralloc.so.1".as_ptr(),
-            libc::RTLD_NOW | libc::RTLD_LOCAL,
-        );
+        let open_gralloc = || {
+            libc::dlopen(c"libgralloc.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL)
+        };
+        let mut library = open_gralloc();
+        let mut preload: Vec<*mut c_void> = Vec::new();
+        if library.is_null() {
+            // Older libhybris images (ARM32) link libgralloc.so.1 and
+            // libhybris-eglplatformcommon with BIND_NOW and a circular
+            // dependency: libgralloc needs native_handle_create/close/delete,
+            // which on those images only eglplatformcommon exports, while
+            // eglplatformcommon needs hybris_gralloc_retain from libgralloc.
+            // They can only resolve as one connected graph. Loading the
+            // Wayland EGL platform module first brings that graph in as a
+            // set - the same way every working Hybris client on such images
+            // already loads it - after which a direct libgralloc open finds
+            // the graph member and resolves.
+            let platform = if cfg!(target_arch = "arm") {
+                "/usr/lib/libhybris/eglplatform_wayland.so"
+            } else {
+                "/usr/lib64/libhybris/eglplatform_wayland.so"
+            };
+            for name in [platform, "libhybris-eglplatformcommon.so.1"] {
+                let Ok(cname) = CString::new(name) else { continue };
+                let loaded = libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+                if loaded.is_null() {
+                    continue;
+                }
+                preload.push(loaded);
+                library = open_gralloc();
+                if !library.is_null() {
+                    break;
+                }
+            }
+        }
         if library.is_null() {
             return Err("libgralloc.so.1 unavailable".into());
         }
@@ -291,19 +340,63 @@ impl GrallocApi {
         )?;
         // libhybris declares hybris_gralloc_initialize(int) as void.
         initialize(0);
+        let import_buffer = symbol(library, "hybris_gralloc_import_buffer")
+            .map(|ptr| cast_function::<GrallocImport>(ptr, "hybris_gralloc_import_buffer"))
+            .transpose()?;
+        let retain = symbol(library, "hybris_gralloc_retain")
+            .map(|ptr| cast_function::<GrallocRetain>(ptr, "hybris_gralloc_retain"))
+            .transpose()?;
+        let release: GrallocRelease = cast_function(
+            symbol(library, "hybris_gralloc_release")
+                .ok_or("hybris_gralloc_release unavailable")?,
+            "hybris_gralloc_release",
+        )?;
+        let import_mode = if import_buffer.is_some() {
+            GrallocImportMode::Import
+        } else {
+            GrallocImportMode::Retain
+        };
+        crate::info!(
+            "gralloc import mode: {}",
+            match import_mode {
+                GrallocImportMode::Import => "hybris_gralloc_import_buffer",
+                GrallocImportMode::Retain => "hybris_gralloc_retain",
+            }
+        );
         Ok(Self {
-            _library: library,
-            import: cast_function(
-                symbol(library, "hybris_gralloc_import_buffer")
-                    .ok_or("hybris_gralloc_import_buffer unavailable")?,
-                "hybris_gralloc_import_buffer",
-            )?,
-            release: cast_function(
-                symbol(library, "hybris_gralloc_release")
-                    .ok_or("hybris_gralloc_release unavailable")?,
-                "hybris_gralloc_release",
-            )?,
+            _libraries: preload,
+            import_mode,
+            import_buffer,
+            retain,
+            release,
         })
+    }
+
+    /// Register the guest handle with this process's gralloc module and return
+    /// the reference to keep until `release` is called.
+    unsafe fn import(&self, handle: *mut c_void, out: *mut *mut c_void) -> Result<(), String> {
+        match self.import_mode {
+            GrallocImportMode::Import => {
+                let import = self.import_buffer.ok_or("import unavailable")?;
+                let rc = import(handle, out);
+                if rc != 0 || (*out).is_null() {
+                    return Err(format!(
+                        "hybris_gralloc_import_buffer failed: rc={rc} handle={handle:p}"
+                    ));
+                }
+            }
+            GrallocImportMode::Retain => {
+                let retain = self.retain.ok_or("retain unavailable")?;
+                let rc = retain(handle);
+                if rc != 0 {
+                    return Err(format!(
+                        "hybris_gralloc_retain failed: rc={rc} handle={handle:p}"
+                    ));
+                }
+                *out = handle;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -341,11 +434,96 @@ struct BufferKey {
 }
 
 struct SurfaceEgl {
-    window: wayland_egl::WlEglSurface,
+    window: WlEglWindow,
     surface: *mut c_void,
     width: u32,
     height: u32,
     textures: HashMap<BufferKey, ImportedTexture>,
+}
+
+/// Minimal `wl_egl_window` owner. The `wayland-egl` crate lazily dlopens
+/// `libwayland-egl.so.1` through `libloading` on first use; on the ARM32
+/// Aurora image that first-use path faulted inside the daemon with a corrupted
+/// stack before any EGL call, so the stable public ABI (unchanged since 2012)
+/// is driven directly with `dlsym` on the already-loaded library instead.
+#[repr(C)]
+struct WlEglWindowLayout {
+    surface: *mut c_void,
+    width: i32,
+    height: i32,
+    dx: i32,
+    dy: i32,
+    attached_width: i32,
+    attached_height: i32,
+    driver_private: *mut c_void,
+}
+
+type WlEglWindowCreate = unsafe extern "C" fn(*mut c_void, i32, i32) -> *mut WlEglWindowLayout;
+type WlEglWindowResize = unsafe extern "C" fn(*mut WlEglWindowLayout, i32, i32, i32, i32);
+type WlEglWindowDestroy = unsafe extern "C" fn(*mut WlEglWindowLayout);
+
+#[derive(Clone, Copy)]
+struct WlEglApi {
+    create: WlEglWindowCreate,
+    resize: WlEglWindowResize,
+    destroy: WlEglWindowDestroy,
+}
+
+impl WlEglApi {
+    unsafe fn load() -> Result<Self, String> {
+        let library = libc::dlopen(
+            c"libwayland-egl.so.1".as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL,
+        );
+        if library.is_null() {
+            return Err("libwayland-egl.so.1 unavailable".into());
+        }
+        let create = symbol(library, "wl_egl_window_create")
+            .ok_or("wl_egl_window_create unavailable")?;
+        let resize = symbol(library, "wl_egl_window_resize")
+            .ok_or("wl_egl_window_resize unavailable")?;
+        let destroy = symbol(library, "wl_egl_window_destroy")
+            .ok_or("wl_egl_window_destroy unavailable")?;
+        Ok(Self {
+            create: cast_function(create, "wl_egl_window_create")?,
+            resize: cast_function(resize, "wl_egl_window_resize")?,
+            destroy: cast_function(destroy, "wl_egl_window_destroy")?,
+        })
+    }
+}
+
+struct WlEglWindow {
+    api: WlEglApi,
+    ptr: *mut WlEglWindowLayout,
+}
+
+impl WlEglWindow {
+    unsafe fn new(
+        wl_surface: &wayland_client::protocol::wl_surface::WlSurface,
+        width: i32,
+        height: i32,
+    ) -> Result<Self, String> {
+        let api = WlEglApi::load()?;
+        let ptr = (api.create)(wl_surface.id().as_ptr().cast(), width, height);
+        if ptr.is_null() {
+            return Err("wl_egl_window_create returned null".into());
+        }
+        Ok(Self { api, ptr })
+    }
+
+    fn ptr(&self) -> *mut WlEglWindowLayout {
+        self.ptr
+    }
+
+    fn resize(&self, width: i32, height: i32, dx: i32, dy: i32) {
+        unsafe { (self.api.resize)(self.ptr, width, height, dx, dy) }
+    }
+}
+
+impl Drop for WlEglWindow {
+    fn drop(&mut self) {
+        unsafe { (self.api.destroy)(self.ptr) }
+    }
 }
 
 pub struct Presenter {
@@ -480,6 +658,10 @@ unsafe fn import_texture(
     usage: i32,
 ) -> Result<u32, String> {
     let mut native = NativeWindowBuffer::new(handle, width, height, stride, format, usage);
+    let trace = std::env::var_os("PENGUDROID_TRACE_EGL").is_some();
+    if trace {
+        eprintln!("[pengudroid-daemon:egl]   import_texture: handle={handle:p} {width}x{height} stride={stride} format={format:#x} usage={usage:#x}");
+    }
     let image = (api.egl_create_image)(
         display,
         EGL_NO_CONTEXT,
@@ -489,6 +671,9 @@ unsafe fn import_texture(
     );
     if image.is_null() {
         return Err(format!("eglCreateImageKHR failed: {:#x}", api.error()));
+    }
+    if trace {
+        eprintln!("[pengudroid-daemon:egl]   eglCreateImageKHR -> {image:p}");
     }
 
     let mut texture = 0;
@@ -502,6 +687,9 @@ unsafe fn import_texture(
     (api.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     (api.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     (api.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if trace {
+        eprintln!("[pengudroid-daemon:egl]   glEGLImageTargetTexture2DOES(texture={texture})");
+    }
     (api.gl_image_target_texture)(GL_TEXTURE_2D, image);
     let error = (api.gl_get_error)();
     (api.egl_destroy_image)(display, image);
@@ -599,8 +787,22 @@ impl Presenter {
         if width == 0 || height == 0 {
             return Err(format!("invalid EGL surface size {width}x{height}"));
         }
-        let window = wayland_egl::WlEglSurface::new(wl_surface.id(), width as i32, height as i32)
-            .map_err(|error| format!("wl_egl_window_create: {error:?}"))?;
+        // Raw marker lines (no formatting machinery) so the failing step can be
+        // identified even when the crash lies inside a format path.
+        macro_rules! mark {
+            ($lit:literal) => {{
+                unsafe { libc::write(2, concat!("[pengudroid-daemon:egl] create_surface: ", $lit, "\n").as_ptr().cast(), concat!("[pengudroid-daemon:egl] create_surface: ", $lit, "\n").len()) };
+            }};
+        }
+        if std::env::var_os("PENGUDROID_TRACE_EGL").is_some() {
+            mark!("enter");
+        }
+        // The EGL window must be created before any EGL call on this surface.
+        let window = unsafe { WlEglWindow::new(wl_surface, width as i32, height as i32) }
+            .map_err(|error| format!("wl_egl_window_create: {error}"))?;
+        if std::env::var_os("PENGUDROID_TRACE_EGL").is_some() {
+            mark!("wl_egl_window_create ok");
+        }
         unsafe {
             let api = &self.api;
             let surface = (api.egl_create_window_surface)(
@@ -611,6 +813,9 @@ impl Presenter {
             );
             if surface.is_null() {
                 return Err(format!("eglCreateWindowSurface failed: {:#x}", api.error()));
+            }
+            if std::env::var_os("PENGUDROID_TRACE_EGL").is_some() {
+                mark!("eglCreateWindowSurface ok");
             }
 
             // Keep the working libhybris order: window surface first, then the
@@ -629,13 +834,25 @@ impl Presenter {
                     }
                     self.state.context = context;
                 }
+                if std::env::var_os("PENGUDROID_TRACE_EGL").is_some() {
+                    mark!("eglCreateContext ok");
+                }
                 if (api.egl_make_current)(self.state.display, surface, surface, self.state.context)
                     != EGL_TRUE
                 {
                     return Err(format!("eglMakeCurrent failed: {:#x}", api.error()));
                 }
+                if std::env::var_os("PENGUDROID_TRACE_EGL").is_some() {
+                    mark!("eglMakeCurrent ok");
+                }
                 if self.state.program.is_none() {
+                    if std::env::var_os("PENGUDROID_TRACE_EGL").is_some() {
+                        mark!("create_program enter");
+                    }
                     self.state.program = Some(create_program(api)?);
+                    if std::env::var_os("PENGUDROID_TRACE_EGL").is_some() {
+                        mark!("create_program ok");
+                    }
                 }
                 Ok(())
             })();
@@ -695,12 +912,19 @@ impl Presenter {
             red_test,
         } = self;
         let surface = surfaces.get_mut(&id).ok_or("EGL surface missing")?;
+        let trace = std::env::var_os("PENGUDROID_TRACE_EGL").is_some();
+        let step = |name: &str| {
+            if trace {
+                eprintln!("[pengudroid-daemon:egl] present: {name}");
+            }
+        };
         unsafe {
             if surface.width != width || surface.height != height {
                 surface.window.resize(width as i32, height as i32, 0, 0);
                 surface.width = width;
                 surface.height = height;
             }
+            step("eglMakeCurrent");
             if (api.egl_make_current)(
                 state.display,
                 surface.surface,
@@ -722,12 +946,11 @@ impl Presenter {
                 let raw_fds: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
                 let mut words = native_handle_words(&raw_fds, ints);
                 let mut gralloc_handle = std::ptr::null_mut();
-                let result = (gralloc.import)(words.as_mut_ptr().cast(), &mut gralloc_handle);
-                if result != 0 || gralloc_handle.is_null() {
-                    return Err(format!(
-                        "hybris_gralloc_import_buffer failed: rc={result} handle={gralloc_handle:p}"
-                    ));
+                step(&format!("gralloc import (fds={:?} ints={:?})", raw_fds, ints));
+                if let Err(error) = gralloc.import(words.as_mut_ptr().cast(), &mut gralloc_handle) {
+                    return Err(error);
                 }
+                step("eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID)");
                 let texture = import_texture(
                     api,
                     state.display,
@@ -738,6 +961,7 @@ impl Presenter {
                     format,
                     usage,
                 );
+                step("import_texture returned");
                 match texture {
                     Ok(texture) => {
                         surface.textures.insert(
@@ -760,6 +984,7 @@ impl Presenter {
             }
             let texture = surface.textures.get(&key).unwrap().id;
             let program = state.program.ok_or("GL program missing")?;
+            step("draw");
             (api.gl_viewport)(0, 0, width as c_int, height as c_int);
             (api.gl_clear_color)(0.0, 0.0, 0.0, 1.0);
             (api.gl_clear)(GL_COLOR_BUFFER_BIT);
@@ -800,6 +1025,7 @@ impl Presenter {
             if error != 0 {
                 return Err(format!("guest textured draw failed: GL error {error:#x}"));
             }
+            step("eglSwapBuffers");
             swap(api, state.display, surface.surface)
         }
     }

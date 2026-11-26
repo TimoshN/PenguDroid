@@ -255,7 +255,34 @@ impl Drop for NativeBuffer {
 
 unsafe fn gralloc_api() -> Result<GrallocApi, String> {
     let name = std::ffi::CString::new("libgralloc.so.1").unwrap();
-    let handle = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+    let mut handle = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+    if handle.is_null() {
+        // Older libhybris images (ARM32) link libgralloc.so.1 and
+        // libhybris-eglplatformcommon with BIND_NOW and a circular dependency
+        // (native_handle_* versus hybris_gralloc_retain); they can only load
+        // as one connected graph. Load the Wayland EGL platform module - the
+        // graph root - first, exactly like the Hybris EGL wrapper does, then
+        // retry the direct open, which finds the graph member.
+        let platform = if cfg!(target_arch = "arm") {
+            "/usr/lib/libhybris/eglplatform_wayland.so"
+        } else {
+            "/usr/lib64/libhybris/eglplatform_wayland.so"
+        };
+        for cname in [
+            std::ffi::CString::new(platform),
+            std::ffi::CString::new("libhybris-eglplatformcommon.so.1"),
+        ] {
+            let Ok(cname) = cname else { continue };
+            let loaded = libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+            if loaded.is_null() {
+                continue;
+            }
+            handle = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if !handle.is_null() {
+                break;
+            }
+        }
+    }
     if handle.is_null() {
         let error = dl_error();
         return Err(format!("cannot load libgralloc.so.1: {error}"));

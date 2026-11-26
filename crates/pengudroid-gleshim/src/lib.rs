@@ -391,11 +391,23 @@ impl Host {
             get_config_attrib: need(core("eglGetConfigAttrib"), "eglGetConfigAttrib")?,
             bind_tex_image: core("eglBindTexImage").and_then(cast_fn),
             release_tex_image: core("eglReleaseTexImage").and_then(cast_fn),
-            client_wait_sync: core("eglClientWaitSync").and_then(cast_fn),
+            client_wait_sync: core("eglClientWaitSync")
+                .or_else(|| proc_or_sym("eglClientWaitSyncKHR"))
+                .and_then(cast_fn),
             create_pbuffer_from_client_buffer: core("eglCreatePbufferFromClientBuffer").and_then(cast_fn),
-            create_sync: core("eglCreateSync").and_then(cast_fn),
-            destroy_sync: core("eglDestroySync").and_then(cast_fn),
-            get_sync_attrib: core("eglGetSyncAttrib").and_then(cast_fn),
+            // EGL 1.5 core names may be absent from the loaded libEGL even
+            // when the driver supports EGL_KHR_fence_sync (the ARM32 Hybris
+            // wrapper libEGL exports almost nothing itself). The KHR-suffix
+            // entry points are semantically identical for fence syncs.
+            create_sync: core("eglCreateSync")
+                .or_else(|| proc_or_sym("eglCreateSyncKHR"))
+                .and_then(cast_fn),
+            destroy_sync: core("eglDestroySync")
+                .or_else(|| proc_or_sym("eglDestroySyncKHR"))
+                .and_then(cast_fn),
+            get_sync_attrib: core("eglGetSyncAttrib")
+                .or_else(|| proc_or_sym("eglGetSyncAttribKHR"))
+                .and_then(cast_fn),
             query_context: core("eglQueryContext").and_then(cast_fn),
             wait_client: core("eglWaitClient").and_then(cast_fn),
             wait_gl: core("eglWaitGL").and_then(cast_fn),

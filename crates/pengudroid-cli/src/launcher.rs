@@ -1135,9 +1135,14 @@ fn apply_aurora_package_env(
         // The daemon's WLEGL path imports guest gralloc buffers as EGLImages
         // and presents through its own EGLSurface/eglSwapBuffers. Use it by
         // default on Hybris; PENGUDROID_GRALLOC_WLEGL=0 restores wl_shm.
-        if cfg!(target_arch = "aarch64") && !overridden("PENGUDROID_GRALLOC_WLEGL") {
-            // This device API set is complete on AArch64. The tested ARM32
-            // stack lacks gralloc import and EGL fence entry points.
+        if cfg!(any(target_arch = "aarch64", target_arch = "arm"))
+            && !overridden("PENGUDROID_GRALLOC_WLEGL")
+        {
+            // Complete on AArch64 since e660dda. On ARM32 the daemon uses the
+            // manual android_wlegl wl_buffer transport, falls back to
+            // hybris_gralloc_retain when hybris_gralloc_import_buffer is
+            // missing, and loads the libgralloc/eglplatformcommon graph as a
+            // set; the guest still lands on wl_shm if any of this fails.
             cmd.env("PENGUDROID_GRALLOC_WLEGL", "1");
         }
         // The compositor frame clock is likewise opt-in

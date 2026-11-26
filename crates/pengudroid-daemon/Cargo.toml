@@ -33,4 +33,4 @@ sctk-adwaita = { version = "0.10.1", optional = true }
 
 [features]
 default = ["wayland"]
-wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-scanner", "dep:wayland-backend", "dep:wayland-egl", "dep:zbus", "dep:smithay-client-toolkit", "dep:sctk-adwaita"]
+wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-scanner", "dep:wayland-backend", "dep:zbus", "dep:smithay-client-toolkit", "dep:sctk-adwaita"]

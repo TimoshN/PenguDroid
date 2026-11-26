@@ -120,6 +120,26 @@ mod imp {
         desktop_configured: bool,
     }
 
+    /// Stable identity of a guest native handle across presents: the fds are
+    /// duplicated on every frame, the int words are not.
+    fn fnv1a_ints(ints: &[i32]) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for word in ints {
+            for byte in word.to_le_bytes() {
+                hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        hash
+    }
+
+    fn ints_as_bytes(ints: &[i32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ints.len() * 4);
+        for word in ints {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
     struct PendingFrame {
         buffer: wl_buffer::WlBuffer,
         /// Direct PresentShm keeps the guest memfd alive until release.
@@ -231,6 +251,9 @@ mod imp {
         /// native (gralloc) buffer as a GPU texture instead of a CPU wl_shm
         /// read. Lipstick advertises it; other compositors simply lack it.
         pub wlegl: Option<AndroidWlegl>,
+        /// One native handle -> one wl_buffer for the surface's life (manual
+        /// android_wlegl path, the ARM32 default).
+        wlegl_buffers: HashMap<(u32, u64), (wl_buffer::WlBuffer, Vec<std::os::fd::OwnedFd>)>,
         /// Opt-in: the launcher asks for the native transport; the presence of
         /// the global alone only makes it possible.
         pub wlegl_enabled: bool,
@@ -328,6 +351,7 @@ mod imp {
                 decoration: None,
                 dmabuf: None,
                 wlegl: None,
+                wlegl_buffers: HashMap::new(),
                 wlegl_enabled: false,
                 wlegl_name: None,
                 egl_presenter: None,
@@ -747,7 +771,11 @@ mod imp {
         /// Replaces the old spinner: the user sees the current boot stage or
         /// the error that stopped the launch.
         fn repaint_loading(&mut self) {
-            if self.wlegl_enabled {
+            // On AArch64 Aurora the EGL-presented surface receives no wl_shm
+            // content at all. Older ARM32 Lipstick builds close a window that
+            // never commits, so there the wl_shm loading screen stays alive
+            // until the first native-buffer frame (surface.loading clears then).
+            if self.wlegl_enabled && !cfg!(target_arch = "arm") {
                 return; // no wl_shm loading buffer on the EGL-presented surface
             }
             let status = self.loading_status.clone();
@@ -828,7 +856,7 @@ mod imp {
 
 
 
-            if !self.wlegl_enabled {
+            if !self.wlegl_enabled || cfg!(target_arch = "arm") {
                 p.wl_surface.attach(Some(&buffer), 0, 0);
                 p.wl_surface.damage(0, 0, p.width as i32, p.height as i32);
                 if let Some(xdg) = p.xdg_surface.as_ref() {
@@ -958,7 +986,10 @@ mod imp {
             // still forces the wl_shm fallback on either side.
             state.wlegl_enabled = match std::env::var("PENGUDROID_GRALLOC_WLEGL") {
                 Ok(_) => Self::env_enabled("PENGUDROID_GRALLOC_WLEGL"),
-                Err(_) => cfg!(target_arch = "aarch64") && Self::hybris_host(),
+                Err(_) => {
+                    cfg!(any(target_arch = "aarch64", target_arch = "arm"))
+                        && Self::hybris_host()
+                }
             };
             state.vsync_enabled = match std::env::var("PENGUDROID_VSYNC_COMPOSITOR") {
                 Ok(value) => value != "0" && !value.is_empty(),
@@ -1960,10 +1991,19 @@ mod imp {
             if !self.state.wlegl_enabled {
                 return Err("android_wlegl presentation is disabled".into());
             }
-            // The daemon owns a real EGLSurface on the guest's wl_surface and
-            // presents through eglSwapBuffers, so the Wayland EGL driver
-            // handles the compositor fence (which the manual android_wlegl
-            // wl_buffer path could not provide).
+            if cfg!(target_arch = "arm") {
+                // ARM32 default: hand the native buffer to Lipstick as a
+                // wl_buffer directly. The Hybris Wayland EGL platform would
+                // create a second event queue and dispatch it on this same
+                // wl_display from eglCreateWindowSurface, racing the Rust
+                // client's own dispatcher; on the tested ARM32/MediaTek
+                // device that crashed the daemon on the first surface.
+                return self.present_wlegl_buffer(id, fds, ints, width, height, stride, format, usage);
+            }
+            // AArch64: the daemon owns a real EGLSurface on the guest's
+            // wl_surface and presents through eglSwapBuffers, so the Wayland
+            // EGL driver handles the compositor fence (which the manual
+            // android_wlegl wl_buffer path could not provide).
             if self.state.egl_presenter.is_none() {
                 let display_ptr = self.conn.backend().display_ptr() as *mut std::ffi::c_void;
                 match crate::egl::Presenter::new(display_ptr) {
@@ -1988,6 +2028,74 @@ mod imp {
             static REPORTED: std::sync::Once = std::sync::Once::new();
             REPORTED.call_once(|| {
                 crate::info!("guest frames presented through daemon EGL (eglSwapBuffers)");
+            });
+            Ok(())
+        }
+
+        /// Present a whole Android native handle as a `wl_buffer` through the
+        /// compositor's `android_wlegl` (no second EGL dispatcher involved).
+        /// This is the ARM32 default; the original transport from the opt-in
+        /// commit, kept because it is the one path that never shares the
+        /// `wl_display` with the Hybris Wayland EGL platform.
+        fn present_wlegl_buffer(
+            &mut self,
+            id: u32,
+            fds: Vec<std::os::fd::OwnedFd>,
+            ints: Vec<i32>,
+            width: u32,
+            height: u32,
+            stride: u32,
+            format: i32,
+            usage: i32,
+        ) -> Result<(), String> {
+            if !self.frame_slot_available(id)? { return Ok(()); }
+            let wlegl = self.state.wlegl.clone()
+                .ok_or("android_wlegl is not advertised by the compositor")?;
+            // One native handle -> one wl_buffer for the whole surface's life.
+            // The int words identify the allocation even though the fds are
+            // duplicated on every present.
+            let key = (id, fnv1a_ints(&ints));
+            let buffer = if let Some((buffer, _fds)) = self.state.wlegl_buffers.get(&key) {
+                buffer.clone()
+            } else {
+                crate::info!(
+                    "wlegl new wl_buffer: surface={id} key={:#x} fds={} total={}",
+                    key.1,
+                    fds.len(),
+                    self.state.wlegl_buffers.len() + 1
+                );
+                let qh = self.queue.handle();
+                let handle = wlegl.create_handle(fds.len() as i32, ints_as_bytes(&ints), &qh, ());
+                for fd in &fds {
+                    handle.add_fd(fd.as_fd());
+                }
+                // stride is in pixels for Android native buffers, not bytes.
+                let buffer = wlegl.create_buffer(
+                    width as i32, height as i32, (stride / 4) as i32, format, usage, &handle, &qh, (),
+                );
+                handle.destroy();
+                self.state.wlegl_buffers.insert(key, (buffer.clone(), fds));
+                buffer
+            };
+            let surface = self.state.surfaces.get_mut(&id).ok_or("surface disappeared")?;
+            surface.loading = false;
+            // Lipstick ignores wl_surface buffer transforms; the guest already
+            // flipped this buffer on the GPU before presenting it.
+            surface.wl_surface.set_buffer_transform(wl_output::Transform::Normal);
+            surface.wl_surface.attach(Some(&buffer), 0, 0);
+            surface.wl_surface.damage(0, 0, surface.display_width as i32, surface.display_height as i32);
+            surface.wl_surface.commit();
+            surface.pending_frames.push(PendingFrame {
+                buffer,
+                _fd: None,
+                _native_fds: Vec::new(),
+            });
+            self.conn.flush().map_err(|e| e.to_string())?;
+            self.record_frame(id);
+            self.vsync_note_present(id);
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                crate::info!("guest frames presented through android_wlegl (GPU native buffers)");
             });
             Ok(())
         }
