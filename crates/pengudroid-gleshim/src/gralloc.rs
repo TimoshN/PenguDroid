@@ -24,9 +24,16 @@ const WLEGL_MAGIC: u64 = 0x776c_6567_6c00_0000;
 struct WleglHandle {
     fds: Vec<RawFd>,
     ints: Vec<i32>,
+    /// Process-unique id of the backing allocation. The daemon keys its
+    /// wl_buffer on it: gralloc0 int words are identical for every same-size
+    /// allocation on the ARM32 MediaTeк stack, and the fd inode is not
+    /// distinctive either, so two flip buffers would otherwise collapse
+    /// onto one wl_buffer and the screen would freeze on the first frame.
+    alloc_id: u32,
 }
 
 fn wlegl_handle(handle: *mut c_void) -> Option<WleglHandle> {
+    static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     if handle.is_null() {
         return None;
     }
@@ -43,7 +50,11 @@ fn wlegl_handle(handle: *mut c_void) -> Option<WleglHandle> {
     for index in 0..num_ints as usize {
         ints.push(unsafe { *header.add(3 + num_fds as usize + index) });
     }
-    Some(WleglHandle { fds, ints })
+    Some(WleglHandle {
+        fds,
+        ints,
+        alloc_id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 /// True when the launcher opted into the compositor's native-buffer transport.
@@ -634,7 +645,9 @@ fn transmit_gralloc(
                 height,
                 stride,
                 format: HAL_BGRA_8888 as u32 | NATIVE_FD_FLAG | WLEGL_FD_FLAG,
-                native_window: WLEGL_MAGIC | handle.ints.len() as u64,
+                native_window: WLEGL_MAGIC
+                    | ((handle.alloc_id as u64 & 0xffff) << 16)
+                    | handle.ints.len() as u64,
                 crop: BufferCrop::full(width as i32, height as i32),
             };
             conn.send_message(&message, &handle.fds)

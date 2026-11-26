@@ -635,6 +635,9 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
                             (format & !(pengudroid_proto::abi::NATIVE_FD_FLAG
                                 | pengudroid_proto::abi::WLEGL_FD_FLAG)) as i32,
                             pengudroid_proto::abi::GRALLOC_USAGE_LINEAR_TEXTURE,
+                            // Bits 16..32 of the tagged native_window carry the
+                            // guest's allocation id (see gleshim WleglHandle).
+                            ((native_window >> 16) & 0xffff) as u32,
                         ),
                         None => Err("graphics unavailable".into()),
                     };

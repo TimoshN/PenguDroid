@@ -1891,7 +1891,12 @@ mod imp {
         fn frame_slot_available(&mut self, id: u32) -> Result<bool, String> {
             self.drain_wayland();
             let surface = self.state.surfaces.get_mut(&id).ok_or_else(|| format!("unknown surface {id}"))?;
-            surface.pending_frames.retain(|frame| frame.buffer.is_alive());
+            // wl_shm buffers are destroyed on release; reusable android_wlegl
+            // buffers only flag it, so drop those pending frames here.
+            surface.pending_frames.retain(|frame| {
+                frame.buffer.is_alive()
+                    && !frame.buffer.data::<WleglBuffer>().is_some_and(|data| data.released.load(std::sync::atomic::Ordering::Acquire))
+            });
             Ok(surface.pending_frames.len() < 3)
         }
 
@@ -1987,6 +1992,7 @@ mod imp {
             stride: u32,
             format: i32,
             usage: i32,
+            alloc_id: u32,
         ) -> Result<(), String> {
             if !self.state.wlegl_enabled {
                 return Err("android_wlegl presentation is disabled".into());
@@ -1998,7 +2004,7 @@ mod imp {
                 // wl_display from eglCreateWindowSurface, racing the Rust
                 // client's own dispatcher; on the tested ARM32/MediaTek
                 // device that crashed the daemon on the first surface.
-                return self.present_wlegl_buffer(id, fds, ints, width, height, stride, format, usage);
+                return self.present_wlegl_buffer(id, fds, ints, width, height, stride, format, usage, alloc_id);
             }
             // AArch64: the daemon owns a real EGLSurface on the guest's
             // wl_surface and presents through eglSwapBuffers, so the Wayland
@@ -2047,14 +2053,32 @@ mod imp {
             stride: u32,
             format: i32,
             usage: i32,
+            alloc_id: u32,
         ) -> Result<(), String> {
             if !self.frame_slot_available(id)? { return Ok(()); }
             let wlegl = self.state.wlegl.clone()
                 .ok_or("android_wlegl is not advertised by the compositor")?;
             // One native handle -> one wl_buffer for the whole surface's life.
-            // The int words identify the allocation even though the fds are
-            // duplicated on every present.
-            let key = (id, fnv1a_ints(&ints));
+            // Key the wl_buffer by the guest's allocation id, with the fd
+            // inode as a fallback for older guests: the int words are
+            // identical for every same-size gralloc0 allocation on the ARM32
+            // MediaTeк stack, so two flip buffers would collapse onto one
+            // wl_buffer and the compositor would keep showing the first
+            // frame. The fds are duplicated on every present; neither the
+            // allocation id nor the inode is.
+            let identity = if alloc_id != 0 {
+                Some(alloc_id as u64)
+            } else {
+                fds.first().and_then(|fd| {
+                    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    (unsafe { libc::fstat(std::os::fd::AsRawFd::as_raw_fd(fd), stat.as_mut_ptr()) } == 0)
+                        .then(|| unsafe {
+                            let stat = stat.assume_init();
+                            (stat.st_dev as u64) << 32 ^ stat.st_ino as u64
+                        })
+                })
+            };
+            let key = (id, identity.unwrap_or_else(|| fnv1a_ints(&ints)));
             let buffer = if let Some((buffer, _fds)) = self.state.wlegl_buffers.get(&key) {
                 buffer.clone()
             } else {
@@ -2071,12 +2095,18 @@ mod imp {
                 }
                 // stride is in pixels for Android native buffers, not bytes.
                 let buffer = wlegl.create_buffer(
-                    width as i32, height as i32, (stride / 4) as i32, format, usage, &handle, &qh, (),
+                    width as i32, height as i32, (stride / 4) as i32, format, usage, &handle, &qh,
+                    WleglBuffer { released: Arc::new(std::sync::atomic::AtomicBool::new(false)) },
                 );
                 handle.destroy();
                 self.state.wlegl_buffers.insert(key, (buffer.clone(), fds));
                 buffer
             };
+            // The compositor releases this buffer once per attach; a fresh
+            // frame re-arms the flag before the slot is reused.
+            if let Some(data) = buffer.data::<WleglBuffer>() {
+                data.released.store(false, std::sync::atomic::Ordering::Release);
+            }
             let surface = self.state.surfaces.get_mut(&id).ok_or("surface disappeared")?;
             surface.loading = false;
             // Lipstick ignores wl_surface buffer transforms; the guest already
@@ -2387,6 +2417,21 @@ mod imp {
     /// Per-frame imports are retired only after wl_buffer.release.
     #[derive(Default)]
     struct FrameBuffer { released: Option<Arc<std::sync::atomic::AtomicBool>> }
+
+    /// A reusable `android_wlegl` buffer. Unlike `wl_shm` buffers these are
+    /// re-attached for every frame of the same guest allocation, so `release`
+    /// must not destroy them; it only clears the pending-frame slot so the
+    /// next frame of that surface is accepted.
+    struct WleglBuffer { released: Arc<std::sync::atomic::AtomicBool> }
+
+    impl Dispatch<wl_buffer::WlBuffer, WleglBuffer> for State {
+        fn event(_: &mut Self, _buffer: &wl_buffer::WlBuffer, event: wl_buffer::Event,
+            data: &WleglBuffer, _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_buffer::Event::Release = event {
+                data.released.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
     impl Dispatch<wl_buffer::WlBuffer, FrameBuffer> for State {
         fn event(_: &mut Self, buffer: &wl_buffer::WlBuffer, event: wl_buffer::Event,
             data: &FrameBuffer, _: &Connection, _: &QueueHandle<Self>) {
