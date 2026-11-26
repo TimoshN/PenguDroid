@@ -1128,7 +1128,10 @@ unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(u32, u32), Str
     target.fbos.push((info.serial, fbo));
     // The daemon's EGL presenter samples the guest texture directly,
     // so the guest renders its gralloc allocation with no extra flip pass.
-    let direct_wlegl = gralloc::wlegl_requested() && !gralloc::async_requested();
+    // The manual android_wlegl buffer transport still needs the flip copies.
+    let direct_wlegl = gralloc::wlegl_requested()
+        && !gralloc::async_requested()
+        && !gralloc::wlegl_buffer_requested();
     if target.gralloc.is_some() && target.flip.is_none()
         && !direct_wlegl
         && std::env::var_os("PENGUDROID_GRALLOC_SHM").is_some()

@@ -53,6 +53,14 @@ pub(super) fn wlegl_requested() -> bool {
     env_truthy("PENGUDROID_GRALLOC_WLEGL")
 }
 
+/// The daemon attaches the native buffer to Lipstick directly (the ARM32
+/// transport) instead of sampling it through its own EGL presenter. The
+/// compositor shows the buffer as is, so the guest must deliver it upright:
+/// the Y-flip that the EGL presenter path skips has to happen here.
+pub(super) fn wlegl_buffer_requested() -> bool {
+    wlegl_requested() && env_truthy("PENGUDROID_WLEGL_BUFFER")
+}
+
 /// WLEGL uses fenced async presentation by default. The legacy SHM path keeps
 /// its historical opt-in; an explicit 0/false disables either async path.
 pub(super) fn async_requested() -> bool {
@@ -349,7 +357,8 @@ unsafe fn shader_flip_draw(
 /// wl_buffer transforms. No CPU readback is involved.
 pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
     if std::env::var_os("PENGUDROID_GRALLOC_SHM").is_none()
-        || (wlegl_requested() && !async_requested()) {
+        || (wlegl_requested() && !async_requested() && !wlegl_buffer_requested())
+    {
         return;
     }
     let rec = &mut *(surface as *mut SurfaceRec);
@@ -409,7 +418,9 @@ pub(super) unsafe fn flip_gralloc_surface(surface: EGLSurface, host: &Host) {
                 disable(GL_SCISSOR_TEST);
             }
         }
-        let (dst_y0, dst_y1) = if wlegl_requested() {
+        let (dst_y0, dst_y1) = if wlegl_buffer_requested() {
+            (rec.h as i32, 0) // the compositor presents this buffer as is
+        } else if wlegl_requested() {
             (0, rec.h as i32) // direct copy: no second orientation flip
         } else {
             (rec.h as i32, 0)
@@ -457,9 +468,11 @@ pub(super) unsafe fn present_gralloc(surface: EGLSurface) -> Result<(), String> 
         .rev()
         .find(|target| target.group == info.group)
         .and_then(|target| {
-            // With android_wlegl the daemon samples this surface allocation
-            // directly, so no auxiliary guest flip target is involved.
-            if wlegl_requested() {
+            // With the daemon-side EGL presenter (AArch64) the surface
+            // allocation is sampled directly, so no auxiliary guest flip
+            // target is involved. The manual android_wlegl buffer (ARM32)
+            // is shown as is by Lipstick and needs the flipped copy.
+            if wlegl_requested() && !wlegl_buffer_requested() {
                 target.gralloc.as_ref()
             } else {
                 target

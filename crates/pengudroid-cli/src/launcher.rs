@@ -1144,6 +1144,11 @@ fn apply_aurora_package_env(
             // missing, and loads the libgralloc/eglplatformcommon graph as a
             // set; the guest still lands on wl_shm if any of this fails.
             cmd.env("PENGUDROID_GRALLOC_WLEGL", "1");
+            if cfg!(target_arch = "arm") {
+                // The daemon attaches the buffer to Lipstick directly; the
+                // guest has to deliver it upright (GPU Y-flip).
+                cmd.env("PENGUDROID_WLEGL_BUFFER", "1");
+            }
         }
         // The compositor frame clock is likewise opt-in
         // (PENGUDROID_VSYNC_COMPOSITOR=1); the existing hosted
