@@ -2543,10 +2543,10 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         let _ = std::fs::create_dir_all(&dir);
     }
     // `StatFs("/data")` is how apps ask for the free space on the data
-    // partition; the shim maps `/data` into the sysroot, so the directory has to
-    // exist or `statvfs` fails with ENOENT and the app sees "Invalid path".
-    if let Some(root) = std::env::var_os("PENGUDROID_ROOT") {
-        let _ = std::fs::create_dir_all(std::path::Path::new(&root).join("data"));
+    // partition. Packaged runtimes are read-only, so the shim maps /data to
+    // ANDROID_DATA rather than trying to create it inside the RPM payload.
+    if let Some(root) = std::env::var_os("ANDROID_DATA") {
+        let _ = std::fs::create_dir_all(std::path::Path::new(&root));
     }
     if std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some() {
         eprintln!("apphost: application directories prepared; extracting native libraries");

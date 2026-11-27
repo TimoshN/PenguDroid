@@ -24,24 +24,36 @@ fi
 # 1. Cross-compile everything (this wipes STAGE).
 tools/build-aurora-rpm.sh
 
-# 2. Restore the known-good prepared ART libraries, then overlay fresh shims.
-mkdir -p "$STAGE/usr/share/$PKG/lib"
-cp -a "$PAYLOAD/lib/." "$STAGE/usr/share/$PKG/lib/"
+# 2. Install only the observed MAX/ART library closure, then overlay fresh
+# shims. Keep the app's own native libraries except the optional WebView engine.
+LIB="$STAGE/usr/share/$PKG/lib"
+rm -rf "$LIB"
+mkdir -p "$LIB/ru.oneme.app"
+while IFS= read -r library; do
+    install -m0644 "$PAYLOAD/lib/$library" "$LIB/$library"
+done < "$ROOT/rpm/aurora/maxnext-arm64-minimal-libs.files"
+for library in "$PAYLOAD"/lib/ru.oneme.app/*.so; do
+    [ -f "$library" ] || continue
+    [ "${library##*/}" = libwebviewchromium.so ] && continue
+    install -m0644 "$library" "$LIB/ru.oneme.app/${library##*/}"
+done
 for library in libpengudroid_shim.so libpengudroid_gleshim.so \
                libpengudroid_hybris_pthread.so libpengudroid_vkshim.so; do
-    install -m0644 "$ARTIFACTS/$library" "$STAGE/usr/share/$PKG/lib/$library"
+    install -m0644 "$ARTIFACTS/$library" "$LIB/$library"
 done
-install -m0644 "$STAGE/usr/share/$PKG/lib/libpengudroid_gleshim.so" \
-    "$STAGE/usr/share/$PKG/lib/libEGL.so"
+install -m0644 "$LIB/libpengudroid_gleshim.so" "$LIB/libEGL.so"
 
-# 3. Original APK (read-only: ART rejects writable dex) + data-only runtime.
+# 3. Original APK plus a direct, read-only runtime. There is intentionally no
+# nested runtime.tar.gz and no first-launch extraction.
 mkdir -p "$STAGE/usr/share/$PKG/apps" "$STAGE/usr/share/$PKG/runtime"
 install -m0444 "$PAYLOAD/apps/MaxNext.apk" "$STAGE/usr/share/$PKG/apps/MaxNext.apk"
-install -m0644 "$ROOT/target/aurora/android17-arm64.tar.gz" \
-    "$STAGE/usr/share/$PKG/runtime/android17-arm64.tar.gz"
+tools/prepare-aurora-minimal-runtime.sh
+cp -a "$ROOT/target/aurora/android17-arm64-minimal/android17-arm64" \
+    "$STAGE/usr/share/$PKG/runtime/"
 
-test -f "$STAGE/usr/share/$PKG/lib/libart.so"
+test -f "$LIB/libart.so"
 test -f "$STAGE/usr/share/$PKG/apps/MaxNext.apk"
+test -f "$STAGE/usr/share/$PKG/runtime/android17-arm64/system/framework/framework.jar"
 
 # 4. Pack and sign. APM requires a strictly newer Release.
 mkdir -p "$WORK/rpm/SOURCES" "$WORK/rpm/BUILD"

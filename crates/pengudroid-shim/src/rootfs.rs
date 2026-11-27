@@ -60,6 +60,18 @@ fn root() -> Option<&'static [u8]> {
     .as_deref()
 }
 
+/// Writable Android data can live outside a read-only packaged sysroot.
+/// ART already receives this location as ANDROID_DATA; use the same root for
+/// absolute guest paths so /data and dalvik-cache cannot diverge.
+fn data_root() -> Option<&'static [u8]> {
+    static ROOT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let value = std::env::var_os("ANDROID_DATA")?;
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(value.as_os_str());
+        (bytes.starts_with(b"/") && bytes != b"/").then(|| bytes.to_vec())
+    }).as_deref()
+}
+
 fn arm64_root() -> Option<&'static [u8]> {
     static ROOT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -102,8 +114,15 @@ pub fn map_with_root(root: &[u8], path: &[u8]) -> Option<Vec<u8>> {
     if root.is_empty() || root == b"/" || !guest_path(path) {
         return None;
     }
-    let mut out = Vec::with_capacity(root.len() + path.len());
+    // Expanded APEX/partition trees live below system/ in the GSI. Direct
+    // mapping replaces the root-level symlinks that RPM validation forbids.
+    let nested = ["/apex", "/product", "/system_ext"]
+        .iter().any(|mount| under(path, mount.as_bytes()));
+    let mut out = Vec::with_capacity(root.len() + path.len() + 7);
     out.extend_from_slice(root);
+    if nested {
+        out.extend_from_slice(b"/system");
+    }
     out.extend_from_slice(path);
     Some(out)
 }
@@ -119,8 +138,22 @@ fn map_with_roots(host: Option<&[u8]>, arm64: Option<&[u8]>, path: &[u8]) -> Opt
     map_with_root(host?, path)
 }
 
+fn map_data_with_root(data: &[u8], path: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() || data == b"/" || !under(path, b"/data") {
+        return None;
+    }
+    let suffix = &path[b"/data".len()..];
+    let mut out = Vec::with_capacity(data.len() + suffix.len());
+    out.extend_from_slice(data);
+    out.extend_from_slice(suffix);
+    Some(out)
+}
+
 /// Map `path` into the selected runtime root, or leave host paths untouched.
 pub fn map_bytes(path: &[u8]) -> Option<Vec<u8>> {
+    if let Some(mapped) = data_root().and_then(|data| map_data_with_root(data, path)) {
+        return Some(mapped);
+    }
     map_with_roots(root(), arm64_root(), path)
 }
 
@@ -796,12 +829,25 @@ mod tests {
         );
         assert_eq!(
             map_with_root(ROOT, b"/apex/com.android.art/javalib/core-oj.jar").unwrap(),
-            b"/opt/android/apex/com.android.art/javalib/core-oj.jar"
+            b"/opt/android/system/apex/com.android.art/javalib/core-oj.jar"
         );
         assert_eq!(
             map_with_root(ROOT, b"/data/system/users/0").unwrap(),
             b"/opt/android/data/system/users/0"
         );
+    }
+
+    #[test]
+    fn data_can_live_outside_a_read_only_sysroot() {
+        assert_eq!(
+            map_data_with_root(b"/home/user/android-data", b"/data/dalvik-cache/arm64"),
+            Some(b"/home/user/android-data/dalvik-cache/arm64".to_vec())
+        );
+        assert_eq!(
+            map_data_with_root(b"/home/user/android-data", b"/data"),
+            Some(b"/home/user/android-data".to_vec())
+        );
+        assert!(map_data_with_root(b"/home/user/android-data", b"/database").is_none());
     }
 
     #[test]
@@ -829,7 +875,7 @@ mod tests {
         assert!(map_with_root(ROOT, b"/systemxyz").is_none());
         assert_eq!(
             map_with_root(ROOT, b"/system_ext/lib64/x.so").unwrap(),
-            b"/opt/android/system_ext/lib64/x.so"
+            b"/opt/android/system/system_ext/lib64/x.so"
         );
     }
 

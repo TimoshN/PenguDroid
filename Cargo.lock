@@ -2987,7 +2987,6 @@ dependencies = [
 name = "pengudroid-cli"
 version = "0.2.1"
 dependencies = [
- "flate2",
  "libc",
  "miniz_oxide 0.8.9",
  "pengudroid-daemon",
@@ -2998,7 +2997,6 @@ dependencies = [
  "pengudroid-proto",
  "pengudroid-socket",
  "roxmltree",
- "tar",
  "wayland-backend",
  "wayland-client",
  "wayland-egl",

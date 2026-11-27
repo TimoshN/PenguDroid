@@ -1191,89 +1191,6 @@ fn apply_aurora_package_env(
     }
 }
 
-/// Sailjail grants an application only its organization/application data and
-/// cache directories. Manual SSH launches historically used ~/.*/pengudroid,
-/// but those paths do not exist in the desktop sandbox's mount namespace.
-fn make_packaged_dex_read_only(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    if path.is_symlink() { return Ok(()); }
-    if path.is_dir() {
-        let entries = std::fs::read_dir(path)
-            .map_err(|e| format!("cannot inspect unpacked runtime {}: {e}", path.display()))?;
-        for entry in entries {
-            make_packaged_dex_read_only(&entry.map_err(|e| e.to_string())?.path())?;
-        }
-    } else if path.is_file()
-        && matches!(path.extension().and_then(|s| s.to_str()), Some("apk" | "jar"))
-    {
-        let metadata = std::fs::metadata(path)
-            .map_err(|e| format!("cannot inspect DEX permissions {}: {e}", path.display()))?;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(permissions.mode() & !0o222);
-        std::fs::set_permissions(path, permissions)
-            .map_err(|e| format!("cannot make DEX read-only {}: {e}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Unpack the RPM's runtime without relying on an external tar executable.
-/// Sailjail's private-bin hides /usr/bin/tar, so spawning it fails before ART.
-/// Extract beside the final runtime and publish it atomically only after the
-/// expected API-37 manifest and framework are present.
-fn unpack_packaged_runtime(archive: &Path, parent: &Path) -> Result<PathBuf, String> {
-    use std::path::Component;
-
-    let unique = format!("{}-{}", crate::runtime::RUNTIME_DIR, std::process::id());
-    let staging = parent.join(format!(".{unique}.unpack"));
-    let runtime = parent.join(crate::runtime::RUNTIME_DIR);
-    let backup = parent.join(format!(".{unique}.incomplete"));
-    let _ = std::fs::remove_dir_all(&staging);
-    let _ = std::fs::remove_dir_all(&backup);
-    std::fs::create_dir_all(&staging)
-        .map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
-    let result = (|| -> Result<PathBuf, String> {
-        let file = std::fs::File::open(archive)
-            .map_err(|e| format!("cannot open {}: {e}", archive.display()))?;
-        let decoder = flate2::read::GzDecoder::new(file);
-        let mut tar = tar::Archive::new(decoder);
-        let entries = tar.entries().map_err(|e| format!("cannot read runtime archive: {e}"))?;
-        for entry in entries {
-            let mut entry = entry.map_err(|e| format!("invalid runtime archive entry: {e}"))?;
-            let path = entry.path().map_err(|e| format!("invalid runtime path: {e}"))?.into_owned();
-            let mut components = path.components();
-            if components.next() != Some(Component::Normal(std::ffi::OsStr::new(crate::runtime::RUNTIME_DIR)))
-                || components.any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-            {
-                return Err(format!("unexpected runtime archive path: {}", path.display()));
-            }
-            if !entry.unpack_in(&staging).map_err(|e| format!("cannot unpack {}: {e}", path.display()))? {
-                return Err(format!("runtime archive path escapes its destination: {}", path.display()));
-            }
-        }
-        let extracted = staging.join(crate::runtime::RUNTIME_DIR);
-        for required in ["pengudroid-runtime.json", "system/framework/framework.jar"] {
-            if !extracted.join(required).is_file() {
-                return Err(format!("unpacked runtime is missing {required}"));
-            }
-        }
-        // ART rejects writable DEX files. The archive is data, not a writable
-        // application prefix, so publish APK/JAR inputs read-only.
-        make_packaged_dex_read_only(&extracted)?;
-        if runtime.exists() {
-            std::fs::rename(&runtime, &backup)
-                .map_err(|e| format!("cannot retain incomplete runtime: {e}"))?;
-        }
-        if let Err(error) = std::fs::rename(&extracted, &runtime) {
-            if backup.exists() { let _ = std::fs::rename(&backup, &runtime); }
-            return Err(format!("cannot publish unpacked runtime: {error}"));
-        }
-        Ok(runtime.clone())
-    })();
-    let _ = std::fs::remove_dir_all(&staging);
-    if result.is_ok() { let _ = std::fs::remove_dir_all(&backup); }
-    result
-}
-
 fn configure_aurora_user_dirs() {
     let Some(package_data) = aurora_package_data_dir() else { return };
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
@@ -1286,28 +1203,15 @@ fn configure_aurora_user_dirs() {
         std::env::set_var("XDG_DATA_HOME", &data);
         std::env::set_var("XDG_CACHE_HOME", &cache);
     }
+    let packaged = package_data.join("runtime").join(crate::runtime::RUNTIME_DIR);
     let runtime = home.join(format!("Documents/PenguDroid/runtime/{}", crate::runtime::RUNTIME_DIR));
-    eprintln!(
-        "pengudroid launch: sandbox paths documents={} runtime={} framework={} cache={}",
-        runtime.parent().is_some_and(|p| p.is_dir()), runtime.is_dir(),
-        runtime.join("system/framework/framework.jar").is_file(), cache.is_dir(),
-    );
-    if !runtime.join("system/framework/framework.jar").is_file() {
-        let archive = package_data.join(format!("runtime/{}.tar.gz", crate::runtime::RUNTIME_DIR));
-        if archive.is_file() {
-            if let Some(parent) = runtime.parent() {
-                let _ = std::fs::create_dir_all(parent);
-                eprintln!("pengudroid launch: unpacking packaged Android runtime");
-                match unpack_packaged_runtime(&archive, parent) {
-                    Ok(path) => eprintln!("pengudroid launch: Android runtime unpacked to {}", path.display()),
-                    Err(error) => eprintln!("pengudroid launch: runtime unpack failed: {error}"),
-                }
-            }
-        }
-    }
     let private_runtime = cache.join(format!("pengudroid/runtime/{}", crate::runtime::RUNTIME_DIR));
-    for candidate in [runtime, private_runtime] {
-        if candidate.is_dir() {
+    // New RPMs contain the framework directly. Prefer that read-only tree and
+    // never unpack it at launch; legacy extracted trees remain usable overrides
+    // for existing installations and development packages.
+    for candidate in [packaged, runtime, private_runtime] {
+        if candidate.join("system/framework/framework.jar").is_file() {
+            eprintln!("pengudroid launch: Android runtime {}", candidate.display());
             unsafe { std::env::set_var("PENGUDROID_ART_SYSROOT", candidate) };
             break;
         }
@@ -1738,34 +1642,4 @@ mod tests {
         assert_eq!(visible_statusbar_inset(true, 0, 0), 0);
     }
 
-    #[test]
-    fn packaged_runtime_unpacks_without_an_external_tar() {
-        let base = std::env::temp_dir().join(format!(
-            "pengudroid-runtime-unpack-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        let archive_path = base.join("runtime.tar.gz");
-        let file = std::fs::File::create(&archive_path).unwrap();
-        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
-        let mut builder = tar::Builder::new(encoder);
-        for (path, bytes) in [
-            (format!("{}/pengudroid-runtime.json", crate::runtime::RUNTIME_DIR), b"{}".as_slice()),
-            (format!("{}/system/framework/framework.jar", crate::runtime::RUNTIME_DIR), b"framework".as_slice()),
-        ] {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, path, bytes).unwrap();
-        }
-        builder.into_inner().unwrap().finish().unwrap();
-        let runtime = unpack_packaged_runtime(&archive_path, &base).unwrap();
-        let framework = runtime.join("system/framework/framework.jar");
-        assert_eq!(std::fs::read(&framework).unwrap(), b"framework");
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(framework).unwrap().permissions().mode() & 0o222, 0);
-        assert!(!base.join(format!(".{}-{}.unpack", crate::runtime::RUNTIME_DIR, std::process::id())).exists());
-        std::fs::remove_dir_all(base).unwrap();
-    }
 }
